@@ -1,0 +1,10 @@
+.DS_Store
+.baseline/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+

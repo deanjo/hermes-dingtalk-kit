@@ -1,0 +1,87 @@
+--- .baseline/hermes/gateway/run.py	2026-07-05 22:19:17
++++ overlays/hermes/gateway/run.py	2026-07-05 22:18:31
+@@ -66,6 +66,11 @@
+ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
+ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
++# T27: sentinel emitted by the DingTalk adapter when the user replied to an earlier
++# message but the platform did not deliver the quoted original text. Value MUST match
++# the adapter's _REPLY_ORIGINAL_UNAVAILABLE exactly; the reply-injection block below
++# keys off it to emit a Chinese back-reference instruction instead of a quote template.
++_REPLY_ORIGINAL_UNAVAILABLE = "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00"
+ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+ 
+ _TELEGRAM_NOISY_STATUS_RE = re.compile(
+@@ -1272,6 +1277,15 @@
+     return f"{platform_name.upper()}_HOME_CHANNEL"
+ 
+ 
++def _should_prompt_for_home_channel(source: Any) -> bool:
++    platform = getattr(source, "platform", None)
++    if not platform or platform in {Platform.LOCAL, Platform.WEBHOOK}:
++        return False
++    if platform == Platform.DINGTALK and getattr(source, "chat_type", "") == "group":
++        return False
++    return True
++
++
+ def _home_thread_env_var(platform_name: str) -> str:
+     """Return the optional thread/topic env var for a platform home target."""
+     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
+@@ -9164,14 +9178,26 @@
+             # is referencing. History can contain the same or similar text
+             # multiple times, and without an explicit pointer the agent has to
+             # guess (or answer for both subjects). Token overhead is minimal.
+-            reply_snippet = event.reply_to_text[:500]
+-            if getattr(event, "reply_to_is_own_message", False):
++            if event.reply_to_text == _REPLY_ORIGINAL_UNAVAILABLE:
++                # T27: user quoted an earlier message but the platform (DingTalk) did
++                # not deliver the original text. We can't render a quote snippet, so
++                # instruct the agent to resolve the reference from conversation history
++                # rather than assuming it points at the most-recent topic.
+                 message_text = (
+-                    f'[Replying to your previous message: "{reply_snippet}"]\n\n'
++                    "【系统提示】用户正在引用本会话中更早的一条消息向你提问，但本次未取到被引用消息的原文。"
++                    "请先回顾上文对话历史，找到用户引用的那条具体消息，据此判断用户此处“这个/这个问题/它”"
++                    "等指代的真正对象，再作答；不要想当然地认为指的是最近讨论的话题。\n\n"
+                     f"{message_text}"
+                 )
+             else:
+-                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
++                reply_snippet = event.reply_to_text[:500]
++                if getattr(event, "reply_to_is_own_message", False):
++                    message_text = (
++                        f'[Replying to your previous message: "{reply_snippet}"]\n\n'
++                        f"{message_text}"
++                    )
++                else:
++                    message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+ 
+         if "@" in message_text:
+             try:
+@@ -9900,7 +9926,7 @@
+         
+         # One-time prompt if no home channel is set for this platform
+         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
+-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
++        if not history and _should_prompt_for_home_channel(source):
+             platform_name = source.platform.value
+             env_key = _home_target_env_var(platform_name)
+             if not os.getenv(env_key):
+@@ -13209,10 +13235,16 @@
+             platform=context.source.platform.value,
+             chat_id=context.source.chat_id,
+             chat_name=context.source.chat_name or "",
++            chat_type=context.source.chat_type or "",
+             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
+             user_id=str(context.source.user_id) if context.source.user_id else "",
++            user_id_alt=str(context.source.user_id_alt) if context.source.user_id_alt else "",
+             user_name=str(context.source.user_name) if context.source.user_name else "",
+             session_key=context.session_key,
++            # 2026-07-02 T26: 补传 session_id。此前缺参导致 contextvar HERMES_SESSION_ID
++            # 每轮被显式置空串，仅新建 AIAgent 那轮由 agent_init 填上；agent 缓存命中轮
++            # 插件读到空值（dingtalk_group_push T25 的自愈兜底可保留）。
++            session_id=context.session_id,
+             message_id=str(context.source.message_id) if context.source.message_id else "",
+             async_delivery=_async_delivery,
+         )

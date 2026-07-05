@@ -1,0 +1,712 @@
+--- .baseline/hermes/plugins/platforms/dingtalk/adapter.py	2026-07-05 22:19:17
++++ overlays/hermes/plugins/platforms/dingtalk/adapter.py	2026-07-05 22:18:31
+@@ -29,6 +29,7 @@
+ import asyncio
+ import json
+ import logging
++import mimetypes
+ import os
+ import re
+ import traceback
+@@ -101,10 +102,278 @@
+     MessageEvent,
+     MessageType,
+     SendResult,
++    cache_media_bytes,
+ )
+ 
+ logger = logging.getLogger(__name__)
+ 
++_FORWARD_DIAG_MAX_ITEMS = 8
++_DINGTALK_PLACEHOLDER_TEXTS = {"[图文消息]", "群聊的聊天记录"}
++
++
++def _safe_keys(value: Any) -> List[str]:
++    if not isinstance(value, dict):
++        return []
++    return sorted(str(key) for key in value.keys())
++
++
++def _safe_list_len(value: Any) -> int:
++    return len(value) if isinstance(value, list) else 0
++
++
++def _jsonish(value: Any) -> Any:
++    if isinstance(value, str):
++        stripped = value.strip()
++        if stripped.startswith(("{", "[")):
++            try:
++                return json.loads(stripped)
++            except Exception:
++                return value
++    return value
++
++
++def _raw_content(data: Any) -> Any:
++    if not isinstance(data, dict):
++        return None
++    return _jsonish(data.get("content") or data.get("contentJson"))
++
++
++def _is_placeholder_text(text: str) -> bool:
++    stripped = (text or "").strip()
++    if not stripped:
++        return False
++    if stripped in _DINGTALK_PLACEHOLDER_TEXTS:
++        return True
++    return all(
++        not line.strip() or line.strip().endswith("[图文消息]")
++        for line in stripped.splitlines()
++    )
++
++
++def _walk_dicts(value: Any, *, depth: int = 0):
++    if depth > 6:
++        return
++    value = _jsonish(value)
++    if isinstance(value, dict):
++        yield value
++        for child in value.values():
++            yield from _walk_dicts(child, depth=depth + 1)
++    elif isinstance(value, list):
++        for child in value[:50]:
++            yield from _walk_dicts(child, depth=depth + 1)
++
++
++def _forward_diag_from_raw(data: Any) -> Dict[str, Any]:
++    """Return a low-sensitive callback shape summary for forwarded content."""
++    summary: Dict[str, Any] = {"data_type": type(data).__name__}
++    if not isinstance(data, dict):
++        return summary
++
++    content = _raw_content(data)
++    text = data.get("text")
++    chat_record = content.get("chatRecord") if isinstance(content, dict) else None
++    rich_text = content.get("richText") if isinstance(content, dict) else None
++    summary.update(
++        {
++            "top_keys": _safe_keys(data),
++            "msgtype": data.get("msgtype") or data.get("messageType"),
++            "is_forward_msg": bool(data.get("isForwardMsg")),
++            "content_type": type(content).__name__ if content is not None else None,
++            "content_keys": _safe_keys(content),
++            "text_keys": _safe_keys(text),
++            "text_len": len(str(text.get("content") or "")) if isinstance(text, dict) else 0,
++            "summary_len": len(str(content.get("summary") or "")) if isinstance(content, dict) else 0,
++            "chat_record_type": type(chat_record).__name__ if chat_record is not None else None,
++            "chat_record_count": _safe_list_len(chat_record),
++            "rich_text_type": type(rich_text).__name__ if rich_text is not None else None,
++            "rich_text_count": _safe_list_len(rich_text),
++        }
++    )
++    if isinstance(chat_record, list) and chat_record:
++        item_keys = []
++        item_types = []
++        for item in chat_record[:_FORWARD_DIAG_MAX_ITEMS]:
++            if isinstance(item, dict):
++                item_keys.append(_safe_keys(item))
++                item_types.append(
++                    item.get("msgtype")
++                    or item.get("msgType")
++                    or item.get("type")
++                    or type(item).__name__
++                )
++            else:
++                item_types.append(type(item).__name__)
++        summary["chat_record_item_keys"] = item_keys
++        summary["chat_record_item_types"] = item_types
++    if isinstance(rich_text, list):
++        summary["rich_text_item_types"] = [
++            item.get("type") if isinstance(item, dict) else type(item).__name__
++            for item in rich_text[:_FORWARD_DIAG_MAX_ITEMS]
++        ]
++
++    download_keys: Set[str] = set()
++    download_ref_count = 0
++    nested_msg_types: Set[str] = set()
++    for obj in _walk_dicts(data):
++        for key, value in obj.items():
++            key_s = str(key)
++            if key_s in {"downloadCode", "pictureDownloadCode", "download_code"} and value:
++                download_keys.add(key_s)
++                download_ref_count += 1
++            if key_s in {"msgType", "msgtype"} and isinstance(value, str):
++                nested_msg_types.add(value)
++    summary["download_ref_count"] = download_ref_count
++    summary["download_ref_keys"] = sorted(download_keys)
++    summary["nested_msg_types"] = sorted(nested_msg_types)[:_FORWARD_DIAG_MAX_ITEMS]
++    return summary
++
++
++def _chat_record_items(value: Any, *, depth: int = 0) -> List[Dict[str, Any]]:
++    if depth > 4:
++        return []
++    parsed = _jsonish(value)
++    if isinstance(parsed, list):
++        return [item for item in parsed if isinstance(item, dict)]
++    if isinstance(parsed, dict):
++        for key in ("chatRecord", "chatRecords", "records", "items", "messages", "list"):
++            nested = _chat_record_items(parsed.get(key), depth=depth + 1)
++            if nested:
++                return nested
++        if any(key in parsed for key in ("content", "text", "plainText", "summary", "title", "msgType", "msgtype")):
++            return [parsed]
++    return []
++
++
++def _non_placeholder_text(value: Any) -> str:
++    text = str(value or "").strip()
++    if not text or _is_placeholder_text(text):
++        return ""
++    return text
++
++
++def _forwarded_chat_text_from_raw(data: Any, *, include_senders: bool = True) -> str:
++    """Extract user-provided forwarded chat text from DingTalk chatRecord payloads."""
++    content = _raw_content(data)
++    if not isinstance(content, dict):
++        return ""
++    chat_record = content.get("chatRecord")
++    records = _chat_record_items(chat_record)
++    if not records:
++        if isinstance(chat_record, str):
++            fallback = _non_placeholder_text(chat_record)
++            if fallback:
++                return fallback
++        return _non_placeholder_text(content.get("summary"))
++
++    lines: List[str] = []
++    for item in records:
++        sender = (
++            item.get("senderNick")
++            or item.get("senderName")
++            or item.get("fromNick")
++            or item.get("name")
++            or ""
++        )
++        msg_type = str(item.get("msgtype") or item.get("msgType") or item.get("type") or "").strip()
++        text = _text_from_forward_record(item)
++        if not text and msg_type:
++            text = f"[{msg_type}]"
++        if not text:
++            continue
++        prefix = f"{sender}: " if include_senders and sender else ""
++        lines.append(f"{prefix}{text}")
++    return "\n".join(lines).strip()
++
++
++def _text_from_forward_record(item: Dict[str, Any]) -> str:
++    for key in ("text", "plainText", "summary", "title"):
++        value = item.get(key)
++        if isinstance(value, str) and value.strip():
++            return value.strip()
++
++    content = _jsonish(item.get("content"))
++    if isinstance(content, str):
++        return content.strip()
++    if not isinstance(content, dict):
++        return ""
++
++    for key in ("content", "text", "plainText", "summary", "title"):
++        value = content.get(key)
++        if isinstance(value, str) and value.strip():
++            return value.strip()
++        if isinstance(value, dict):
++            nested = value.get("content") or value.get("text")
++            if isinstance(nested, str) and nested.strip():
++                return nested.strip()
++
++    rich_text = content.get("richText") or content.get("rich_text")
++    if isinstance(rich_text, list):
++        parts = []
++        for part in rich_text:
++            if isinstance(part, dict):
++                part_text = part.get("text") or part.get("content")
++                if isinstance(part_text, str) and part_text.strip():
++                    parts.append(part_text.strip())
++        if parts:
++            return " ".join(parts)
++    return ""
++
++
++def _log_forward_diag(stage: str, data: Any) -> None:
++    summary = _forward_diag_from_raw(data)
++    if not (
++        summary.get("msgtype") in {"chatRecord", "richText"}
++        or summary.get("is_forward_msg")
++        or summary.get("chat_record_count")
++        or summary.get("download_ref_count")
++    ):
++        return
++    logger.warning(
++        "DINGTALK_FORWARD_DIAG stage=%s summary=%s",
++        stage,
++        json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str),
++    )
++
++def _get_text_extensions(message: "ChatbotMessage") -> Dict[str, Any]:
++    text = getattr(message, "text", None)
++    extensions = getattr(text, "extensions", None)
++    return extensions if isinstance(extensions, dict) else {}
++
++
++def _get_replied_file_content(message: "ChatbotMessage") -> Optional[Dict[str, Any]]:
++    replied = _get_text_extensions(message).get("repliedMsg")
++    if not isinstance(replied, dict):
++        return None
++    msg_type = str(replied.get("msgType") or replied.get("msgtype") or "").lower()
++    content = replied.get("content")
++    if msg_type != "file" or not isinstance(content, dict):
++        return None
++    return content
++
++# T27: sentinel meaning "user replied to an earlier message but the platform did
++# not deliver the original text". Value MUST match run.py's _REPLY_ORIGINAL_UNAVAILABLE
++# exactly — run.py keys off it to inject a Chinese back-reference instruction.
++_REPLY_ORIGINAL_UNAVAILABLE = "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00"
++
++
++def _extract_replied_text_original(replied: Dict[str, Any]) -> str:
++    """Best-effort extraction of the quoted message's original text.
++
++    DingTalk usually omits the original text for a text-reply (``repliedMsg`` carries
++    only ``msgId``/``msgType``). When ``content`` is present it may be a plain string
++    or a dict such as ``{"content": "..."}`` / ``{"text": "..."}``. Return "" when no
++    usable text is found so the caller can fall back to the sentinel.
++    """
++    content = replied.get("content")
++    if isinstance(content, str):
++        return content.strip()
++    if isinstance(content, dict):
++        for key in ("content", "text", "value"):
++            val = content.get(key)
++            if isinstance(val, str) and val.strip():
++                return val.strip()
++    return ""
++
+ MAX_MESSAGE_LENGTH = 20000
+ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+ _SESSION_WEBHOOKS_MAX = 500
+@@ -615,20 +884,35 @@
+         # Allowed-users gate (applies to both DM and group)
+         if not self._is_user_allowed(sender_id, sender_staff_id):
+             logger.debug(
+-                "[%s] Dropping message from non-allowlisted user staff_id=%s sender_id=%s",
+-                self.name, sender_staff_id, sender_id,
++                "[%s] Dropping message from non-allowlisted user has_staff_id=%s has_sender_id=%s",
++                self.name, bool(sender_staff_id), bool(sender_id),
+             )
+             return
+ 
++        forwarded_chat_text = _forwarded_chat_text_from_raw(
++            getattr(message, "_hermes_raw_data", None)
++        )
++        forwarded_chat_gate_text = _forwarded_chat_text_from_raw(
++            getattr(message, "_hermes_raw_data", None),
++            include_senders=False,
++        )
++
+         # Group mention/pattern gate.  DMs pass through unconditionally.
+         # We need the message text for regex wake-word matching; extract it
+         # early but don't consume the rest of the pipeline until after the
+         # gate decides whether to process.
+         _early_text = self._extract_text(message) or ""
+-        if not self._should_process_message(message, _early_text, is_group, chat_id):
++        gate_text = (
++            forwarded_chat_gate_text
++            if forwarded_chat_gate_text and (not _early_text or _is_placeholder_text(_early_text))
++            else f"{_early_text}\n{forwarded_chat_gate_text}".strip()
++            if forwarded_chat_gate_text
++            else _early_text
++        )
++        if not self._should_process_message(message, gate_text, is_group, chat_id):
+             logger.debug(
+-                "[%s] Dropping group message that failed mention gate message_id=%s chat_id=%s",
+-                self.name, msg_id, chat_id,
++                "[%s] Dropping group message that failed mention gate has_message_id=%s has_chat_id=%s",
++                self.name, bool(msg_id), bool(chat_id),
+             )
+             return
+ 
+@@ -661,9 +945,24 @@
+ 
+         # Extract text content
+         text = self._extract_text(message)
++        if forwarded_chat_text:
++            text = (
++                forwarded_chat_text
++                if not text or _is_placeholder_text(text)
++                else f"{text}\n\n{forwarded_chat_text}"
++            )
+ 
+         # Determine message type and build media list
+         msg_type, media_urls, media_types = self._extract_media(message)
++        _log_forward_diag(
++            "after_extract",
++            {
++                "msgtype": getattr(message, "message_type", "") or "",
++                "text": {"content": text or ""},
++                "content": {"summary": "", "chatRecord": []},
++                "media": {"count": len(media_urls), "types": list(media_types)},
++            },
++        )
+ 
+         if not text and not media_urls:
+             logger.debug("[%s] Empty message, skipping", self.name)
+@@ -676,6 +975,7 @@
+             user_id=sender_id,
+             user_name=sender_nick,
+             user_id_alt=sender_staff_id if sender_staff_id else None,
++            message_id=msg_id,
+         )
+ 
+         # Parse timestamp
+@@ -689,6 +989,26 @@
+         except (ValueError, OSError, TypeError):
+             timestamp = datetime.now(tz=timezone.utc)
+ 
++        # T27: surface reply-to context for text quotes so the gateway can inject a
++        # disambiguation pointer. File quotes keep flowing through the existing
++        # document path (_get_replied_file_content) and are skipped here. Any failure
++        # must degrade to "no reply context" and never break normal message handling.
++        reply_kwargs: Dict[str, Any] = {}
++        try:
++            replied = (_get_text_extensions(message) or {}).get("repliedMsg") or {}
++            if isinstance(replied, dict) and replied:
++                _mid = str(replied.get("msgId") or replied.get("msgid") or "").strip()
++                _mtype = str(replied.get("msgType") or replied.get("msgtype") or "").lower()
++                if _mid and _mtype != "file":
++                    _orig = _extract_replied_text_original(replied)
++                    reply_kwargs = dict(
++                        reply_to_message_id=_mid,
++                        reply_to_text=(_orig if _orig else _REPLY_ORIGINAL_UNAVAILABLE),
++                        reply_to_is_own_message=False,
++                    )
++        except Exception:  # noqa: BLE001 — reply context is best-effort; never block a message
++            reply_kwargs = {}
++
+         event = MessageEvent(
+             text=text,
+             message_type=msg_type,
+@@ -698,14 +1018,15 @@
+             media_urls=media_urls,
+             media_types=media_types,
+             timestamp=timestamp,
++            **reply_kwargs,
+         )
+ 
+         logger.debug(
+-            "[%s] Message from %s in %s: %s",
++            "[%s] Message accepted chat_type=%s text_len=%d media_count=%d",
+             self.name,
+-            sender_nick,
+-            chat_id[:20] if chat_id else "?",
+-            text[:80] if text else "(media)",
++            chat_type,
++            len(text or ""),
++            len(media_urls),
+         )
+         await self.handle_message(event)
+ 
+@@ -781,7 +1102,10 @@
+                 for item in rich_list:
+                     if isinstance(item, dict):
+                         dl_code = (
+-                            item.get("downloadCode") or item.get("download_code") or ""
++                            item.get("downloadCode")
++                            or item.get("pictureDownloadCode")
++                            or item.get("download_code")
++                            or ""
+                         )
+                         item_type = item.get("type", "")
+                         if dl_code:
+@@ -811,6 +1135,26 @@
+                                 if msg_type == MessageType.TEXT:
+                                     msg_type = MessageType.DOCUMENT
+ 
++        replied_file = _get_replied_file_content(message)
++        if replied_file:
++            dl_code = (
++                replied_file.get("downloadCode")
++                or replied_file.get("download_code")
++                or ""
++            )
++            if dl_code:
++                filename = (
++                    replied_file.get("fileName")
++                    or replied_file.get("filename")
++                    or replied_file.get("name")
++                    or ""
++                )
++                guessed_type = mimetypes.guess_type(str(filename))[0] if filename else None
++                media_urls.append(dl_code)
++                media_types.append(guessed_type or "application/octet-stream")
++                if msg_type == MessageType.TEXT:
++                    msg_type = MessageType.DOCUMENT
++
+         msg_type_str = getattr(message, "message_type", "") or ""
+         if msg_type_str == "picture" and not media_urls:
+             msg_type = MessageType.PHOTO
+@@ -835,9 +1179,9 @@
+         """Send a markdown reply via DingTalk session webhook."""
+         metadata = metadata or {}
+         logger.debug(
+-            "[%s] send() chat_id=%s card_enabled=%s",
++            "[%s] send() has_chat_id=%s card_enabled=%s",
+             self.name,
+-            chat_id,
++            bool(chat_id),
+             bool(self._card_template_id and self._card_sdk),
+         )
+ 
+@@ -847,8 +1191,8 @@
+             webhook_info = self._get_valid_webhook(chat_id)
+             if not webhook_info:
+                 logger.warning(
+-                    "[%s] No valid session_webhook for chat_id=%s",
+-                    self.name, chat_id,
++                    "[%s] No valid session_webhook has_chat_id=%s",
++                    self.name, bool(chat_id),
+                 )
+                 return SendResult(
+                     success=False,
+@@ -1290,8 +1634,8 @@
+                     request, sdk_headers, runtime
+                 )
+             logger.info(
+-                "[%s] _send_emotion: %s %s on msg=%s",
+-                self.name, action, emoji_name, open_msg_id[:24],
++                "[%s] _send_emotion: %s %s has_message_id=%s",
++                self.name, action, emoji_name, bool(open_msg_id),
+             )
+         except Exception:
+             logger.debug(
+@@ -1304,7 +1648,9 @@
+         if not token:
+             return
+ 
+-        robot_code = getattr(message, "robot_code", None) or self._client_id
++        _msg_rc = getattr(message, "robot_code", None)
++        robot_code = self._client_id or _msg_rc  # expt-C: prefer app client_id (valid for send)
++        logger.info("[%s] media dl robotCode expt-C: using_client_id=%s msg_rc_matches=%s", self.name, bool(self._client_id), _msg_rc == self._client_id)
+         codes_to_resolve = []
+ 
+         # Collect codes and references to update
+@@ -1314,15 +1660,25 @@
+             codes_to_resolve.append((img_content, "download_code"))
+ 
+         # 2. Rich text list
+-        rich_text = getattr(message, "rich_text_content", None)
++        rich_text = getattr(message, "rich_text_content", None) or getattr(
++            message, "rich_text", None
++        )
+         if rich_text:
+-            rich_list = getattr(rich_text, "rich_text_list", []) or []
++            rich_list = getattr(rich_text, "rich_text_list", None) or rich_text
+             for item in rich_list:
+                 if isinstance(item, dict):
+                     for key in ("downloadCode", "pictureDownloadCode", "download_code"):
+                         if item.get(key):
+                             codes_to_resolve.append((item, key))
+ 
++        # 3. Quoted/replied file cards in text messages. DingTalk delivers
++        # these as text.repliedMsg.content, not as richText media.
++        replied_file = _get_replied_file_content(message)
++        if replied_file:
++            for key in ("downloadCode", "download_code"):
++                if replied_file.get(key):
++                    codes_to_resolve.append((replied_file, key))
++
+         if not codes_to_resolve:
+             return
+ 
+@@ -1347,34 +1703,115 @@
+                 self.name,
+             )
+             return
+-        try:
+-            request = dingtalk_robot_models.RobotMessageFileDownloadRequest(
+-                download_code=code,
+-                robot_code=robot_code,
+-            )
+-            headers = dingtalk_robot_models.RobotMessageFileDownloadHeaders(
+-                x_acs_dingtalk_access_token=token,
+-            )
+-            runtime = tea_util_models.RuntimeOptions()
+-            response = await self._robot_sdk.robot_message_file_download_with_options_async(
+-                request, headers, runtime
+-            )
+-            body = response.body if response else None
+-            if body:
+-                url = getattr(body, "download_url", None)
+-                if url:
+-                    if hasattr(obj, key):
+-                        setattr(obj, key, url)
+-                    elif isinstance(obj, dict):
+-                        obj[key] = url
+-            else:
++        last_err = None
++        for _attempt in range(3):
++            try:
++                request = dingtalk_robot_models.RobotMessageFileDownloadRequest(
++                    download_code=code,
++                    robot_code=robot_code,
++                )
++                headers = dingtalk_robot_models.RobotMessageFileDownloadHeaders(
++                    x_acs_dingtalk_access_token=token,
++                )
++                runtime = tea_util_models.RuntimeOptions()
++                response = await self._robot_sdk.robot_message_file_download_with_options_async(
++                    request, headers, runtime
++                )
++                body = response.body if response else None
++                if body:
++                    url = getattr(body, "download_url", None)
++                    if url:
++                        # Cache the resolved URL to a LOCAL file. Native image
++                        # attachment (agent.image_input_mode=native) only reads
++                        # local file paths (image_routing.build_native_content_parts
++                        # checks p.exists()/is_file()); previously only replied
++                        # files (with a fileName) were cached, leaving inline
++                        # images as remote OSS URLs that native attach skips as
++                        # "unreadable". Cache images too so native can read them.
++                        _fname = ""
++                        if isinstance(obj, dict):
++                            _fname = str(obj.get("fileName") or "")
++                        if not _fname:
++                            _p = url.split("?", 1)[0].rstrip("/")
++                            _b = _p.rsplit("/", 1)[-1] if "/" in _p else ""
++                            _fname = _b if ("." in _b) else "dingtalk_image.png"
++                        cached = await self._cache_downloaded_file_url(url, _fname)
++                        if cached:
++                            url = cached
++                        if hasattr(obj, key):
++                            setattr(obj, key, url)
++                        elif isinstance(obj, dict):
++                            obj[key] = url
++                    if _attempt > 0:
++                        logger.info(
++                            "[%s] media download OK on retry #%d for key=%s",
++                            self.name,
++                            _attempt,
++                            key,
++                        )
++                    return
+                 logger.warning(
+-                    "[%s] Failed to download media: empty response for code %s",
++                    "[%s] media download empty response for key=%s attempt=%d",
+                     self.name,
+-                    code,
++                    key,
++                    _attempt,
+                 )
++            except Exception as e:
++                last_err = e
++                logger.warning(
++                    "[%s] media download attempt=%d failed key=%s error_type=%s provider_code_present=%s",
++                    self.name,
++                    _attempt,
++                    key,
++                    type(e).__name__,
++                    bool(getattr(e, "code", None)),
++                )
++            if _attempt < 2:
++                await asyncio.sleep(0.6 * (_attempt + 1))
++        logger.error(
++            "[%s] Error resolving media key=%s after 3 attempts error_type=%s provider_code_present=%s",
++            self.name,
++            key,
++            type(last_err).__name__ if last_err else "Unknown",
++            bool(getattr(last_err, "code", None)) if last_err else False,
++        )
++
++    async def _cache_downloaded_file_url(self, url: str, filename: str) -> Optional[str]:
++        """Download a DingTalk file URL and cache it for the agent."""
++        if not HTTPX_AVAILABLE:
++            return None
++        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
++        try:
++            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
++                response = await client.get(
++                    url,
++                    headers={
++                        "User-Agent": "HermesAgent/1.0",
++                        "Accept": "*/*",
++                    },
++                )
++                response.raise_for_status()
++            cached = cache_media_bytes(
++                response.content,
++                filename=filename,
++                mime_type=mime_type,
++                default_kind="document",
++            )
++            if cached:
++                logger.info(
++                    "[%s] Cached DingTalk file type=%s",
++                    self.name,
++                    cached.media_type,
++                )
++                return cached.path
+         except Exception as e:
+-            logger.error("[%s] Error resolving media code %s: %s", self.name, code, e)
++            logger.warning(
++                "[%s] Failed to cache DingTalk file ext=%s error_type=%s",
++                self.name,
++                os.path.splitext(str(filename))[1].lower()[:16],
++                type(e).__name__,
++            )
++        return None
+ 
+     @staticmethod
+     def _normalize_markdown(text: str) -> str:
+@@ -1431,6 +1868,23 @@
+         attribute 'pre_start'`` and kills the stream connection.
+         """
+         return
++
++    async def raw_process(self, callback_message):
++        """Compatibility hook for dingtalk-stream versions that call raw_process()."""
++        data = getattr(callback_message, "data", callback_message)
++        if hasattr(callback_message, "data"):
++            message = callback_message
++        else:
++            message = type("_CompatCallbackMessage", (), {"data": data})()
++        code, response = await self.process(message)
++        ack_message = AckMessage()
++        ack_message.code = code
++        ack_message.headers.message_id = getattr(
++            getattr(callback_message, "headers", None), "message_id", None
++        )
++        ack_message.headers.content_type = "application/json"
++        ack_message.data = {"response": response}
++        return ack_message
+ 
+     async def process(self, message: "CallbackMessage"):
+         """Called by dingtalk-stream (>=0.20) when a message arrives.
+@@ -1448,6 +1902,7 @@
+             data = message.data
+             if isinstance(data, str):
+                 data = json.loads(data)
++            _log_forward_diag("raw_callback", data)
+ 
+             # Parse dict into ChatbotMessage using SDK's from_dict
+             chatbot_msg = ChatbotMessage.from_dict(data)
+@@ -1463,6 +1918,8 @@
+                 ) if isinstance(data, dict) else ""
+                 if webhook:
+                     chatbot_msg.session_webhook = webhook
++            if not getattr(chatbot_msg, "message_type", None) and isinstance(data, dict):
++                chatbot_msg.message_type = data.get("msgtype") or data.get("messageType") or ""
+ 
+             # Ensure is_in_at_list is populated from the structured callback
+             # flag even if from_dict() did not map it.  DingTalk sends
+@@ -1475,6 +1932,8 @@
+                 if raw_flag:
+                     chatbot_msg.is_in_at_list = True
+ 
++            chatbot_msg._hermes_raw_data = data
++
+             msg_id = getattr(chatbot_msg, "message_id", None) or ""
+             conversation_id = getattr(chatbot_msg, "conversation_id", None) or ""
+ 

@@ -1,0 +1,47 @@
+--- .baseline/hermes/gateway/session.py	2026-07-05 22:19:18
++++ overlays/hermes/gateway/session.py	2026-07-05 22:18:31
+@@ -89,6 +89,26 @@
+     return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
+ 
+ 
++# session_key never flows into a filesystem path (only session_id does; see
++# hermes_state ``sessions_dir / f"{session_id}.json"``), but it does embed
++# platform-native chat ids. DingTalk conversation ids are base64 whose
++# alphabet includes ``/``, so the blanket ``/`` rejection above produces
++# false positives that silently drop those sessions on every reload. Keep
++# rejecting genuinely path-shaped values (parent traversal, backslashes,
++# absolute/home prefixes, drive letters) while allowing interior ``/``:
++# base64 cannot produce ``..``, so no traversal payload is admitted.
++def _is_session_key_unsafe(value: object) -> bool:
++    """Return True if a session key looks like a path-escape attempt."""
++    if not value:
++        return False
++    s = str(value)
++    if ".." in s or "\\" in s:
++        return True
++    if s.startswith(("/", "~")):
++        return True
++    return len(s) >= 2 and s[0].isalpha() and s[1] == ":" and s[2:3] in ("/", "\\")
++
++
+ @dataclass
+ class SessionSource:
+     """
+@@ -611,9 +631,14 @@
+         session_key = data["session_key"]
+         session_id = data["session_id"]
+ 
+-        # Validate path-sensitive fields to prevent directory traversal (CWE-22)
+-        for _field, _val in (("session_key", session_key), ("session_id", session_id)):
+-            if _is_path_unsafe(_val):
++        # Validate path-sensitive fields to prevent directory traversal (CWE-22).
++        # session_id flows into filenames and keeps the strict check;
++        # session_key never does, and must tolerate base64 chat ids with "/".
++        for _field, _val, _checker in (
++            ("session_key", session_key, _is_session_key_unsafe),
++            ("session_id", session_id, _is_path_unsafe),
++        ):
++            if _checker(_val):
+                 raise ValueError(
+                     f"Invalid {_field}: potential directory traversal detected"
+                 )
