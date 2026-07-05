@@ -2,7 +2,7 @@
 
 Hermes DingTalk Kit 是 Hermes 官方 DingTalk adapter（适配器）的生产补丁包，用来减少接入钉钉时反复踩的坑。
 
-当前状态：private staging（私有整理仓库）。代码基于 `hermes-agent:stable-daocloud` 验证；公开发布前还要完成脱敏、测试和 upstream（上游）拆 PR。
+当前状态：private staging（私有整理仓库）。代码基于 `hermes-agent:stable-daocloud` 验证；已拆出 4 个 upstream（上游）PR，公开发布前还要完成最终脱敏、测试和发布说明。
 
 ## 包含内容
 
@@ -50,6 +50,12 @@ python3 -m unittest discover -s tests
 
 1. `scripts/verify_no_secrets.sh` 通过。
 2. `python3 -m unittest discover -s tests` 通过。
-3. `patches/` 被拆成可读的 upstream PR 候选。
+3. upstream PR 链接已记录在 `docs/UPSTREAM_CANDIDATES.md`。
 4. README 明确支持的 Hermes 基础镜像版本。
 
+已提交到 Hermes 官方的拆分 PR：
+
+- [#58910 raw_process ACK 兼容](https://github.com/NousResearch/hermes-agent/pull/58910)
+- [#58913 session_key slash 修复](https://github.com/NousResearch/hermes-agent/pull/58913)
+- [#58914 HERMES_SESSION_ID 传递](https://github.com/NousResearch/hermes-agent/pull/58914)
+- [#58917 DingTalk replied text 上下文](https://github.com/NousResearch/hermes-agent/pull/58917)
