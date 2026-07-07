@@ -27,7 +27,6 @@ Configuration in config.yaml:
 """
 
 import asyncio
-import json
 import logging
 import mimetypes
 import os
@@ -105,286 +104,43 @@ from gateway.platforms.base import (
     cache_media_bytes,
 )
 
+try:
+    from .incoming import make_incoming_handler
+    from .markdown import normalize_markdown
+    from .media import extract_media
+    from .mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, should_process_message
+    from .plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup
+    from .reply_context import (
+        _forwarded_chat_text_from_raw,
+        _get_replied_file_content,
+        _is_placeholder_text,
+        _log_forward_diag,
+        build_reply_kwargs,
+    )
+except ImportError:
+    import sys
+    from pathlib import Path
+    _MODULE_DIR = str(Path(__file__).resolve().parent)
+    if _MODULE_DIR not in sys.path: sys.path.insert(0, _MODULE_DIR)
+    from incoming import make_incoming_handler  # type: ignore
+    from markdown import normalize_markdown  # type: ignore
+    from media import extract_media  # type: ignore
+    from mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, should_process_message  # type: ignore
+    from plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup  # type: ignore
+    from reply_context import (  # type: ignore
+        _forwarded_chat_text_from_raw,
+        _get_replied_file_content,
+        _is_placeholder_text,
+        _log_forward_diag,
+        build_reply_kwargs,
+    )
+
 logger = logging.getLogger(__name__)
-
-_FORWARD_DIAG_MAX_ITEMS = 8
-_DINGTALK_PLACEHOLDER_TEXTS = {"[图文消息]", "群聊的聊天记录"}
-
-
-def _safe_keys(value: Any) -> List[str]:
-    if not isinstance(value, dict):
-        return []
-    return sorted(str(key) for key in value.keys())
-
-
-def _safe_list_len(value: Any) -> int:
-    return len(value) if isinstance(value, list) else 0
-
-
-def _jsonish(value: Any) -> Any:
-    if isinstance(value, str):
-        stripped = value.strip()
-        if stripped.startswith(("{", "[")):
-            try:
-                return json.loads(stripped)
-            except Exception:
-                return value
-    return value
-
-
-def _raw_content(data: Any) -> Any:
-    if not isinstance(data, dict):
-        return None
-    return _jsonish(data.get("content") or data.get("contentJson"))
-
-
-def _is_placeholder_text(text: str) -> bool:
-    stripped = (text or "").strip()
-    if not stripped:
-        return False
-    if stripped in _DINGTALK_PLACEHOLDER_TEXTS:
-        return True
-    return all(
-        not line.strip() or line.strip().endswith("[图文消息]")
-        for line in stripped.splitlines()
-    )
-
-
-def _walk_dicts(value: Any, *, depth: int = 0):
-    if depth > 6:
-        return
-    value = _jsonish(value)
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from _walk_dicts(child, depth=depth + 1)
-    elif isinstance(value, list):
-        for child in value[:50]:
-            yield from _walk_dicts(child, depth=depth + 1)
-
-
-def _forward_diag_from_raw(data: Any) -> Dict[str, Any]:
-    """Return a low-sensitive callback shape summary for forwarded content."""
-    summary: Dict[str, Any] = {"data_type": type(data).__name__}
-    if not isinstance(data, dict):
-        return summary
-
-    content = _raw_content(data)
-    text = data.get("text")
-    chat_record = content.get("chatRecord") if isinstance(content, dict) else None
-    rich_text = content.get("richText") if isinstance(content, dict) else None
-    summary.update(
-        {
-            "top_keys": _safe_keys(data),
-            "msgtype": data.get("msgtype") or data.get("messageType"),
-            "is_forward_msg": bool(data.get("isForwardMsg")),
-            "content_type": type(content).__name__ if content is not None else None,
-            "content_keys": _safe_keys(content),
-            "text_keys": _safe_keys(text),
-            "text_len": len(str(text.get("content") or "")) if isinstance(text, dict) else 0,
-            "summary_len": len(str(content.get("summary") or "")) if isinstance(content, dict) else 0,
-            "chat_record_type": type(chat_record).__name__ if chat_record is not None else None,
-            "chat_record_count": _safe_list_len(chat_record),
-            "rich_text_type": type(rich_text).__name__ if rich_text is not None else None,
-            "rich_text_count": _safe_list_len(rich_text),
-        }
-    )
-    if isinstance(chat_record, list) and chat_record:
-        item_keys = []
-        item_types = []
-        for item in chat_record[:_FORWARD_DIAG_MAX_ITEMS]:
-            if isinstance(item, dict):
-                item_keys.append(_safe_keys(item))
-                item_types.append(
-                    item.get("msgtype")
-                    or item.get("msgType")
-                    or item.get("type")
-                    or type(item).__name__
-                )
-            else:
-                item_types.append(type(item).__name__)
-        summary["chat_record_item_keys"] = item_keys
-        summary["chat_record_item_types"] = item_types
-    if isinstance(rich_text, list):
-        summary["rich_text_item_types"] = [
-            item.get("type") if isinstance(item, dict) else type(item).__name__
-            for item in rich_text[:_FORWARD_DIAG_MAX_ITEMS]
-        ]
-
-    download_keys: Set[str] = set()
-    download_ref_count = 0
-    nested_msg_types: Set[str] = set()
-    for obj in _walk_dicts(data):
-        for key, value in obj.items():
-            key_s = str(key)
-            if key_s in {"downloadCode", "pictureDownloadCode", "download_code"} and value:
-                download_keys.add(key_s)
-                download_ref_count += 1
-            if key_s in {"msgType", "msgtype"} and isinstance(value, str):
-                nested_msg_types.add(value)
-    summary["download_ref_count"] = download_ref_count
-    summary["download_ref_keys"] = sorted(download_keys)
-    summary["nested_msg_types"] = sorted(nested_msg_types)[:_FORWARD_DIAG_MAX_ITEMS]
-    return summary
-
-
-def _chat_record_items(value: Any, *, depth: int = 0) -> List[Dict[str, Any]]:
-    if depth > 4:
-        return []
-    parsed = _jsonish(value)
-    if isinstance(parsed, list):
-        return [item for item in parsed if isinstance(item, dict)]
-    if isinstance(parsed, dict):
-        for key in ("chatRecord", "chatRecords", "records", "items", "messages", "list"):
-            nested = _chat_record_items(parsed.get(key), depth=depth + 1)
-            if nested:
-                return nested
-        if any(key in parsed for key in ("content", "text", "plainText", "summary", "title", "msgType", "msgtype")):
-            return [parsed]
-    return []
-
-
-def _non_placeholder_text(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text or _is_placeholder_text(text):
-        return ""
-    return text
-
-
-def _forwarded_chat_text_from_raw(data: Any, *, include_senders: bool = True) -> str:
-    """Extract user-provided forwarded chat text from DingTalk chatRecord payloads."""
-    content = _raw_content(data)
-    if not isinstance(content, dict):
-        return ""
-    chat_record = content.get("chatRecord")
-    records = _chat_record_items(chat_record)
-    if not records:
-        if isinstance(chat_record, str):
-            fallback = _non_placeholder_text(chat_record)
-            if fallback:
-                return fallback
-        return _non_placeholder_text(content.get("summary"))
-
-    lines: List[str] = []
-    for item in records:
-        sender = (
-            item.get("senderNick")
-            or item.get("senderName")
-            or item.get("fromNick")
-            or item.get("name")
-            or ""
-        )
-        msg_type = str(item.get("msgtype") or item.get("msgType") or item.get("type") or "").strip()
-        text = _text_from_forward_record(item)
-        if not text and msg_type:
-            text = f"[{msg_type}]"
-        if not text:
-            continue
-        prefix = f"{sender}: " if include_senders and sender else ""
-        lines.append(f"{prefix}{text}")
-    return "\n".join(lines).strip()
-
-
-def _text_from_forward_record(item: Dict[str, Any]) -> str:
-    for key in ("text", "plainText", "summary", "title"):
-        value = item.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
-    content = _jsonish(item.get("content"))
-    if isinstance(content, str):
-        return content.strip()
-    if not isinstance(content, dict):
-        return ""
-
-    for key in ("content", "text", "plainText", "summary", "title"):
-        value = content.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        if isinstance(value, dict):
-            nested = value.get("content") or value.get("text")
-            if isinstance(nested, str) and nested.strip():
-                return nested.strip()
-
-    rich_text = content.get("richText") or content.get("rich_text")
-    if isinstance(rich_text, list):
-        parts = []
-        for part in rich_text:
-            if isinstance(part, dict):
-                part_text = part.get("text") or part.get("content")
-                if isinstance(part_text, str) and part_text.strip():
-                    parts.append(part_text.strip())
-        if parts:
-            return " ".join(parts)
-    return ""
-
-
-def _log_forward_diag(stage: str, data: Any) -> None:
-    summary = _forward_diag_from_raw(data)
-    if not (
-        summary.get("msgtype") in {"chatRecord", "richText"}
-        or summary.get("is_forward_msg")
-        or summary.get("chat_record_count")
-        or summary.get("download_ref_count")
-    ):
-        return
-    logger.warning(
-        "DINGTALK_FORWARD_DIAG stage=%s summary=%s",
-        stage,
-        json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str),
-    )
-
-def _get_text_extensions(message: "ChatbotMessage") -> Dict[str, Any]:
-    text = getattr(message, "text", None)
-    extensions = getattr(text, "extensions", None)
-    return extensions if isinstance(extensions, dict) else {}
-
-
-def _get_replied_file_content(message: "ChatbotMessage") -> Optional[Dict[str, Any]]:
-    replied = _get_text_extensions(message).get("repliedMsg")
-    if not isinstance(replied, dict):
-        return None
-    msg_type = str(replied.get("msgType") or replied.get("msgtype") or "").lower()
-    content = replied.get("content")
-    if msg_type != "file" or not isinstance(content, dict):
-        return None
-    return content
-
-# T27: sentinel meaning "user replied to an earlier message but the platform did
-# not deliver the original text". Value MUST match run.py's _REPLY_ORIGINAL_UNAVAILABLE
-# exactly — run.py keys off it to inject a Chinese back-reference instruction.
-_REPLY_ORIGINAL_UNAVAILABLE = "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00"
-
-
-def _extract_replied_text_original(replied: Dict[str, Any]) -> str:
-    """Best-effort extraction of the quoted message's original text.
-
-    DingTalk usually omits the original text for a text-reply (``repliedMsg`` carries
-    only ``msgId``/``msgType``). When ``content`` is present it may be a plain string
-    or a dict such as ``{"content": "..."}`` / ``{"text": "..."}``. Return "" when no
-    usable text is found so the caller can fall back to the sentinel.
-    """
-    content = replied.get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, dict):
-        for key in ("content", "text", "value"):
-            val = content.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-    return ""
 
 MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
-
-# DingTalk message type → runtime content type
-DINGTALK_TYPE_MAPPING = {
-    "picture": "image",
-    "voice": "audio",
-}
-
 
 def check_dingtalk_requirements() -> bool:
     """Check if DingTalk dependencies are available and configured.
@@ -417,7 +173,6 @@ def check_dingtalk_requirements() -> bool:
     if not os.getenv("DINGTALK_CLIENT_ID") or not os.getenv("DINGTALK_CLIENT_SECRET"):
         return False
     return True
-
 
 class DingTalkAdapter(BasePlatformAdapter):
     """DingTalk chatbot adapter using Stream Mode.
@@ -469,8 +224,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Mention state is the structured ``is_in_at_list`` attribute from the
         # dingtalk-stream SDK (set from the callback's ``isInAtList`` flag),
         # not text parsing.
-        self._mention_patterns: List[re.Pattern] = self._compile_mention_patterns()
-        self._allowed_users: Set[str] = self._load_allowed_users()
+        self._mention_patterns: List[re.Pattern] = compile_mention_patterns(extra, logger, self.name)
+        self._allowed_users: Set[str] = load_allowed_users(extra)
 
         self._stream_client: Any = None
         self._stream_task: Optional[asyncio.Task] = None
@@ -561,7 +316,15 @@ class DingTalkAdapter(BasePlatformAdapter):
 
             # Capture the current event loop for cross-thread dispatch
             loop = asyncio.get_running_loop()
-            handler = _IncomingHandler(self, loop)
+            handler_cls = make_incoming_handler(
+                dingtalk_stream=dingtalk_stream,
+                dingtalk_stream_available=DINGTALK_STREAM_AVAILABLE,
+                chatbot_message_cls=ChatbotMessage,
+                ack_message_cls=AckMessage,
+                logger=logger,
+                log_forward_diag=_log_forward_diag,
+            )
+            handler = handler_cls(self, loop)
             self._stream_client.register_callback_handler(
                 dingtalk_stream.ChatbotMessage.TOPIC, handler
             )
@@ -659,140 +422,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
 
-    # -- Group gating --------------------------------------------------------
-
-    def _dingtalk_require_mention(self) -> bool:
-        """Return whether group chats should require an explicit bot trigger."""
-        configured = self.config.extra.get("require_mention")
-        if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() in {"true", "1", "yes", "on"}
-            return bool(configured)
-        return os.getenv("DINGTALK_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
-
-    def _dingtalk_free_response_chats(self) -> Set[str]:
-        raw = self.config.extra.get("free_response_chats")
-        if raw is None:
-            raw = os.getenv("DINGTALK_FREE_RESPONSE_CHATS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        return {part.strip() for part in str(raw).split(",") if part.strip()}
-
-    def _dingtalk_allowed_chats(self) -> Set[str]:
-        """Return the whitelist of group chat IDs the bot will respond in.
-
-        When non-empty, group messages from chats NOT in this set are silently
-        ignored — even if the bot is @mentioned.  DMs are never filtered.
-        Empty set means no restriction (fully backward compatible).
-        """
-        raw = self.config.extra.get("allowed_chats") if self.config.extra else None
-        if raw is None:
-            raw = os.getenv("DINGTALK_ALLOWED_CHATS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        return {part.strip() for part in str(raw).split(",") if part.strip()}
-
-    def _compile_mention_patterns(self) -> List[re.Pattern]:
-        """Compile optional regex wake-word patterns for group triggers."""
-        patterns = self.config.extra.get("mention_patterns") if self.config.extra else None
-        if patterns is None:
-            raw = os.getenv("DINGTALK_MENTION_PATTERNS", "").strip()
-            if raw:
-                try:
-                    loaded = json.loads(raw)
-                except Exception:
-                    loaded = [part.strip() for part in raw.splitlines() if part.strip()]
-                    if not loaded:
-                        loaded = [part.strip() for part in raw.split(",") if part.strip()]
-                patterns = loaded
-
-        if patterns is None:
-            return []
-        if isinstance(patterns, str):
-            patterns = [patterns]
-        if not isinstance(patterns, list):
-            logger.warning(
-                "[%s] dingtalk mention_patterns must be a list or string; got %s",
-                self.name,
-                type(patterns).__name__,
-            )
-            return []
-
-        compiled: List[re.Pattern] = []
-        for pattern in patterns:
-            if not isinstance(pattern, str) or not pattern.strip():
-                continue
-            try:
-                compiled.append(re.compile(pattern, re.IGNORECASE))
-            except re.error as exc:
-                logger.warning("[%s] Invalid DingTalk mention pattern %r: %s", self.name, pattern, exc)
-        if compiled:
-            logger.info("[%s] Loaded %d DingTalk mention pattern(s)", self.name, len(compiled))
-        return compiled
-
-    def _load_allowed_users(self) -> Set[str]:
-        """Load allowed-users list from config.extra or env var.
-
-        IDs are matched case-insensitively against the sender's ``staff_id`` and
-        ``sender_id``. A wildcard ``*`` disables the check.
-        """
-        raw = self.config.extra.get("allowed_users") if self.config.extra else None
-        if raw is None:
-            raw = os.getenv("DINGTALK_ALLOWED_USERS", "")
-        if isinstance(raw, list):
-            items = [str(part).strip() for part in raw if str(part).strip()]
-        else:
-            items = [part.strip() for part in str(raw).split(",") if part.strip()]
-        return {item.lower() for item in items}
-
-    def _is_user_allowed(self, sender_id: str, sender_staff_id: str) -> bool:
-        if not self._allowed_users or "*" in self._allowed_users:
-            return True
-        candidates = {(sender_id or "").lower(), (sender_staff_id or "").lower()}
-        candidates.discard("")
-        return bool(candidates & self._allowed_users)
-
-    def _message_mentions_bot(self, message: "ChatbotMessage") -> bool:
-        """True if the bot was @-mentioned in a group message.
-
-        dingtalk-stream sets ``is_in_at_list`` on the incoming ChatbotMessage
-        when the bot is addressed via @-mention.
-        """
-        return bool(getattr(message, "is_in_at_list", False))
-
-    def _message_matches_mention_patterns(self, text: str) -> bool:
-        if not text or not self._mention_patterns:
-            return False
-        return any(pattern.search(text) for pattern in self._mention_patterns)
-
-    def _should_process_message(self, message: "ChatbotMessage", text: str, is_group: bool, chat_id: str) -> bool:
-        """Apply DingTalk group trigger rules.
-
-        DMs remain unrestricted (subject to ``allowed_users`` which is enforced
-        earlier). Group messages are accepted when:
-        - the chat passes the ``allowed_chats`` whitelist (when set)
-        - the chat is explicitly allowlisted in ``free_response_chats``
-        - ``require_mention`` is disabled
-        - the bot is @mentioned (``is_in_at_list``)
-        - the text matches a configured regex wake-word pattern
-
-        When ``allowed_chats`` is non-empty, it acts as a hard gate — messages
-        from any group chat not in the list are ignored regardless of the
-        other rules.
-        """
-        if not is_group:
-            return True
-        allowed = self._dingtalk_allowed_chats()
-        if allowed and chat_id and chat_id not in allowed:
-            return False
-        if chat_id and chat_id in self._dingtalk_free_response_chats():
-            return True
-        if not self._dingtalk_require_mention():
-            return True
-        if self._message_mentions_bot(message):
-            return True
-        return self._message_matches_mention_patterns(text)
-
     def _spawn_bg(self, coro) -> None:
         """Start a fire-and-forget coroutine and track it for cleanup."""
         task = asyncio.create_task(coro)
@@ -882,7 +511,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         chat_type = "group" if is_group else "dm"
 
         # Allowed-users gate (applies to both DM and group)
-        if not self._is_user_allowed(sender_id, sender_staff_id):
+        if not is_user_allowed(self._allowed_users, sender_id, sender_staff_id):
             logger.debug(
                 "[%s] Dropping message from non-allowlisted user has_staff_id=%s has_sender_id=%s",
                 self.name, bool(sender_staff_id), bool(sender_id),
@@ -909,7 +538,14 @@ class DingTalkAdapter(BasePlatformAdapter):
             if forwarded_chat_gate_text
             else _early_text
         )
-        if not self._should_process_message(message, gate_text, is_group, chat_id):
+        if not should_process_message(
+            extra=self.config.extra or {},
+            mention_patterns=self._mention_patterns,
+            message=message,
+            text=gate_text,
+            is_group=is_group,
+            chat_id=chat_id,
+        ):
             logger.debug(
                 "[%s] Dropping group message that failed mention gate has_message_id=%s has_chat_id=%s",
                 self.name, bool(msg_id), bool(chat_id),
@@ -953,7 +589,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
 
         # Determine message type and build media list
-        msg_type, media_urls, media_types = self._extract_media(message)
+        msg_type, media_urls, media_types = extract_media(message, MessageType)
         _log_forward_diag(
             "after_extract",
             {
@@ -993,21 +629,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # disambiguation pointer. File quotes keep flowing through the existing
         # document path (_get_replied_file_content) and are skipped here. Any failure
         # must degrade to "no reply context" and never break normal message handling.
-        reply_kwargs: Dict[str, Any] = {}
-        try:
-            replied = (_get_text_extensions(message) or {}).get("repliedMsg") or {}
-            if isinstance(replied, dict) and replied:
-                _mid = str(replied.get("msgId") or replied.get("msgid") or "").strip()
-                _mtype = str(replied.get("msgType") or replied.get("msgtype") or "").lower()
-                if _mid and _mtype != "file":
-                    _orig = _extract_replied_text_original(replied)
-                    reply_kwargs = dict(
-                        reply_to_message_id=_mid,
-                        reply_to_text=(_orig if _orig else _REPLY_ORIGINAL_UNAVAILABLE),
-                        reply_to_is_own_message=False,
-                    )
-        except Exception:  # noqa: BLE001 — reply context is best-effort; never block a message
-            reply_kwargs = {}
+        reply_kwargs = build_reply_kwargs(message)
 
         event = MessageEvent(
             text=text,
@@ -1077,95 +699,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         # LLM see the raw text — it handles "@bot hello" cleanly.
         return content
 
-    def _extract_media(self, message: "ChatbotMessage"):
-        """Extract media info from message. Returns (MessageType, [urls], [mime_types])."""
-        msg_type = MessageType.TEXT
-        media_urls = []
-        media_types = []
-
-        # Check for image/picture
-        image_content = getattr(message, "image_content", None)
-        if image_content:
-            download_code = getattr(image_content, "download_code", None)
-            if download_code:
-                media_urls.append(download_code)
-                media_types.append("image")
-                msg_type = MessageType.PHOTO
-
-        # Check for rich text with mixed content
-        rich_text = getattr(message, "rich_text_content", None) or getattr(
-            message, "rich_text", None
-        )
-        if rich_text:
-            rich_list = getattr(rich_text, "rich_text_list", None) or rich_text
-            if isinstance(rich_list, list):
-                for item in rich_list:
-                    if isinstance(item, dict):
-                        dl_code = (
-                            item.get("downloadCode")
-                            or item.get("pictureDownloadCode")
-                            or item.get("download_code")
-                            or ""
-                        )
-                        item_type = item.get("type", "")
-                        if dl_code:
-                            mapped = DINGTALK_TYPE_MAPPING.get(item_type, "file")
-                            media_urls.append(dl_code)
-                            if mapped == "image":
-                                media_types.append("image")
-                                if msg_type == MessageType.TEXT:
-                                    msg_type = MessageType.PHOTO
-                            elif mapped == "audio":
-                                media_types.append("audio")
-                                if msg_type == MessageType.TEXT:
-                                    # DingTalk's "voice" rich-text item is a
-                                    # native voice note — route through STT.
-                                    # "audio" comes from file uploads only;
-                                    # keep those as AUDIO (no auto-STT).
-                                    if item_type == "voice":
-                                        msg_type = MessageType.VOICE
-                                    else:
-                                        msg_type = MessageType.AUDIO
-                            elif mapped == "video":
-                                media_types.append("video")
-                                if msg_type == MessageType.TEXT:
-                                    msg_type = MessageType.VIDEO
-                            else:
-                                media_types.append("application/octet-stream")
-                                if msg_type == MessageType.TEXT:
-                                    msg_type = MessageType.DOCUMENT
-
-        replied_file = _get_replied_file_content(message)
-        if replied_file:
-            dl_code = (
-                replied_file.get("downloadCode")
-                or replied_file.get("download_code")
-                or ""
-            )
-            if dl_code:
-                filename = (
-                    replied_file.get("fileName")
-                    or replied_file.get("filename")
-                    or replied_file.get("name")
-                    or ""
-                )
-                guessed_type = mimetypes.guess_type(str(filename))[0] if filename else None
-                media_urls.append(dl_code)
-                media_types.append(guessed_type or "application/octet-stream")
-                if msg_type == MessageType.TEXT:
-                    msg_type = MessageType.DOCUMENT
-
-        msg_type_str = getattr(message, "message_type", "") or ""
-        if msg_type_str == "picture" and not media_urls:
-            msg_type = MessageType.PHOTO
-        elif msg_type_str == "richText":
-            msg_type = (
-                MessageType.PHOTO
-                if any("image" in t for t in media_types)
-                else MessageType.TEXT
-            )
-
-        return msg_type, media_urls, media_types
+    @staticmethod
+    def _normalize_markdown(text: str) -> str:
+        return normalize_markdown(text)
 
     # -- Outbound messaging -------------------------------------------------
 
@@ -1648,18 +1184,20 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not token:
             return
 
-        _msg_rc = getattr(message, "robot_code", None)
-        robot_code = self._client_id or _msg_rc  # expt-C: prefer app client_id (valid for send)
-        logger.info("[%s] media dl robotCode expt-C: using_client_id=%s msg_rc_matches=%s", self.name, bool(self._client_id), _msg_rc == self._client_id)
+        msg_robot_code = getattr(message, "robot_code", None)
+        robot_code = self._client_id or msg_robot_code
+        logger.info(
+            "[%s] media dl robotCode expt-C: using_client_id=%s msg_rc_matches=%s",
+            self.name,
+            bool(self._client_id),
+            msg_robot_code == self._client_id,
+        )
         codes_to_resolve = []
 
-        # Collect codes and references to update
-        # 1. Single image content
         img_content = getattr(message, "image_content", None)
         if img_content and getattr(img_content, "download_code", None):
             codes_to_resolve.append((img_content, "download_code"))
 
-        # 2. Rich text list
         rich_text = getattr(message, "rich_text_content", None) or getattr(
             message, "rich_text", None
         )
@@ -1671,8 +1209,6 @@ class DingTalkAdapter(BasePlatformAdapter):
                         if item.get(key):
                             codes_to_resolve.append((item, key))
 
-        # 3. Quoted/replied file cards in text messages. DingTalk delivers
-        # these as text.repliedMsg.content, not as richText media.
         replied_file = _get_replied_file_content(message)
         if replied_file:
             for key in ("downloadCode", "download_code"):
@@ -1682,14 +1218,11 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not codes_to_resolve:
             return
 
-        # Resolve all codes in parallel
         tasks = []
         for obj, key in codes_to_resolve:
             code = getattr(obj, key, None) if hasattr(obj, key) else obj.get(key)
             if code:
-                tasks.append(
-                    self._fetch_download_url(code, robot_code, token, obj, key)
-                )
+                tasks.append(self._fetch_download_url(code, robot_code, token, obj, key))
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1704,7 +1237,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
             return
         last_err = None
-        for _attempt in range(3):
+        for attempt in range(3):
             try:
                 request = dingtalk_robot_models.RobotMessageFileDownloadRequest(
                     download_code=code,
@@ -1721,32 +1254,25 @@ class DingTalkAdapter(BasePlatformAdapter):
                 if body:
                     url = getattr(body, "download_url", None)
                     if url:
-                        # Cache the resolved URL to a LOCAL file. Native image
-                        # attachment (agent.image_input_mode=native) only reads
-                        # local file paths (image_routing.build_native_content_parts
-                        # checks p.exists()/is_file()); previously only replied
-                        # files (with a fileName) were cached, leaving inline
-                        # images as remote OSS URLs that native attach skips as
-                        # "unreadable". Cache images too so native can read them.
-                        _fname = ""
+                        filename = ""
                         if isinstance(obj, dict):
-                            _fname = str(obj.get("fileName") or "")
-                        if not _fname:
-                            _p = url.split("?", 1)[0].rstrip("/")
-                            _b = _p.rsplit("/", 1)[-1] if "/" in _p else ""
-                            _fname = _b if ("." in _b) else "dingtalk_image.png"
-                        cached = await self._cache_downloaded_file_url(url, _fname)
+                            filename = str(obj.get("fileName") or "")
+                        if not filename:
+                            path = url.split("?", 1)[0].rstrip("/")
+                            basename = path.rsplit("/", 1)[-1] if "/" in path else ""
+                            filename = basename if ("." in basename) else "dingtalk_image.png"
+                        cached = await self._cache_downloaded_file_url(url, filename)
                         if cached:
                             url = cached
                         if hasattr(obj, key):
                             setattr(obj, key, url)
                         elif isinstance(obj, dict):
                             obj[key] = url
-                    if _attempt > 0:
+                    if attempt > 0:
                         logger.info(
                             "[%s] media download OK on retry #%d for key=%s",
                             self.name,
-                            _attempt,
+                            attempt,
                             key,
                         )
                     return
@@ -1754,20 +1280,20 @@ class DingTalkAdapter(BasePlatformAdapter):
                     "[%s] media download empty response for key=%s attempt=%d",
                     self.name,
                     key,
-                    _attempt,
+                    attempt,
                 )
-            except Exception as e:
-                last_err = e
+            except Exception as exc:
+                last_err = exc
                 logger.warning(
                     "[%s] media download attempt=%d failed key=%s error_type=%s provider_code_present=%s",
                     self.name,
-                    _attempt,
+                    attempt,
                     key,
-                    type(e).__name__,
-                    bool(getattr(e, "code", None)),
+                    type(exc).__name__,
+                    bool(getattr(exc, "code", None)),
                 )
-            if _attempt < 2:
-                await asyncio.sleep(0.6 * (_attempt + 1))
+            if attempt < 2:
+                await asyncio.sleep(0.6 * (attempt + 1))
         logger.error(
             "[%s] Error resolving media key=%s after 3 attempts error_type=%s provider_code_present=%s",
             self.name,
@@ -1804,170 +1330,14 @@ class DingTalkAdapter(BasePlatformAdapter):
                     cached.media_type,
                 )
                 return cached.path
-        except Exception as e:
+        except Exception as exc:
             logger.warning(
                 "[%s] Failed to cache DingTalk file ext=%s error_type=%s",
                 self.name,
                 os.path.splitext(str(filename))[1].lower()[:16],
-                type(e).__name__,
+                type(exc).__name__,
             )
         return None
-
-    @staticmethod
-    def _normalize_markdown(text: str) -> str:
-        """Normalize markdown for DingTalk's parser.
-
-        DingTalk's markdown renderer has quirks:
-        - Numbered lists need blank line before them
-        - Indented code blocks may render incorrectly
-        """
-        lines = text.split("\n")
-        out = []
-        for i, line in enumerate(lines):
-            # Ensure blank line before numbered list items
-            is_numbered = re.match(r"^\d+\.\s", line.strip())
-            if is_numbered and i > 0:
-                prev = lines[i - 1]
-                if prev.strip() and not re.match(r"^\d+\.\s", prev.strip()):
-                    out.append("")
-            # Dedent fenced code blocks
-            if line.strip().startswith("```") and line != line.lstrip():
-                indent = len(line) - len(line.lstrip())
-                line = line[indent:]
-            out.append(line)
-        return "\n".join(out)
-
-
-# ---------------------------------------------------------------------------
-# Internal stream handler
-# ---------------------------------------------------------------------------
-
-
-class _IncomingHandler(
-    dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object
-):
-    """dingtalk-stream ChatbotHandler that forwards messages to the adapter.
-
-    SDK >= 0.20 changed process() from sync to async, and the message
-    parameter from ChatbotMessage to CallbackMessage. We parse the
-    CallbackMessage.data dict into a ChatbotMessage before forwarding.
-    """
-
-    def __init__(self, adapter: DingTalkAdapter, loop: Optional[asyncio.AbstractEventLoop] = None):
-        if DINGTALK_STREAM_AVAILABLE:
-            super().__init__()
-        self._adapter = adapter
-        self._loop = loop
-
-    def pre_start(self) -> None:
-        """No-op pre-start hook required by dingtalk-stream SDK.
-
-        The SDK calls ``pre_start()`` on every registered handler before
-        opening the WebSocket connection.  Without this method, the SDK
-        raises ``AttributeError: '_IncomingHandler' object has no
-        attribute 'pre_start'`` and kills the stream connection.
-        """
-        return
-
-    async def raw_process(self, callback_message):
-        """Compatibility hook for dingtalk-stream versions that call raw_process()."""
-        data = getattr(callback_message, "data", callback_message)
-        if hasattr(callback_message, "data"):
-            message = callback_message
-        else:
-            message = type("_CompatCallbackMessage", (), {"data": data})()
-        code, response = await self.process(message)
-        ack_message = AckMessage()
-        ack_message.code = code
-        ack_message.headers.message_id = getattr(
-            getattr(callback_message, "headers", None), "message_id", None
-        )
-        ack_message.headers.content_type = "application/json"
-        ack_message.data = {"response": response}
-        return ack_message
-
-    async def process(self, message: "CallbackMessage"):
-        """Called by dingtalk-stream (>=0.20) when a message arrives.
-
-        dingtalk-stream >= 0.24 passes a CallbackMessage whose ``.data`` contains
-        the chatbot payload. Convert it to ChatbotMessage via
-        ``ChatbotMessage.from_dict()``.
-
-        Message processing is dispatched as a background task so that this
-        method returns the ACK immediately — blocking here would prevent the
-        SDK from sending heartbeats, eventually causing a disconnect.
-        """
-        try:
-            # CallbackMessage.data is a dict containing the raw DingTalk payload
-            data = message.data
-            if isinstance(data, str):
-                data = json.loads(data)
-            _log_forward_diag("raw_callback", data)
-
-            # Parse dict into ChatbotMessage using SDK's from_dict
-            chatbot_msg = ChatbotMessage.from_dict(data)
-
-            # Ensure session_webhook is populated even if the SDK's
-            # from_dict() did not map it (field name mismatch across
-            # SDK versions).
-            if not getattr(chatbot_msg, "session_webhook", None):
-                webhook = (
-                    data.get("sessionWebhook")
-                    or data.get("session_webhook")
-                    or ""
-                ) if isinstance(data, dict) else ""
-                if webhook:
-                    chatbot_msg.session_webhook = webhook
-            if not getattr(chatbot_msg, "message_type", None) and isinstance(data, dict):
-                chatbot_msg.message_type = data.get("msgtype") or data.get("messageType") or ""
-
-            # Ensure is_in_at_list is populated from the structured callback
-            # flag even if from_dict() did not map it.  DingTalk sends
-            # ``isInAtList`` in the raw payload; the adapter's mention check
-            # reads the ChatbotMessage attribute ``is_in_at_list``.
-            if not getattr(chatbot_msg, "is_in_at_list", False):
-                raw_flag = (
-                    data.get("isInAtList") if isinstance(data, dict) else False
-                )
-                if raw_flag:
-                    chatbot_msg.is_in_at_list = True
-
-            chatbot_msg._hermes_raw_data = data
-
-            msg_id = getattr(chatbot_msg, "message_id", None) or ""
-            conversation_id = getattr(chatbot_msg, "conversation_id", None) or ""
-
-            # Thinking reaction — fire-and-forget, tracked
-            if msg_id and conversation_id:
-                self._adapter._spawn_bg(
-                    self._adapter._send_emotion(
-                        msg_id, conversation_id, "🤔Thinking", recall=False,
-                    )
-                )
-
-            # Fire-and-forget: return ACK immediately, process in background.
-            # Blocking here would prevent the SDK from sending heartbeats,
-            # eventually causing a disconnect.  _on_message is wrapped so
-            # exceptions inside the task surface in logs instead of
-            # disappearing into the event loop.
-            asyncio.create_task(self._safe_on_message(chatbot_msg))
-        except Exception:
-            logger.exception(
-                "[%s] Error preparing incoming message", self._adapter.name
-            )
-            return AckMessage.STATUS_SYSTEM_EXCEPTION, "error"
-
-        return AckMessage.STATUS_OK, "OK"
-
-    async def _safe_on_message(self, chatbot_msg: "ChatbotMessage") -> None:
-        """Wrapper that catches exceptions from _on_message."""
-        try:
-            await self._adapter._on_message(chatbot_msg)
-        except Exception:
-            logger.exception(
-                "[%s] Error processing incoming message", self._adapter.name
-            )
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # Plugin migration glue (#41112 / #3823)
@@ -1981,163 +1351,6 @@ class _IncomingHandler(
 # dict in hermes_cli/gateway.py, and the _send_dingtalk dispatch in
 # tools/send_message_tool.py).
 # ──────────────────────────────────────────────────────────────────────────
-
-
-async def _standalone_send(
-    pconfig,
-    chat_id,
-    message,
-    *,
-    thread_id=None,
-    media_files=None,
-    force_document=False,
-):
-    """Out-of-process DingTalk delivery via a static robot webhook URL.
-
-    Implements the standalone_sender_fn contract so deliver=dingtalk cron jobs
-    succeed when cron runs separately from the gateway. The live adapter uses
-    per-session webhook URLs from incoming messages, which aren't available
-    out-of-process; this path uses the static DINGTALK_WEBHOOK_URL / extra
-    webhook_url instead. Replaces the legacy _send_dingtalk helper.
-    """
-    extra = getattr(pconfig, "extra", {}) or {}
-    try:
-        import httpx
-    except ImportError:
-        return {"error": "httpx not installed"}
-    try:
-        webhook_url = extra.get("webhook_url") or os.getenv("DINGTALK_WEBHOOK_URL", "")
-        if not webhook_url:
-            return {"error": "DingTalk not configured. Set DINGTALK_WEBHOOK_URL env var or webhook_url in dingtalk platform extra config."}
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                webhook_url,
-                json={"msgtype": "text", "text": {"content": message}},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("errcode", 0) != 0:
-                return {"error": f"DingTalk API error: {data.get('errmsg', 'unknown')}"}
-        return {"success": True, "platform": "dingtalk", "chat_id": chat_id}
-    except Exception as e:
-        # Redact the access_token from webhook URLs that may appear in the
-        # exception text. Reuse send_message_tool._error's redaction so the
-        # logic stays single-sourced (lazy import avoids a circular at module
-        # load). Falls back to a plain message if that helper is unavailable.
-        try:
-            from tools.send_message_tool import _error as _redact_error
-            return _redact_error(f"DingTalk send failed: {e}")
-        except Exception:
-            return {"error": f"DingTalk send failed: {e}"}
-
-
-def interactive_setup() -> None:
-    """Configure DingTalk — QR scan (recommended) or manual credential entry.
-
-    Replaces hermes_cli/setup.py-era _setup_dingtalk + the static
-    _PLATFORMS["dingtalk"] dict in hermes_cli/gateway.py. CLI helpers are
-    lazy-imported so the plugin's module-load surface stays minimal.
-    """
-    from hermes_cli.config import get_env_value, save_env_value
-    from hermes_cli.setup import prompt_choice
-    from hermes_cli.cli_output import (
-        prompt,
-        prompt_yes_no,
-        print_header,
-        print_success,
-        print_warning,
-    )
-
-    print_header("DingTalk")
-    existing = get_env_value("DINGTALK_CLIENT_ID")
-    if existing:
-        print_success(f"DingTalk is already configured (Client ID: {existing}).")
-        if not prompt_yes_no("Reconfigure DingTalk?", False):
-            return
-
-    method = prompt_choice(
-        "Choose setup method",
-        [
-            "QR Code Scan (Recommended, auto-obtain Client ID and Client Secret)",
-            "Manual Input (Client ID and Client Secret)",
-        ],
-        default=0,
-    )
-
-    if method == 0:
-        try:
-            from hermes_cli.dingtalk_auth import dingtalk_qr_auth
-        except ImportError as exc:
-            print_warning(f"QR auth module failed to load ({exc}), falling back to manual input.")
-            _manual_credential_entry(prompt, save_env_value, print_success)
-            return
-        result = dingtalk_qr_auth()
-        if result is None:
-            print_warning("QR auth incomplete, falling back to manual input.")
-            _manual_credential_entry(prompt, save_env_value, print_success)
-            return
-        client_id, client_secret = result
-        save_env_value("DINGTALK_CLIENT_ID", client_id)
-        save_env_value("DINGTALK_CLIENT_SECRET", client_secret)
-        print_success("DingTalk configured via QR scan!")
-    else:
-        _manual_credential_entry(prompt, save_env_value, print_success)
-
-
-def _manual_credential_entry(prompt, save_env_value, print_success) -> None:
-    client_id = prompt("DingTalk Client ID (app key)")
-    if not client_id:
-        return
-    save_env_value("DINGTALK_CLIENT_ID", client_id)
-    client_secret = prompt("DingTalk Client Secret", password=True)
-    if client_secret:
-        save_env_value("DINGTALK_CLIENT_SECRET", client_secret)
-    print_success("DingTalk credentials saved")
-
-
-def _apply_yaml_config(yaml_cfg: dict, dingtalk_cfg: dict) -> dict | None:
-    """Translate config.yaml dingtalk: keys into DINGTALK_* env vars.
-
-    Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
-    dingtalk_cfg block from gateway/config.py::load_gateway_config(). Env vars
-    take precedence over YAML (each assignment guarded by not os.getenv(...)).
-    Returns None — everything flows through env.
-    """
-    import json as _json
-    if "require_mention" in dingtalk_cfg and not os.getenv("DINGTALK_REQUIRE_MENTION"):
-        os.environ["DINGTALK_REQUIRE_MENTION"] = str(dingtalk_cfg["require_mention"]).lower()
-    if "mention_patterns" in dingtalk_cfg and not os.getenv("DINGTALK_MENTION_PATTERNS"):
-        os.environ["DINGTALK_MENTION_PATTERNS"] = _json.dumps(dingtalk_cfg["mention_patterns"])
-    frc = dingtalk_cfg.get("free_response_chats")
-    if frc is not None and not os.getenv("DINGTALK_FREE_RESPONSE_CHATS"):
-        if isinstance(frc, list):
-            frc = ",".join(str(v) for v in frc)
-        os.environ["DINGTALK_FREE_RESPONSE_CHATS"] = str(frc)
-    ac = dingtalk_cfg.get("allowed_chats")
-    if ac is not None and not os.getenv("DINGTALK_ALLOWED_CHATS"):
-        if isinstance(ac, list):
-            ac = ",".join(str(v) for v in ac)
-        os.environ["DINGTALK_ALLOWED_CHATS"] = str(ac)
-    allowed = dingtalk_cfg.get("allowed_users")
-    if allowed is not None and not os.getenv("DINGTALK_ALLOWED_USERS"):
-        if isinstance(allowed, list):
-            allowed = ",".join(str(v) for v in allowed)
-        os.environ["DINGTALK_ALLOWED_USERS"] = str(allowed)
-    return None
-
-
-def _is_connected(config) -> bool:
-    """DingTalk is connected when client_id + client_secret are present.
-
-    Mirrors the legacy _PLATFORM_CONNECTED_CHECKERS[Platform.DINGTALK] entry.
-    Reads from PlatformConfig.extra first, then env vars.
-    """
-    extra = getattr(config, "extra", {}) or {}
-    return bool(
-        (extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
-        and (extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
-    )
-
 
 def _build_adapter(config):
     """Factory wrapper that constructs DingTalkAdapter from a PlatformConfig."""
