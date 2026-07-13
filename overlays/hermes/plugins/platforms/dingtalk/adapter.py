@@ -1377,3 +1377,13 @@ def register(ctx) -> None:
         emoji="🐳",
         allow_update_command=True,
     )
+    # Admin-gated 1:1 private-message tool (config-driven allowlist; see private_send.py).
+    # A tool-registration failure must never break the platform adapter itself.
+    try:
+        from .private_send import register_private_send_tool
+
+        register_private_send_tool(ctx)
+    except Exception:  # noqa: BLE001 — optional tool; degrade without killing the platform
+        logging.getLogger(__name__).warning(
+            "DingTalk private-send tool registration failed", exc_info=True
+        )

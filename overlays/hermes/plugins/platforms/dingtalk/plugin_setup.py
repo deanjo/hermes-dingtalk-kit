@@ -121,6 +121,11 @@ def _apply_yaml_config(yaml_cfg: dict, dingtalk_cfg: dict) -> dict | None:
         if isinstance(allowed, list):
             allowed = ",".join(str(v) for v in allowed)
         os.environ["DINGTALK_ALLOWED_USERS"] = str(allowed)
+    admins = dingtalk_cfg.get("private_message_admins")
+    if admins is not None and not os.getenv("DINGTALK_PRIVATE_MESSAGE_ADMINS"):
+        if isinstance(admins, list):
+            admins = ",".join(str(v) for v in admins)
+        os.environ["DINGTALK_PRIVATE_MESSAGE_ADMINS"] = str(admins)
     return None
 
 

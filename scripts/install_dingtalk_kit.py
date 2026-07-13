@@ -30,6 +30,7 @@ PLUGIN_FILES = (
     "mentions.py",
     "plugin_setup.py",
     "plugin.yaml",
+    "private_send.py",
     "reply_context.py",
 )
 CORE_REL_PATHS = (
