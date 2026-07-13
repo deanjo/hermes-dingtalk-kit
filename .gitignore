@@ -8,3 +8,12 @@ dist/
 build/
 *.egg-info/
 
+# never commit secrets or local backups
+.env
+.env.*
+*.env
+*.bak
+*.bak.*
+*.bad*
+*.pristine*
+
