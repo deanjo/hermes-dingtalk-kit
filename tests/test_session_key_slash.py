@@ -26,9 +26,9 @@ class SessionKeySlashTest(unittest.TestCase):
 
     def test_dingtalk_base64_keys_are_allowed(self):
         allowed = [
-            "agent:main:dingtalk:dm:cidDAIsw68cJ7w/QyVwV0zB+KTziay5M9uOmLdzHoEi1tM=",
-            "agent:main:dingtalk:group:cidvL9m/YqbdGp1lPYxdOOEvw==:10000000000000001",
-            "agent:main:dingtalk:dm:$:LWCP_v1:$NW/8Xdhg39tkxmokXozO/Q==",
+            "agent:main:dingtalk:dm:cidEXAMPLEbase64/WithSlashAAAA=",
+            "agent:main:dingtalk:group:cidEXAMPLEbase64/WithSlash==:10000000000000001",
+            "agent:main:dingtalk:dm:$:LWCP_v1:$EXAMPLE/EncryptedIdAA==",
         ]
         for key in allowed:
             self.assertFalse(self.unsafe_session_key(key), key)

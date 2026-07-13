@@ -327,9 +327,9 @@ def _load_function_from_ast(path: Path, function_name: str) -> Any:
 def _assert_session_key_slash(root: Path) -> str:
     checker = _load_function_from_ast(root / "gateway/session.py", "_is_session_key_unsafe")
     allowed = [
-        "agent:main:dingtalk:dm:cidDAIsw68cJ7w/QyVwV0zB+KTziay5M9uOmLdzHoEi1tM=",
-        "agent:main:dingtalk:group:cidvL9m/YqbdGp1lPYxdOOEvw==:10000000000000001",
-        "agent:main:dingtalk:dm:$:LWCP_v1:$NW/8Xdhg39tkxmokXozO/Q==",
+        "agent:main:dingtalk:dm:cidEXAMPLEbase64/WithSlashAAAA=",
+        "agent:main:dingtalk:group:cidEXAMPLEbase64/WithSlash==:10000000000000001",
+        "agent:main:dingtalk:dm:$:LWCP_v1:$EXAMPLE/EncryptedIdAA==",
     ]
     blocked = [
         "../../etc/passwd",
