@@ -105,15 +105,43 @@ class MentionMetaLineTest(unittest.TestCase):
         self.assertEqual("", self.mod.mention_meta_line(msg, {}))
 
     def test_missing_bot_id_not_in_at_list_reports_all(self):
-        # Free-response chat: bot not @'d, another human is.
+        # Free-response chat: bot not @'d, another human is. The wording must
+        # NOT imply the bot was mentioned.
         msg = _message(
             at_users=[_at_user(dingtalk_id="$:LWCP_v1:$a", staff_id="111199")],
             chatbot_user_id=None,
             is_in_at_list=False,
         )
         line = self.mod.mention_meta_line(msg, {})
-        self.assertIn("还@了 1 位群成员", line)
+        self.assertIn("本消息未@你", line)
+        self.assertIn("@了 1 位群成员", line)
         self.assertIn("工号尾号1199", line)
+        self.assertNotIn("除你以外", line)
+
+    def test_numeric_staff_id_payload_does_not_crash(self):
+        # A JSON-number staffId must not raise (a crash here silently drops
+        # the whole inbound message via _safe_on_message).
+        msg = _message(
+            at_users=[
+                _at_user(dingtalk_id=BOT_ID),
+                SimpleNamespace(dingtalk_id="$:LWCP_v1:$a", staff_id=15528999368652879),
+            ]
+        )
+        line = self.mod.mention_meta_line(msg, {})
+        self.assertIn("工号尾号2879", line)
+
+    def test_int_keys_in_name_map_are_normalised(self):
+        # YAML parses unquoted all-digit keys as ints; the mapping must still hit.
+        msg = _message(
+            at_users=[
+                _at_user(dingtalk_id=BOT_ID),
+                _at_user(dingtalk_id="$:LWCP_v1:$a", staff_id="15528999368652879"),
+            ]
+        )
+        extra = {"at_user_names": {15528999368652879: "胡东光"}}
+        line = self.mod.mention_meta_line(msg, extra)
+        self.assertIn("胡东光", line)
+        self.assertNotIn("工号尾号", line)
 
     def test_multiple_others_counted_and_joined(self):
         msg = _message(
@@ -143,7 +171,9 @@ class AdapterWiringTest(unittest.TestCase):
     def test_adapter_injects_mention_meta_for_group_messages(self):
         text = ADAPTER_PATH.read_text(encoding="utf-8")
         self.assertIn("mention_meta_line(message", text)
-        self.assertIn("if is_group:", text)
+        # Slash commands are consumed verbatim by the gateway; the adapter
+        # must skip the meta line for them.
+        self.assertIn('if is_group and not (text or "").lstrip().startswith("/")', text)
         # Both import paths must export the helper.
         self.assertEqual(2, text.count("mention_meta_line, should_process_message"))
 

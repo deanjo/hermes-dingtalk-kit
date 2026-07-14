@@ -606,8 +606,10 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         # DingTalk strips @-mention tokens from text.content server-side and
         # only delivers the at list structurally; surface the non-bot entries
-        # so the model can resolve who "你/你们" refers to.
-        if is_group:
+        # so the model can resolve who "你/你们" refers to. Slash commands are
+        # consumed verbatim by the gateway (get_command_args, confirm/clarify
+        # matchers), so never append to them.
+        if is_group and not (text or "").lstrip().startswith("/"):
             mention_meta = mention_meta_line(message, self.config.extra or {})
             if mention_meta:
                 text = f"{text}\n\n{mention_meta}" if text else mention_meta

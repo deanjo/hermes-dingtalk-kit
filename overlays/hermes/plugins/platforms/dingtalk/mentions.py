@@ -120,21 +120,29 @@ def mention_meta_line(message: "ChatbotMessage", extra: dict) -> str:
     at_users = getattr(message, "at_users", None) or []
     if not at_users:
         return ""
-    bot_id = getattr(message, "chatbot_user_id", None) or ""
-    if not bot_id and getattr(message, "is_in_at_list", False):
+    bot_mentioned = bool(getattr(message, "is_in_at_list", False))
+    bot_id = str(getattr(message, "chatbot_user_id", None) or "")
+    if not bot_id and bot_mentioned:
         # The bot is somewhere in the at list but we cannot tell which entry
         # it is; a wrong "someone else was mentioned" hint is worse than none.
         return ""
     others = []
     for user in at_users:
-        dingtalk_id = getattr(user, "dingtalk_id", None) or ""
+        # str-coerce both ids: a numeric staffId in the payload would
+        # otherwise crash the slicing below, and _safe_on_message swallowing
+        # that exception silently drops the whole message.
+        dingtalk_id = str(getattr(user, "dingtalk_id", None) or "")
         if bot_id and dingtalk_id and dingtalk_id == bot_id:
             continue
-        others.append((dingtalk_id, getattr(user, "staff_id", None) or ""))
+        others.append((dingtalk_id, str(getattr(user, "staff_id", None) or "")))
     if not others:
         return ""
     name_map = extra.get("at_user_names")
-    if not isinstance(name_map, dict):
+    if isinstance(name_map, dict):
+        # YAML parses unquoted all-digit keys (staffIds) as ints; normalise
+        # so the mapping works however the operator wrote it.
+        name_map = {str(k): v for k, v in name_map.items()}
+    else:
         name_map = {}
     labels = []
     for dingtalk_id, staff_id in others:
@@ -145,8 +153,9 @@ def mention_meta_line(message: "ChatbotMessage", extra: dict) -> str:
             labels.append(f"工号尾号{staff_id[-4:]}")
         else:
             labels.append("未知成员")
+    prefix = "除你以外，本消息还" if bot_mentioned else "本消息未@你，"
     return (
-        f"【消息元信息】除你以外，本消息还@了 {len(others)} 位群成员："
+        f"【消息元信息】{prefix}@了 {len(others)} 位群成员："
         f"{'、'.join(labels)}。请据此分辨正文中“你/你们”的指代对象。"
     )
 
