@@ -108,7 +108,7 @@ try:
     from .incoming import make_incoming_handler
     from .markdown import normalize_markdown
     from .media import extract_media
-    from .mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, should_process_message
+    from .mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message
     from .plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup
     from .reply_context import (
         _forwarded_chat_text_from_raw,
@@ -125,7 +125,7 @@ except ImportError:
     from incoming import make_incoming_handler  # type: ignore
     from markdown import normalize_markdown  # type: ignore
     from media import extract_media  # type: ignore
-    from mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, should_process_message  # type: ignore
+    from mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message  # type: ignore
     from plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup  # type: ignore
     from reply_context import (  # type: ignore
         _forwarded_chat_text_from_raw,
@@ -603,6 +603,14 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not text and not media_urls:
             logger.debug("[%s] Empty message, skipping", self.name)
             return
+
+        # DingTalk strips @-mention tokens from text.content server-side and
+        # only delivers the at list structurally; surface the non-bot entries
+        # so the model can resolve who "你/你们" refers to.
+        if is_group:
+            mention_meta = mention_meta_line(message, self.config.extra or {})
+            if mention_meta:
+                text = f"{text}\n\n{mention_meta}" if text else mention_meta
 
         source = self.build_source(
             chat_id=chat_id,
