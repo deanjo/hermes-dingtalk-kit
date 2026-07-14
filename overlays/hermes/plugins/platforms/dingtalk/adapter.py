@@ -760,8 +760,17 @@ class DingTalkAdapter(BasePlatformAdapter):
         #   2. fire Done reaction?  Only when this is the final reply.
         is_final_reply = reply_to is not None
 
+        # Structured @-mentions requested by the caller (e.g. the
+        # product-confirmation tool @-ing the product owner). AI Cards have no
+        # at-mention field, so a send carrying at_user_ids must take the
+        # webhook markdown path deterministically.
+        raw_at = metadata.get("at_user_ids") or []
+        if isinstance(raw_at, str):
+            raw_at = [raw_at]
+        at_user_ids = [str(u) for u in raw_at if str(u).strip()]
+
         # Try AI Card first (using alibabacloud_dingtalk.card_1_0 SDK).
-        if self._card_template_id and current_message and self._card_sdk:
+        if self._card_template_id and current_message and self._card_sdk and not at_user_ids:
             # Close any previously-open streaming cards for this chat
             # before creating a new one (handles tool-progress → final-
             # response handoff; also cleans up lingering commentary cards).
@@ -795,12 +804,33 @@ class DingTalkAdapter(BasePlatformAdapter):
             "msgtype": "markdown",
             "markdown": {"title": "Hermes", "text": normalized},
         }
+        if at_user_ids:
+            payload["at"] = {"atUserIds": at_user_ids, "isAtAll": False}
 
         try:
             resp = await self._http_client.post(
                 session_webhook, json=payload, timeout=15.0
             )
             if resp.status_code < 300:
+                # DingTalk webhooks report most delivery failures (robot
+                # removed from the chat, content blocked by moderation,
+                # expired webhook) as HTTP 200 with errcode != 0 in the JSON
+                # body — treat those as failures, not silent successes.
+                try:
+                    body_json = resp.json()
+                except Exception:
+                    body_json = None
+                if isinstance(body_json, dict) and body_json.get("errcode", 0) != 0:
+                    logger.warning(
+                        "[%s] Send rejected by DingTalk errcode=%s errmsg=%s",
+                        self.name, body_json.get("errcode"),
+                        str(body_json.get("errmsg"))[:200],
+                    )
+                    return SendResult(
+                        success=False,
+                        error=f"DingTalk errcode {body_json.get('errcode')}:"
+                              f" {str(body_json.get('errmsg'))[:200]}",
+                    )
                 # Webhook path: fire Done only for final replies, same as
                 # the card path.
                 if is_final_reply:
