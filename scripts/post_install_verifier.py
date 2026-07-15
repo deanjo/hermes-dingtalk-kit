@@ -35,9 +35,17 @@ PLUGIN_FILES = (
     "mentions.py",
     "plugin_setup.py",
     "plugin.yaml",
+    "private_send.py",
     "reply_context.py",
 )
 PLUGIN_REL = Path("plugins/platforms/dingtalk")
+PRODUCT_PLUGIN_FILES = (
+    "__init__.py",
+    "plugin.yaml",
+    "store.py",
+    "tools.py",
+)
+PRODUCT_PLUGIN_REL = Path("plugins/product_confirmation")
 FAILURE_STATUSES = {"error", "failed", "missing-file"}
 
 
@@ -383,12 +391,17 @@ def _assert_session_context_bridge(root: Path) -> str:
     return "session context bridge sets and clears DingTalk fields"
 
 
-def _check_plugin_files(root: Path) -> list[CheckResult]:
+def _check_plugin_files(
+    root: Path,
+    plugin_rel: Path = PLUGIN_REL,
+    filenames: tuple[str, ...] = PLUGIN_FILES,
+    name_prefix: str = "plugin",
+) -> list[CheckResult]:
     results: list[CheckResult] = []
-    for filename in PLUGIN_FILES:
-        rel_path = PLUGIN_REL / filename
+    for filename in filenames:
+        rel_path = plugin_rel / filename
         path = root / rel_path
-        name = f"plugin.file.{filename}"
+        name = f"{name_prefix}.file.{filename}"
         if not path.exists():
             results.append(_fail(name, str(rel_path), "missing-file", "required plugin file not found"))
             continue
@@ -396,7 +409,7 @@ def _check_plugin_files(root: Path) -> list[CheckResult]:
         if path.suffix != ".py":
             continue
         line_count = len(path.read_text(encoding="utf-8").splitlines())
-        line_name = f"plugin.line_count.{filename}"
+        line_name = f"{name_prefix}.line_count.{filename}"
         if line_count > MAX_SOURCE_LINES:
             results.append(
                 _fail(
@@ -409,6 +422,131 @@ def _check_plugin_files(root: Path) -> list[CheckResult]:
         else:
             results.append(_ok(line_name, str(rel_path), f"{line_count} lines"))
     return results
+
+
+def _assert_product_plugin(root: Path) -> str:
+    """Load Product Confirmation as a package and inspect its public surface."""
+    plugin_dir = root / PRODUCT_PLUGIN_REL
+    module_name = f"post_install_product_confirmation_{id(root)}"
+    for loaded_name in list(sys.modules):
+        if loaded_name == module_name or loaded_name.startswith(module_name + "."):
+            sys.modules.pop(loaded_name, None)
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        plugin_dir / "__init__.py",
+        submodule_search_locations=[str(plugin_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("cannot load product_confirmation package")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+
+        class FakeContext:
+            def __init__(self) -> None:
+                self.hooks: list[tuple[str, Any]] = []
+                self.tools: list[str] = []
+
+            def register_hook(self, name: str, callback: Any) -> None:
+                self.hooks.append((name, callback))
+
+            def register_tool(self, *, name: str, **kwargs: Any) -> None:
+                self.tools.append(name)
+
+        context = FakeContext()
+        module.register(context)
+        expected_tools = {
+            "product_confirm_draft",
+            "product_confirm_request",
+            "product_confirm_decide",
+            "product_confirm_advance",
+            "product_confirm_status",
+        }
+        if set(context.tools) != expected_tools:
+            raise AssertionError(f"unexpected Product tools: {sorted(context.tools)!r}")
+        if [name for name, _ in context.hooks] != ["pre_gateway_dispatch"]:
+            raise AssertionError(f"unexpected Product hooks: {context.hooks!r}")
+    finally:
+        for loaded_name in list(sys.modules):
+            if loaded_name == module_name or loaded_name.startswith(module_name + "."):
+                sys.modules.pop(loaded_name, None)
+
+    tools_text = (plugin_dir / "tools.py").read_text(encoding="utf-8")
+    forbidden = [
+        "gateway.run import _gateway_runner_ref",
+        "HERMES_SESSION_USER_ID_ALT",
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+    ]
+    present = [marker for marker in forbidden if marker in tools_text]
+    if present:
+        raise AssertionError("private gateway bridge markers present: " + ", ".join(present))
+    required = [
+        'getattr(source, "user_id_alt"',
+        "capture_dispatch_context",
+        "asyncio.run_coroutine_threadsafe",
+    ]
+    missing = [marker for marker in required if marker not in tools_text]
+    if missing:
+        raise AssertionError("missing public hook wiring: " + ", ".join(missing))
+    return "five Product tools plus pre_gateway_dispatch hook registered"
+
+
+def _assert_product_manifest(root: Path) -> str:
+    text = (root / PRODUCT_PLUGIN_REL / "plugin.yaml").read_text(encoding="utf-8")
+    required = [
+        "name: product_confirmation",
+        "kind: standalone",
+        "product_confirm_draft",
+        "product_confirm_request",
+        "product_confirm_decide",
+        "product_confirm_advance",
+        "product_confirm_status",
+    ]
+    missing = [marker for marker in required if marker not in text]
+    if missing:
+        raise AssertionError("missing Product manifest markers: " + ", ".join(missing))
+    return "Product manifest declares standalone plugin and five tools"
+
+
+def _product_hook_contract_probe(root: Path) -> CheckResult:
+    hook_registry = root / "hermes_cli/plugins.py"
+    gateway_run = root / "gateway/run.py"
+    if not hook_registry.is_file() or not gateway_run.is_file():
+        return _skip(
+            "product.public_hook_contract",
+            ".",
+            "full Hermes public hook runtime not present in target root",
+        )
+    try:
+        registry_text = hook_registry.read_text(encoding="utf-8")
+        run_text = gateway_run.read_text(encoding="utf-8")
+        if '"pre_gateway_dispatch"' not in registry_text:
+            raise AssertionError("pre_gateway_dispatch absent from VALID_HOOKS")
+        required = [
+            '"pre_gateway_dispatch",',
+            "event=event,",
+            "gateway=self,",
+            "session_store=self.session_store,",
+        ]
+        missing = [marker for marker in required if marker not in run_text]
+        if missing:
+            raise AssertionError("gateway hook kwargs missing: " + ", ".join(missing))
+    except AssertionError as exc:
+        return _fail("product.public_hook_contract", ".", "failed", str(exc))
+    except Exception as exc:  # noqa: BLE001 - verifier boundary
+        return _fail(
+            "product.public_hook_contract",
+            ".",
+            "error",
+            f"{type(exc).__name__}: {exc}",
+        )
+    return _ok(
+        "product.public_hook_contract",
+        ".",
+        "event, gateway and session_store public kwargs found",
+    )
 
 
 def _compat_results(root: Path) -> list[CheckResult]:
@@ -444,7 +582,7 @@ def _has_failure(results: list[CheckResult]) -> bool:
     return any(result.status in FAILURE_STATUSES for result in results)
 
 
-def build_report(target: Path) -> dict[str, Any]:
+def build_report(target: Path, *, require_compat: bool = True) -> dict[str, Any]:
     results: list[CheckResult] = []
     try:
         compat = _load_compat_patcher()
@@ -461,12 +599,18 @@ def build_report(target: Path) -> dict[str, Any]:
         )
     else:
         results.append(_ok("target.resolve", str(root), "Hermes root located"))
-        compat_results = _compat_results(root)
+        compat_results = _compat_results(root) if require_compat else []
         results.extend(compat_results)
         if not _has_failure(compat_results):
             plugin_results = _check_plugin_files(root)
-            results.extend(plugin_results)
-            if not _has_failure(plugin_results):
+            product_results = _check_plugin_files(
+                root,
+                PRODUCT_PLUGIN_REL,
+                PRODUCT_PLUGIN_FILES,
+                "product",
+            )
+            results.extend(plugin_results + product_results)
+            if not _has_failure(plugin_results + product_results):
                 results.extend(
                     [
                         _run_check("plugin.manifest", str(PLUGIN_REL / "plugin.yaml"), lambda: _assert_plugin_manifest(root)),
@@ -474,10 +618,18 @@ def build_report(target: Path) -> dict[str, Any]:
                         _runtime_discovery_probe(root),
                         _run_check("plugin.raw_process_ack", str(PLUGIN_REL / "incoming.py"), lambda: _assert_raw_process_ack(root)),
                         _run_check("plugin.reply_context_kwargs", str(PLUGIN_REL / "reply_context.py"), lambda: _assert_reply_context(root)),
-                        _run_check("gateway.session_key_slash", "gateway/session.py", lambda: _assert_session_key_slash(root)),
-                        _run_check("gateway.session_context_bridge", "gateway/session_context.py", lambda: _assert_session_context_bridge(root)),
+                        _run_check("product.manifest", str(PRODUCT_PLUGIN_REL / "plugin.yaml"), lambda: _assert_product_manifest(root)),
+                        _run_check("product.entry", str(PRODUCT_PLUGIN_REL / "__init__.py"), lambda: _assert_product_plugin(root)),
+                        _product_hook_contract_probe(root),
                     ]
                 )
+                if require_compat:
+                    results.extend(
+                        [
+                            _run_check("gateway.session_key_slash", "gateway/session.py", lambda: _assert_session_key_slash(root)),
+                            _run_check("gateway.session_context_bridge", "gateway/session_context.py", lambda: _assert_session_context_bridge(root)),
+                        ]
+                    )
 
     failures = [result for result in results if result.status in FAILURE_STATUSES]
     return {
@@ -485,6 +637,7 @@ def build_report(target: Path) -> dict[str, Any]:
         "target": str(root),
         "check_count": len(results),
         "failure_count": len(failures),
+        "require_compat": require_compat,
         "checks": [result.to_dict() for result in results],
     }
 
@@ -510,10 +663,15 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Hermes root containing gateway/ and plugins/platforms/dingtalk/.",
     )
+    parser.add_argument(
+        "--plugins-only",
+        action="store_true",
+        help="Verify Kit-owned plugin trees without requiring legacy core compat markers.",
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     args = parser.parse_args(argv)
 
-    report = build_report(args.target)
+    report = build_report(args.target, require_compat=not args.plugins_only)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     else:

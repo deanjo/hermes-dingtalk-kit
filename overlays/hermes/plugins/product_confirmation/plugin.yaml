@@ -1,0 +1,11 @@
+name: product_confirmation
+version: 0.2.0
+description: "Product proposal confirmation state machine — durable SQLite state (PRODUCT_DRAFT -> WAITING_PRODUCT_CONFIRMATION -> APPROVED/NEEDS_REVISION -> TECH_DESIGN) with a directed DingTalk confirmation request to the configured product owner. The public pre_gateway_dispatch hook supplies event.source.user_id_alt and the live gateway; decisions never trust model arguments or a private environment bridge. Standalone: opt in via `hermes plugins enable product_confirmation`."
+author: openclaw-harmes
+kind: standalone
+provides_tools:
+  - product_confirm_draft
+  - product_confirm_request
+  - product_confirm_decide
+  - product_confirm_advance
+  - product_confirm_status
