@@ -35,6 +35,10 @@ class PostInstallVerifierTest(unittest.TestCase):
             OVERLAY / "plugins/platforms/dingtalk",
             root / "plugins/platforms/dingtalk",
         )
+        shutil.copytree(
+            OVERLAY / "plugins/product_confirmation",
+            root / "plugins/product_confirmation",
+        )
         return root
 
     def test_overlay_installation_report_passes(self):
@@ -48,6 +52,9 @@ class PostInstallVerifierTest(unittest.TestCase):
         self.assertIn("plugin.runtime_discovery", check_names)
         self.assertIn("plugin.raw_process_ack", check_names)
         self.assertIn("plugin.reply_context_kwargs", check_names)
+        self.assertIn("product.manifest", check_names)
+        self.assertIn("product.entry", check_names)
+        self.assertIn("product.public_hook_contract", check_names)
         self.assertIn("gateway.session_key_slash", check_names)
         self.assertIn("gateway.session_context_bridge", check_names)
         runtime = next(item for item in report["checks"] if item["name"] == "plugin.runtime_discovery")

@@ -108,7 +108,7 @@ try:
     from .incoming import make_incoming_handler
     from .markdown import normalize_markdown
     from .media import extract_media
-    from .mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, should_process_message
+    from .mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message
     from .plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup
     from .reply_context import (
         _forwarded_chat_text_from_raw,
@@ -125,7 +125,7 @@ except ImportError:
     from incoming import make_incoming_handler  # type: ignore
     from markdown import normalize_markdown  # type: ignore
     from media import extract_media  # type: ignore
-    from mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, should_process_message  # type: ignore
+    from mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message  # type: ignore
     from plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup  # type: ignore
     from reply_context import (  # type: ignore
         _forwarded_chat_text_from_raw,
@@ -604,6 +604,16 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.debug("[%s] Empty message, skipping", self.name)
             return
 
+        # DingTalk strips @-mention tokens from text.content server-side and
+        # only delivers the at list structurally; surface the non-bot entries
+        # so the model can resolve who "你/你们" refers to. Slash commands are
+        # consumed verbatim by the gateway (get_command_args, confirm/clarify
+        # matchers), so never append to them.
+        if is_group and not (text or "").lstrip().startswith("/"):
+            mention_meta = mention_meta_line(message, self.config.extra or {})
+            if mention_meta:
+                text = f"{text}\n\n{mention_meta}" if text else mention_meta
+
         source = self.build_source(
             chat_id=chat_id,
             chat_name=getattr(message, "conversation_title", None),
@@ -733,11 +743,16 @@ class DingTalkAdapter(BasePlatformAdapter):
                 return SendResult(
                     success=False,
                     error="No valid session_webhook available. Reply must follow an incoming message.",
+                    raw_response={"delivery_outcome": "rejected"},
                 )
             session_webhook, _ = webhook_info
 
         if not self._http_client:
-            return SendResult(success=False, error="HTTP client not initialized")
+            return SendResult(
+                success=False,
+                error="HTTP client not initialized",
+                raw_response={"delivery_outcome": "rejected"},
+            )
 
         # Look up the inbound message for this chat (for AI Card routing)
         current_message = self._message_contexts.get(chat_id)
@@ -752,8 +767,17 @@ class DingTalkAdapter(BasePlatformAdapter):
         #   2. fire Done reaction?  Only when this is the final reply.
         is_final_reply = reply_to is not None
 
+        # Structured @-mentions requested by the caller (e.g. the
+        # product-confirmation tool @-ing the product owner). AI Cards have no
+        # at-mention field, so a send carrying at_user_ids must take the
+        # webhook markdown path deterministically.
+        raw_at = metadata.get("at_user_ids") or []
+        if isinstance(raw_at, str):
+            raw_at = [raw_at]
+        at_user_ids = [str(u) for u in raw_at if str(u).strip()]
+
         # Try AI Card first (using alibabacloud_dingtalk.card_1_0 SDK).
-        if self._card_template_id and current_message and self._card_sdk:
+        if self._card_template_id and current_message and self._card_sdk and not at_user_ids:
             # Close any previously-open streaming cards for this chat
             # before creating a new one (handles tool-progress → final-
             # response handoff; also cleans up lingering commentary cards).
@@ -764,6 +788,13 @@ class DingTalkAdapter(BasePlatformAdapter):
                 finalize=is_final_reply,
             )
             if result and result.success:
+                raw_response = (
+                    dict(result.raw_response)
+                    if isinstance(result.raw_response, dict)
+                    else {}
+                )
+                raw_response["delivery_outcome"] = "delivered"
+                result.raw_response = raw_response
                 if is_final_reply:
                     # Final reply: card closed, swap Thinking → Done.
                     self._fire_done_reaction(chat_id)
@@ -787,31 +818,65 @@ class DingTalkAdapter(BasePlatformAdapter):
             "msgtype": "markdown",
             "markdown": {"title": "Hermes", "text": normalized},
         }
+        if at_user_ids:
+            payload["at"] = {"atUserIds": at_user_ids, "isAtAll": False}
 
         try:
             resp = await self._http_client.post(
                 session_webhook, json=payload, timeout=15.0
             )
             if resp.status_code < 300:
+                # DingTalk webhooks report most delivery failures (robot
+                # removed from the chat, content blocked by moderation,
+                # expired webhook) as HTTP 200 with errcode != 0 in the JSON
+                # body — treat those as failures, not silent successes.
+                try:
+                    body_json = resp.json()
+                except Exception:
+                    body_json = None
+                if isinstance(body_json, dict) and body_json.get("errcode", 0) != 0:
+                    logger.warning(
+                        "[%s] Send rejected by DingTalk errcode=%s errmsg=%s",
+                        self.name, body_json.get("errcode"),
+                        str(body_json.get("errmsg"))[:200],
+                    )
+                    return SendResult(
+                        success=False,
+                        error=f"DingTalk errcode {body_json.get('errcode')}:"
+                              f" {str(body_json.get('errmsg'))[:200]}",
+                        raw_response={"delivery_outcome": "rejected"},
+                    )
                 # Webhook path: fire Done only for final replies, same as
                 # the card path.
                 if is_final_reply:
                     self._fire_done_reaction(chat_id)
-                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+                return SendResult(
+                    success=True,
+                    message_id=uuid.uuid4().hex[:12],
+                    raw_response={"delivery_outcome": "delivered"},
+                )
             body = resp.text
             logger.warning(
                 "[%s] Send failed HTTP %d: %s", self.name, resp.status_code, body[:200]
             )
             return SendResult(
-                success=False, error=f"HTTP {resp.status_code}: {body[:200]}"
+                success=False,
+                error=f"HTTP {resp.status_code}: {body[:200]}",
+                raw_response={"delivery_outcome": "rejected"},
             )
         except httpx.TimeoutException:
             return SendResult(
-                success=False, error="Timeout sending message to DingTalk"
+                success=False,
+                error="Timeout sending message to DingTalk",
+                raw_response={"delivery_outcome": "unknown"},
             )
         except Exception as e:
             logger.error("[%s] Send error: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+            return SendResult(
+                success=False,
+                error=str(e),
+                raw_response={"delivery_outcome": "unknown"},
+            )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """DingTalk does not support typing indicators."""

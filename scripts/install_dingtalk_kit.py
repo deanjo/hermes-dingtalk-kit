@@ -11,6 +11,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,14 @@ PLUGIN_FILES = (
     "plugin.yaml",
     "private_send.py",
     "reply_context.py",
+)
+SOURCE_PRODUCT_PLUGIN_DIR = ROOT / "overlays/hermes/plugins/product_confirmation"
+PRODUCT_PLUGIN_REL = Path("plugins/product_confirmation")
+PRODUCT_PLUGIN_FILES = (
+    "__init__.py",
+    "plugin.yaml",
+    "store.py",
+    "tools.py",
 )
 CORE_REL_PATHS = (
     Path("gateway/run.py"),
@@ -99,9 +108,12 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _source_manifest(source_dir: Path) -> dict[str, dict[str, str | int | bool]]:
+def _source_manifest(
+    source_dir: Path,
+    filenames: tuple[str, ...] = PLUGIN_FILES,
+) -> dict[str, dict[str, str | int | bool]]:
     manifest: dict[str, dict[str, str | int | bool]] = {}
-    for filename in PLUGIN_FILES:
+    for filename in filenames:
         path = source_dir / filename
         manifest[filename] = {
             "exists": path.is_file(),
@@ -111,23 +123,27 @@ def _source_manifest(source_dir: Path) -> dict[str, dict[str, str | int | bool]]
     return manifest
 
 
-def _validate_source_plugin(source_dir: Path) -> OperationResult:
+def _validate_source_plugin(
+    source_dir: Path,
+    filenames: tuple[str, ...] = PLUGIN_FILES,
+    operation_name: str = "plugin.source",
+) -> OperationResult:
     if not source_dir.is_dir():
         return _fail(
-            "plugin.source",
+            operation_name,
             str(source_dir),
             "missing-source",
-            "DingTalk plugin source directory not found",
+            "plugin source directory not found",
         )
-    missing = [filename for filename in PLUGIN_FILES if not (source_dir / filename).is_file()]
+    missing = [filename for filename in filenames if not (source_dir / filename).is_file()]
     if missing:
         return _fail(
-            "plugin.source",
+            operation_name,
             str(source_dir),
             "missing-source",
             "missing plugin files: " + ", ".join(missing),
         )
-    return _ok("plugin.source", str(source_dir), f"{len(PLUGIN_FILES)} files")
+    return _ok(operation_name, str(source_dir), f"{len(filenames)} files")
 
 
 def _take_file_snapshots(root: Path) -> list[FileSnapshot]:
@@ -158,10 +174,14 @@ def _restore_file_snapshots(snapshots: list[FileSnapshot]) -> None:
             snapshot.path.unlink()
 
 
-def _take_tree_snapshot(path: Path, backup_root: Path) -> TreeSnapshot:
+def _take_tree_snapshot(
+    path: Path,
+    backup_root: Path,
+    backup_name: str = "previous_dingtalk_plugin",
+) -> TreeSnapshot:
     if not path.exists():
         return TreeSnapshot(path=path, existed=False)
-    backup = backup_root / "previous_dingtalk_plugin"
+    backup = backup_root / backup_name
     shutil.copytree(path, backup)
     return TreeSnapshot(path=path, existed=True, backup=backup)
 
@@ -176,41 +196,100 @@ def _restore_tree_snapshot(snapshot: TreeSnapshot) -> None:
         shutil.copytree(snapshot.backup, snapshot.path)
 
 
-def _plugin_tree_matches(source_dir: Path, target_dir: Path) -> bool:
+def _plugin_tree_matches(
+    source_dir: Path,
+    target_dir: Path,
+    filenames: tuple[str, ...] = PLUGIN_FILES,
+) -> bool:
     if not target_dir.is_dir():
         return False
-    for filename in PLUGIN_FILES:
+    for filename in filenames:
         source_file = source_dir / filename
         target_file = target_dir / filename
         if not target_file.is_file():
             return False
         if source_file.read_bytes() != target_file.read_bytes():
             return False
-    extra_paths = [path for path in target_dir.iterdir() if path.name not in PLUGIN_FILES]
+    # Import-time bytecode is runtime cache, not installed source.  Ignoring
+    # only ``__pycache__`` keeps repeated installs idempotent after the verifier
+    # imports the plugin while still replacing any undeclared source file.
+    extra_paths = [
+        path for path in target_dir.iterdir()
+        if path.name not in filenames and path.name != "__pycache__"
+    ]
     return not extra_paths
 
 
-def _install_plugin_tree(source_dir: Path, target_dir: Path, temp_root: Path) -> OperationResult:
-    if _plugin_tree_matches(source_dir, target_dir):
-        return _ok("plugin.copy", str(target_dir), "plugin tree already matches source")
+def _rename_tree(source: Path, destination: Path) -> None:
+    """Rename one directory within a filesystem (test seam for fault injection)."""
+    source.rename(destination)
 
-    staged = temp_root / "staged_dingtalk_plugin"
-    shutil.copytree(source_dir, staged)
-    if target_dir.exists():
-        shutil.rmtree(target_dir)
+
+def _install_plugin_tree(
+    source_dir: Path,
+    target_dir: Path,
+    temp_root: Path,
+    filenames: tuple[str, ...] = PLUGIN_FILES,
+    operation_name: str = "plugin.copy",
+    staged_name: str = "staged_dingtalk_plugin",
+) -> OperationResult:
+    if _plugin_tree_matches(source_dir, target_dir, filenames):
+        return _ok(operation_name, str(target_dir), "plugin tree already matches source")
+
     target_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(staged), str(target_dir))
-    return _ok("plugin.copy", str(target_dir), f"copied {len(PLUGIN_FILES)} files")
+    # Stage beside the destination so every rename stays on the destination's
+    # filesystem. ``temp_root`` remains the transaction-wide snapshot root; it
+    # is intentionally not used for the live switch.
+    del temp_root
+    staged = Path(
+        tempfile.mkdtemp(
+            prefix=f".{target_dir.name}.{staged_name}-",
+            dir=target_dir.parent,
+        )
+    )
+    previous = target_dir.parent / (
+        f".{target_dir.name}.previous-{uuid.uuid4().hex}"
+    )
+    try:
+        staged.chmod(stat.S_IMODE(source_dir.stat().st_mode))
+        # Copy only the declared manifest. Development artifacts such as
+        # ``__pycache__`` must never become part of an installed plugin tree.
+        for filename in filenames:
+            shutil.copy2(source_dir / filename, staged / filename)
+
+        if target_dir.exists():
+            _rename_tree(target_dir, previous)
+        try:
+            _rename_tree(staged, target_dir)
+        except Exception:
+            # The new-tree rename failed after the old tree moved aside. Put
+            # the old tree back before propagating the error; outer rollback
+            # remains a second safety net for the multi-tree transaction.
+            if previous.exists() and not target_dir.exists():
+                _rename_tree(previous, target_dir)
+            raise
+
+        if previous.exists():
+            shutil.rmtree(previous)
+    finally:
+        if staged.exists():
+            shutil.rmtree(staged, ignore_errors=True)
+        # Safe cleanup after a successful switch or successful restoration.
+        # If restoration itself failed and target is absent, preserve
+        # ``previous`` so the transaction-level rollback can recover it.
+        if previous.exists() and target_dir.exists():
+            shutil.rmtree(previous, ignore_errors=True)
+    return _ok(operation_name, str(target_dir), f"copied {len(filenames)} files")
 
 
 def _rollback(
     operations: list[OperationResult],
     core_snapshots: list[FileSnapshot],
-    plugin_snapshot: TreeSnapshot | None,
+    plugin_snapshots: list[TreeSnapshot],
 ) -> None:
     try:
         _restore_file_snapshots(core_snapshots)
-        if plugin_snapshot is not None:
+        for plugin_snapshot in plugin_snapshots:
             _restore_tree_snapshot(plugin_snapshot)
     except Exception as exc:  # noqa: BLE001 - installer rollback boundary
         operations.append(
@@ -229,11 +308,79 @@ def _operation_failures(operations: list[OperationResult]) -> list[OperationResu
     ]
 
 
-def build_report(target: Path) -> dict[str, Any]:
+def _core_manifest(root: Path) -> dict[str, dict[str, str | int | bool]]:
+    manifest: dict[str, dict[str, str | int | bool]] = {}
+    for rel_path in CORE_REL_PATHS:
+        path = root / rel_path
+        exists = path.is_file()
+        manifest[str(rel_path)] = {
+            "exists": exists,
+            "sha256": _sha256(path) if exists else "",
+            "bytes": path.stat().st_size if exists else 0,
+        }
+    return manifest
+
+
+def _core_changed_paths(
+    before: dict[str, dict[str, str | int | bool]],
+    after: dict[str, dict[str, str | int | bool]],
+) -> list[str]:
+    return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+
+
+def build_report(target: Path, *, plugins_only: bool = False) -> dict[str, Any]:
+    """Install Kit-owned plugin trees, optionally applying legacy core compat.
+
+    plugins_only is the T4 offline-verification mode: it installs the same
+    DingTalk and Product Confirmation source trees but intentionally skips the
+    pre-existing legacy gateway compat patch set. The report keeps plugin-owned
+    files and legacy core changes in separate fields.
+    """
     operations: list[OperationResult] = []
     compat_report: dict[str, Any] | None = None
     verifier_report: dict[str, Any] | None = None
     root = target
+    mode = "plugins-only" if plugins_only else "legacy-compat"
+    plugin_manifest = {
+        "dingtalk": _source_manifest(SOURCE_PLUGIN_DIR),
+        "product_confirmation": _source_manifest(
+            SOURCE_PRODUCT_PLUGIN_DIR, PRODUCT_PLUGIN_FILES
+        ),
+    }
+    owned_plugin_paths = [str(PLUGIN_REL), str(PRODUCT_PLUGIN_REL)]
+
+    def finish(
+        *,
+        core_before: dict[str, dict[str, str | int | bool]] | None = None,
+    ) -> dict[str, Any]:
+        before = core_before or {}
+        after = _core_manifest(root) if before else {}
+        failures = _operation_failures(operations)
+        return {
+            "ok": not failures,
+            "target": str(root),
+            "installation_mode": mode,
+            "operation_count": len(operations),
+            "failure_count": len(failures),
+            "operations": [operation.to_dict() for operation in operations],
+            "owned_plugin_paths": owned_plugin_paths,
+            "plugin_manifest": plugin_manifest,
+            "legacy_compat": {
+                "requested": not plugins_only,
+                "applied": compat_report is not None,
+                "rolled_back": any(
+                    operation.name == "rollback" for operation in operations
+                ),
+                "result": compat_report,
+            },
+            "core_manifest": {
+                "before": before,
+                "after": after,
+                "changed_paths": _core_changed_paths(before, after),
+            },
+            "compat": compat_report,
+            "verifier": verifier_report,
+        }
 
     try:
         compat = _load_compat_patcher()
@@ -243,58 +390,92 @@ def build_report(target: Path) -> dict[str, Any]:
         operations.append(
             _fail("target.resolve", str(target), "error", f"{type(exc).__name__}: {exc}")
         )
-        failures = _operation_failures(operations)
-        return {
-            "ok": False,
-            "target": str(root),
-            "operation_count": len(operations),
-            "failure_count": len(failures),
-            "operations": [operation.to_dict() for operation in operations],
-            "plugin_manifest": {"source": {}},
-            "compat": compat_report,
-            "verifier": verifier_report,
-        }
+        return finish()
 
     operations.append(_ok("target.resolve", str(root), "Hermes root located"))
 
-    source_check = _validate_source_plugin(SOURCE_PLUGIN_DIR)
-    operations.append(source_check)
-    if source_check.status != "ok":
-        failures = _operation_failures(operations)
-        return {
-            "ok": False,
-            "target": str(root),
-            "operation_count": len(operations),
-            "failure_count": len(failures),
-            "operations": [operation.to_dict() for operation in operations],
-            "plugin_manifest": {"source": _source_manifest(SOURCE_PLUGIN_DIR)},
-            "compat": compat_report,
-            "verifier": verifier_report,
-        }
+    source_checks = [
+        _validate_source_plugin(
+            SOURCE_PLUGIN_DIR,
+            PLUGIN_FILES,
+            "dingtalk.source",
+        ),
+        _validate_source_plugin(
+            SOURCE_PRODUCT_PLUGIN_DIR,
+            PRODUCT_PLUGIN_FILES,
+            "product_confirmation.source",
+        ),
+    ]
+    operations.extend(source_checks)
+    if any(check.status != "ok" for check in source_checks):
+        return finish()
 
+    core_before = _core_manifest(root)
     core_snapshots = _take_file_snapshots(root)
-    plugin_snapshot: TreeSnapshot | None = None
+    plugin_snapshots: list[TreeSnapshot] = []
     should_rollback = False
 
     with tempfile.TemporaryDirectory(prefix="hermes-dingtalk-install-") as temp_name:
         temp_root = Path(temp_name)
         try:
-            plugin_snapshot = _take_tree_snapshot(root / PLUGIN_REL, temp_root)
-            operations.append(_install_plugin_tree(SOURCE_PLUGIN_DIR, root / PLUGIN_REL, temp_root))
-
-            compat_report = compat.build_report(root, "apply")
-            compat_message = (
-                f"changed_count={compat_report['changed_count']} "
-                f"failure_count={compat_report['failure_count']}"
+            plugin_snapshots = [
+                _take_tree_snapshot(
+                    root / PLUGIN_REL,
+                    temp_root,
+                    "previous_dingtalk_plugin",
+                ),
+                _take_tree_snapshot(
+                    root / PRODUCT_PLUGIN_REL,
+                    temp_root,
+                    "previous_product_confirmation_plugin",
+                ),
+            ]
+            operations.append(
+                _install_plugin_tree(
+                    SOURCE_PLUGIN_DIR,
+                    root / PLUGIN_REL,
+                    temp_root,
+                    PLUGIN_FILES,
+                    "dingtalk.copy",
+                    "staged_dingtalk_plugin",
+                )
             )
-            if compat_report["ok"]:
-                operations.append(_ok("compat.apply", ".", compat_message))
+            operations.append(
+                _install_plugin_tree(
+                    SOURCE_PRODUCT_PLUGIN_DIR,
+                    root / PRODUCT_PLUGIN_REL,
+                    temp_root,
+                    PRODUCT_PLUGIN_FILES,
+                    "product_confirmation.copy",
+                    "staged_product_confirmation_plugin",
+                )
+            )
+
+            if plugins_only:
+                operations.append(
+                    _ok(
+                        "compat.skip",
+                        ".",
+                        "legacy gateway compat intentionally excluded from Product verification",
+                    )
+                )
             else:
-                operations.append(_fail("compat.apply", ".", "failed", compat_message))
-                should_rollback = True
+                compat_report = compat.build_report(root, "apply")
+                compat_message = (
+                    f"changed_count={compat_report['changed_count']} "
+                    f"failure_count={compat_report['failure_count']}"
+                )
+                if compat_report["ok"]:
+                    operations.append(_ok("compat.apply", ".", compat_message))
+                else:
+                    operations.append(_fail("compat.apply", ".", "failed", compat_message))
+                    should_rollback = True
 
             if not should_rollback:
-                verifier_report = verifier.build_report(root)
+                if plugins_only:
+                    verifier_report = verifier.build_report(root, require_compat=False)
+                else:
+                    verifier_report = verifier.build_report(root)
                 verifier_message = (
                     f"check_count={verifier_report['check_count']} "
                     f"failure_count={verifier_report['failure_count']}"
@@ -311,19 +492,10 @@ def build_report(target: Path) -> dict[str, Any]:
             should_rollback = True
 
         if should_rollback:
-            _rollback(operations, core_snapshots, plugin_snapshot)
+            _rollback(operations, core_snapshots, plugin_snapshots)
 
-    failures = _operation_failures(operations)
-    return {
-        "ok": not failures,
-        "target": str(root),
-        "operation_count": len(operations),
-        "failure_count": len(failures),
-        "operations": [operation.to_dict() for operation in operations],
-        "plugin_manifest": {"source": _source_manifest(SOURCE_PLUGIN_DIR)},
-        "compat": compat_report,
-        "verifier": verifier_report,
-    }
+    return finish(core_before=core_before)
+
 
 
 def _text_summary(report: dict[str, Any]) -> str:
@@ -361,10 +533,18 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Hermes root containing gateway/, or a parent containing hermes/gateway/.",
     )
+    parser.add_argument(
+        "--plugins-only",
+        action="store_true",
+        help=(
+            "Install and verify Kit-owned plugin trees without applying the "
+            "pre-existing legacy gateway compatibility patch set."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     args = parser.parse_args(argv)
 
-    report = build_report(args.target)
+    report = build_report(args.target, plugins_only=args.plugins_only)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     else:

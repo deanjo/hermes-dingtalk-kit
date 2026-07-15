@@ -104,6 +104,62 @@ def message_matches_patterns(patterns: List[re.Pattern], text: str) -> bool:
     return any(pattern.search(text) for pattern in patterns)
 
 
+def mention_meta_line(message: "ChatbotMessage", extra: dict) -> str:
+    """Describe non-bot @-mentions as a meta line for the LLM, or ``""``.
+
+    DingTalk strips every ``@nick`` token from ``text.content`` server-side
+    and only delivers the at list structurally (``atUsers`` entries carry
+    dingtalkId/staffId, never a nickname).  Without this line the model
+    cannot tell that e.g. "你测试一下" was addressed to another human in
+    the at list rather than to the bot itself.
+
+    Display names resolve through the optional ``extra.at_user_names``
+    mapping (staffId or dingtalkId -> name); unmapped org members fall back
+    to the staffId tail so no full id leaks into the conversation.
+    """
+    at_users = getattr(message, "at_users", None) or []
+    if not at_users:
+        return ""
+    bot_mentioned = bool(getattr(message, "is_in_at_list", False))
+    bot_id = str(getattr(message, "chatbot_user_id", None) or "")
+    if not bot_id and bot_mentioned:
+        # The bot is somewhere in the at list but we cannot tell which entry
+        # it is; a wrong "someone else was mentioned" hint is worse than none.
+        return ""
+    others = []
+    for user in at_users:
+        # str-coerce both ids: a numeric staffId in the payload would
+        # otherwise crash the slicing below, and _safe_on_message swallowing
+        # that exception silently drops the whole message.
+        dingtalk_id = str(getattr(user, "dingtalk_id", None) or "")
+        if bot_id and dingtalk_id and dingtalk_id == bot_id:
+            continue
+        others.append((dingtalk_id, str(getattr(user, "staff_id", None) or "")))
+    if not others:
+        return ""
+    name_map = extra.get("at_user_names")
+    if isinstance(name_map, dict):
+        # YAML parses unquoted all-digit keys (staffIds) as ints; normalise
+        # so the mapping works however the operator wrote it.
+        name_map = {str(k): v for k, v in name_map.items()}
+    else:
+        name_map = {}
+    labels = []
+    for dingtalk_id, staff_id in others:
+        name = name_map.get(staff_id) or name_map.get(dingtalk_id)
+        if name:
+            labels.append(str(name))
+        elif staff_id:
+            labels.append(f"工号尾号{staff_id[-4:]}")
+        else:
+            labels.append("未知成员")
+    prefix = "除你以外，本消息还" if bot_mentioned else "本消息未@你，"
+    return (
+        f"【消息元信息】{prefix}@了 {len(others)} 位群成员："
+        f"{'、'.join(labels)}。请据此分辨正文中“你/你们”的指代对象。"
+    )
+
+
 def should_process_message(
     *,
     extra: dict,
