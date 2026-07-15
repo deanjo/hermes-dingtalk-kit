@@ -325,6 +325,8 @@ class InstallDingTalkKitTest(unittest.TestCase):
         text = DOCKERFILE.read_text(encoding="utf-8")
 
         self.assertIn("install_dingtalk_kit.py --target /opt/hermes", text)
+        self.assertIn("rm -rf /opt/hermes/plugins/platforms/dingtalk", text)
+        self.assertIn("--plugins-only", text)
         self.assertIn("overlays/hermes/plugins/platforms/dingtalk", text)
         self.assertIn("overlays/hermes/plugins/product_confirmation", text)
         self.assertNotIn(
