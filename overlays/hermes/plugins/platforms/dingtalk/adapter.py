@@ -111,6 +111,7 @@ try:
     from .mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message
     from .plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup
     from .reply_context import (
+        _REPLY_ORIGINAL_UNAVAILABLE,
         _forwarded_chat_text_from_raw,
         _get_replied_file_content,
         _is_placeholder_text,
@@ -128,6 +129,7 @@ except ImportError:
     from mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message  # type: ignore
     from plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup  # type: ignore
     from reply_context import (  # type: ignore
+        _REPLY_ORIGINAL_UNAVAILABLE,
         _forwarded_chat_text_from_raw,
         _get_replied_file_content,
         _is_placeholder_text,
@@ -141,6 +143,10 @@ MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
+_REPLY_CONTEXT_CLARIFICATION = (
+    "我没有拿到你引用的原文。请补一句你指的是哪条内容，或把原文贴出来；"
+    "在确认前我不会开始排查。"
+)
 
 def check_dingtalk_requirements() -> bool:
     """Check if DingTalk dependencies are available and configured.
@@ -640,6 +646,19 @@ class DingTalkAdapter(BasePlatformAdapter):
         # document path (_get_replied_file_content) and are skipped here. Any failure
         # must degrade to "no reply context" and never break normal message handling.
         reply_kwargs = build_reply_kwargs(message)
+
+        # A reply ID without the quoted text is not enough to identify the task.
+        # Stop before MessageEvent reaches the model: guessing here can make Hermes
+        # answer a different topic from the one the user actually quoted.
+        if reply_kwargs.get("reply_to_text") == _REPLY_ORIGINAL_UNAVAILABLE:
+            result = await self.send(
+                chat_id,
+                _REPLY_CONTEXT_CLARIFICATION,
+                reply_to=msg_id,
+            )
+            if not result.success:
+                logger.warning("[%s] Failed to deliver reply-context clarification", self.name)
+            return
 
         event = MessageEvent(
             text=text,

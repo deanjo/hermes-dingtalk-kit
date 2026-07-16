@@ -320,6 +320,150 @@ def _assert_reply_context(root: Path) -> str:
     return "repliedMsg maps to reply_to_message_id/reply_to_text"
 
 
+def _assert_reply_context_fail_closed(root: Path) -> str:
+    """Ensure unresolved text replies stop before model dispatch."""
+    def is_reply_lookup(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "reply_kwargs"
+            and node.func.attr == "get"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "reply_to_text"
+        )
+
+    def is_unavailable_sentinel(node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) and node.id == "_REPLY_ORIGINAL_UNAVAILABLE"
+
+    adapter = root / PLUGIN_REL / "adapter.py"
+    tree = _read_tree(adapter)
+    clarification = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "_REPLY_CONTEXT_CLARIFICATION"
+            for target in node.targets
+        ):
+            try:
+                clarification = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                clarification = None
+            break
+    if not isinstance(clarification, str) or not clarification.strip():
+        raise AssertionError("reply-context clarification text is missing")
+
+    method = None
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "DingTalkAdapter":
+            method = next(
+                (
+                    item
+                    for item in node.body
+                    if isinstance(item, ast.AsyncFunctionDef) and item.name == "_on_message"
+                ),
+                None,
+            )
+            break
+    if method is None:
+        raise AssertionError("DingTalkAdapter._on_message not found")
+
+    guard_index = None
+    dispatch_index = None
+    for index, statement in enumerate(method.body):
+        if isinstance(statement, ast.If):
+            test = statement.test
+            has_exact_guard = (
+                isinstance(test, ast.Compare)
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.Eq)
+                and len(test.comparators) == 1
+                and (
+                    (
+                        is_reply_lookup(test.left)
+                        and is_unavailable_sentinel(test.comparators[0])
+                    )
+                    or (
+                        is_unavailable_sentinel(test.left)
+                        and is_reply_lookup(test.comparators[0])
+                    )
+                )
+            )
+            if has_exact_guard:
+                guard_index = index
+                all_sends = [
+                    node.value
+                    for node in ast.walk(statement)
+                    if isinstance(node, ast.Await)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Attribute)
+                    and isinstance(node.value.func.value, ast.Name)
+                    and node.value.func.value.id == "self"
+                    and node.value.func.attr == "send"
+                ]
+                direct_sends = []
+                for body_index, body_statement in enumerate(statement.body):
+                    await_node = None
+                    if isinstance(body_statement, ast.Assign):
+                        await_node = body_statement.value
+                    elif isinstance(body_statement, ast.Expr):
+                        await_node = body_statement.value
+                    if (
+                        isinstance(await_node, ast.Await)
+                        and isinstance(await_node.value, ast.Call)
+                        and isinstance(await_node.value.func, ast.Attribute)
+                        and isinstance(await_node.value.func.value, ast.Name)
+                        and await_node.value.func.value.id == "self"
+                        and await_node.value.func.attr == "send"
+                    ):
+                        direct_sends.append((body_index, await_node.value))
+                if len(all_sends) != 1 or len(direct_sends) != 1:
+                    raise AssertionError("unresolved-reply guard must await exactly one send")
+                send_index, send_call = direct_sends[0]
+                if not (
+                    len(send_call.args) == 2
+                    and isinstance(send_call.args[0], ast.Name)
+                    and send_call.args[0].id == "chat_id"
+                    and isinstance(send_call.args[1], ast.Name)
+                    and send_call.args[1].id == "_REPLY_CONTEXT_CLARIFICATION"
+                ):
+                    raise AssertionError("unresolved-reply guard sends the wrong chat or content")
+                if not any(
+                    keyword.arg == "reply_to"
+                    and isinstance(keyword.value, ast.Name)
+                    and keyword.value.id == "msg_id"
+                    for keyword in send_call.keywords
+                ):
+                    raise AssertionError("unresolved-reply guard does not reply to the incoming message")
+                all_returns = [
+                    node for node in ast.walk(statement) if isinstance(node, ast.Return)
+                ]
+                direct_returns = [
+                    body_index
+                    for body_index, body_statement in enumerate(statement.body)
+                    if isinstance(body_statement, ast.Return)
+                ]
+                if len(all_returns) != 1 or len(direct_returns) != 1:
+                    raise AssertionError("unresolved-reply guard does not return before dispatch")
+                if send_index >= direct_returns[0]:
+                    raise AssertionError("unresolved-reply guard returns before clarification send")
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == "handle_message"
+            for node in ast.walk(statement)
+        ):
+            dispatch_index = index
+
+    if guard_index is None:
+        raise AssertionError("unresolved-reply guard not found")
+    if dispatch_index is None or guard_index >= dispatch_index:
+        raise AssertionError("unresolved-reply guard must run before handle_message")
+    return "unresolved text replies clarify once and stop before model dispatch"
+
+
 def _load_function_from_ast(path: Path, function_name: str) -> Any:
     tree = _read_tree(path)
     for node in tree.body:
@@ -618,6 +762,7 @@ def build_report(target: Path, *, require_compat: bool = True) -> dict[str, Any]
                         _runtime_discovery_probe(root),
                         _run_check("plugin.raw_process_ack", str(PLUGIN_REL / "incoming.py"), lambda: _assert_raw_process_ack(root)),
                         _run_check("plugin.reply_context_kwargs", str(PLUGIN_REL / "reply_context.py"), lambda: _assert_reply_context(root)),
+                        _run_check("plugin.reply_context_fail_closed", str(PLUGIN_REL / "adapter.py"), lambda: _assert_reply_context_fail_closed(root)),
                         _run_check("product.manifest", str(PRODUCT_PLUGIN_REL / "plugin.yaml"), lambda: _assert_product_manifest(root)),
                         _run_check("product.entry", str(PRODUCT_PLUGIN_REL / "__init__.py"), lambda: _assert_product_plugin(root)),
                         _product_hook_contract_probe(root),

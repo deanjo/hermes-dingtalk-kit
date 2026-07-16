@@ -52,6 +52,7 @@ class PostInstallVerifierTest(unittest.TestCase):
         self.assertIn("plugin.runtime_discovery", check_names)
         self.assertIn("plugin.raw_process_ack", check_names)
         self.assertIn("plugin.reply_context_kwargs", check_names)
+        self.assertIn("plugin.reply_context_fail_closed", check_names)
         self.assertIn("product.manifest", check_names)
         self.assertIn("product.entry", check_names)
         self.assertIn("product.public_hook_contract", check_names)
@@ -101,6 +102,7 @@ class PostInstallVerifierTest(unittest.TestCase):
         self.assertNotIn("plugin.manifest", check_names)
         self.assertNotIn("plugin.entry", check_names)
         self.assertNotIn("plugin.reply_context_kwargs", check_names)
+        self.assertNotIn("plugin.reply_context_fail_closed", check_names)
         self.assertNotIn("gateway.session_key_slash", check_names)
 
     def test_missing_plugin_manifest_fails_before_behavior_probes(self):
@@ -170,6 +172,184 @@ class PostInstallVerifierTest(unittest.TestCase):
         self.assertNotIn("plugin.raw_process_ack", check_names)
         self.assertNotIn("plugin.reply_context_kwargs", check_names)
         self.assertNotIn("gateway.session_key_slash", check_names)
+
+    def test_reply_context_guard_without_return_fails(self):
+        root = self.make_target()
+        adapter = root / "plugins/platforms/dingtalk/adapter.py"
+        text = adapter.read_text(encoding="utf-8")
+        marker = (
+            '                logger.warning("[%s] Failed to deliver reply-context clarification", self.name)\n'
+            "            return\n\n"
+            "        event = MessageEvent("
+        )
+        self.assertIn(marker, text)
+        adapter.write_text(
+            text.replace(
+                marker,
+                '                logger.warning("[%s] Failed to deliver reply-context clarification", self.name)\n\n'
+                "        event = MessageEvent(",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "plugin.reply_context_fail_closed"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("does not return before dispatch", failure["message"])
+
+    def test_reply_context_guard_with_inverted_comparison_fails(self):
+        root = self.make_target()
+        adapter = root / "plugins/platforms/dingtalk/adapter.py"
+        text = adapter.read_text(encoding="utf-8")
+        marker = 'reply_kwargs.get("reply_to_text") == _REPLY_ORIGINAL_UNAVAILABLE'
+        self.assertIn(marker, text)
+        adapter.write_text(
+            text.replace(marker, marker.replace(" == ", " != "), 1),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "plugin.reply_context_fail_closed"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("guard not found", failure["message"])
+
+    def test_reply_context_guard_with_extra_false_clause_fails(self):
+        root = self.make_target()
+        adapter = root / "plugins/platforms/dingtalk/adapter.py"
+        text = adapter.read_text(encoding="utf-8")
+        marker = 'reply_kwargs.get("reply_to_text") == _REPLY_ORIGINAL_UNAVAILABLE'
+        self.assertIn(marker, text)
+        adapter.write_text(
+            text.replace(marker, marker + " and False", 1),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "plugin.reply_context_fail_closed"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("guard not found", failure["message"])
+
+    def test_reply_context_guard_with_duplicate_send_fails(self):
+        root = self.make_target()
+        adapter = root / "plugins/platforms/dingtalk/adapter.py"
+        text = adapter.read_text(encoding="utf-8")
+        marker = (
+            "            result = await self.send(\n"
+            "                chat_id,\n"
+            "                _REPLY_CONTEXT_CLARIFICATION,\n"
+            "                reply_to=msg_id,\n"
+            "            )\n"
+        )
+        self.assertIn(marker, text)
+        adapter.write_text(
+            text.replace(marker, marker + marker.replace("result = ", ""), 1),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "plugin.reply_context_fail_closed"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("exactly one send", failure["message"])
+
+    def test_reply_context_guard_with_wrong_chat_fails(self):
+        root = self.make_target()
+        adapter = root / "plugins/platforms/dingtalk/adapter.py"
+        text = adapter.read_text(encoding="utf-8")
+        marker = (
+            "            result = await self.send(\n"
+            "                chat_id,\n"
+        )
+        self.assertIn(marker, text)
+        adapter.write_text(
+            text.replace(marker, marker.replace("chat_id", '"wrong-chat"'), 1),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "plugin.reply_context_fail_closed"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("wrong chat or content", failure["message"])
+
+    def test_empty_reply_context_clarification_fails(self):
+        root = self.make_target()
+        adapter = root / "plugins/platforms/dingtalk/adapter.py"
+        text = adapter.read_text(encoding="utf-8")
+        start = text.index("_REPLY_CONTEXT_CLARIFICATION = (")
+        end = text.index("\n)\n", start) + 3
+        adapter.write_text(
+            text[:start] + '_REPLY_CONTEXT_CLARIFICATION = ""\n' + text[end:],
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "plugin.reply_context_fail_closed"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("clarification text is missing", failure["message"])
+
+    def test_reply_context_guard_that_returns_before_send_fails(self):
+        root = self.make_target()
+        adapter = root / "plugins/platforms/dingtalk/adapter.py"
+        text = adapter.read_text(encoding="utf-8")
+        send_marker = "            result = await self.send(\n"
+        return_marker = (
+            '                logger.warning("[%s] Failed to deliver reply-context clarification", self.name)\n'
+            "            return\n\n"
+            "        event = MessageEvent("
+        )
+        self.assertIn(send_marker, text)
+        self.assertIn(return_marker, text)
+        mutated = text.replace(
+            send_marker,
+            "            return\n" + send_marker,
+            1,
+        ).replace(
+            return_marker,
+            '                logger.warning("[%s] Failed to deliver reply-context clarification", self.name)\n\n'
+            "        event = MessageEvent(",
+            1,
+        )
+        adapter.write_text(mutated, encoding="utf-8")
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "plugin.reply_context_fail_closed"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("returns before clarification send", failure["message"])
 
 
 if __name__ == "__main__":

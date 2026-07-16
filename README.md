@@ -74,11 +74,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/install_dingtalk_kit.py --target /o
 PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/install_dingtalk_kit.py --target /opt/hermes --plugins-only --json
 ```
 
-在完整 Hermes `569b912d7d0931c7256e9f5fb326609e9deda377` 临时 root 上，`--plugins-only` 首次安装与再次安装都为 `failure_count=0`、verifier `35/35`，第二次两个插件目录均为 `already matches source`，且 `core_manifest.changed_paths=[]`。默认 legacy-compat 模式会因 `run.reply_sentinel_constant` 与 `session.path_sensitive_validation` 两个旧锚点不匹配而失败，并自动恢复 gateway 三文件和两个旧插件目录；这证明回滚有效，也表示该模式在适配前不可发布。脚本不读取 `.env`，不做真实 DingTalk 网络收发；生产切换属于另行授权的 H1 发布任务。
+在完整 Hermes `569b912d7d0931c7256e9f5fb326609e9deda377` 临时 root 上，`--plugins-only` 首次安装与再次安装都为 `failure_count=0`、verifier `36/36`，第二次两个插件目录均为 `already matches source`，且 `core_manifest.changed_paths=[]`。默认 legacy-compat 模式会因 `run.reply_sentinel_constant` 与 `session.path_sensitive_validation` 两个旧锚点不匹配而失败，并自动恢复 gateway 三文件和两个旧插件目录；这证明回滚有效，也表示该模式在适配前不可发布。脚本不读取 `.env`，不做真实 DingTalk 网络收发；生产切换属于另行授权的 H1 发布任务。
 
 ## Post-Install Verifier
 
-`scripts/post_install_verifier.py` 对安装后的 Hermes root 做只读验收，确认 gateway compat 结构、DingTalk 插件 manifest、Hermes runtime 可发现 `dingtalk` adapter、`raw_process` ACK、reply context、Product 的 5 个工具与公开 hook，以及 `session_key` slash 和 `session_context` bridge 都存在。
+`scripts/post_install_verifier.py` 对安装后的 Hermes root 做只读验收，确认 gateway compat 结构、DingTalk 插件 manifest、Hermes runtime 可发现 `dingtalk` adapter、`raw_process` ACK、引用原文缺失时澄清并在模型前停止、Product 的 5 个工具与公开 hook，以及 `session_key` slash 和 `session_context` bridge 都存在。
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/post_install_verifier.py --target /opt/hermes
@@ -86,7 +86,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/post_install_verifier.py --target /
 PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/post_install_verifier.py --target /opt/hermes --plugins-only --json
 ```
 
-本地 overlay 默认模式当前输出 `check_count=50 failure_count=0`，其中 runtime discovery 和 Product public-hook contract 在不含完整 `hermes_cli/` 的 overlay root 上为 `skipped`；完整 Hermes canary root 必须输出 `plugin.runtime_discovery ... runtime_dingtalk_entry=dingtalk plugin=dingtalk-platform`，并且 `product.public_hook_contract` 为 `ok`。这个 verifier 不做真实 DingTalk 网络收发；需要真实消息验收时另开带凭证和脱敏边界的任务。
+本地 overlay 默认模式当前输出 `check_count=51 failure_count=0`，其中 runtime discovery 和 Product public-hook contract 在不含完整 `hermes_cli/` 的 overlay root 上为 `skipped`；完整 Hermes canary root 必须输出 `plugin.runtime_discovery ... runtime_dingtalk_entry=dingtalk plugin=dingtalk-platform`，并且 `product.public_hook_contract` 为 `ok`。这个 verifier 不做真实 DingTalk 网络收发；需要真实消息验收时另开带凭证和脱敏边界的任务。
 
 ## 发布状态
 
