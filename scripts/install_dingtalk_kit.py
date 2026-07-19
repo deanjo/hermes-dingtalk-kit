@@ -33,6 +33,7 @@ PLUGIN_FILES = (
     "plugin.yaml",
     "private_send.py",
     "reply_context.py",
+    "task_binding.py",
 )
 SOURCE_PRODUCT_PLUGIN_DIR = ROOT / "overlays/hermes/plugins/product_confirmation"
 PRODUCT_PLUGIN_REL = Path("plugins/product_confirmation")

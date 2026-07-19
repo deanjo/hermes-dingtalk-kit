@@ -37,6 +37,7 @@ PLUGIN_FILES = (
     "plugin.yaml",
     "private_send.py",
     "reply_context.py",
+    "task_binding.py",
 )
 PLUGIN_REL = Path("plugins/platforms/dingtalk")
 PRODUCT_PLUGIN_FILES = (

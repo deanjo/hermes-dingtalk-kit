@@ -118,6 +118,7 @@ try:
         _log_forward_diag,
         build_reply_kwargs,
     )
+    from .task_binding import resolve_task_binding
 except ImportError:
     import sys
     from pathlib import Path
@@ -136,6 +137,7 @@ except ImportError:
         _log_forward_diag,
         build_reply_kwargs,
     )
+    from task_binding import resolve_task_binding  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +149,7 @@ _REPLY_CONTEXT_CLARIFICATION = (
     "我没有拿到你引用的原文。请补一句你指的是哪条内容，或把原文贴出来；"
     "在确认前我不会开始排查。"
 )
+_TASK_BINDING_CLARIFICATION = "我没有找到有效的任务绑定。请用“#任务 board/task 你的问题”重试，例如：#任务 agong/t_deadbeef 联系人为什么没显示。"
 
 def check_dingtalk_requirements() -> bool:
     """Check if DingTalk dependencies are available and configured.
@@ -610,6 +613,17 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.debug("[%s] Empty message, skipping", self.name)
             return
 
+        task_binding = None
+        if (text or "").lstrip().startswith("#任务"):
+            parsed_task_message = await resolve_task_binding(
+                self, text or "", chat_id=chat_id, message_id=msg_id,
+                clarification=_TASK_BINDING_CLARIFICATION,
+            )
+            if parsed_task_message is None:
+                return
+            task_binding = parsed_task_message.binding
+            text = parsed_task_message.message_text
+
         # DingTalk strips @-mention tokens from text.content server-side and
         # only delivers the at list structurally; surface the non-bot entries
         # so the model can resolve who "你/你们" refers to. Slash commands are
@@ -620,7 +634,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             if mention_meta:
                 text = f"{text}\n\n{mention_meta}" if text else mention_meta
 
-        source = self.build_source(
+        source_kwargs = dict(
             chat_id=chat_id,
             chat_name=getattr(message, "conversation_title", None),
             chat_type=chat_type,
@@ -629,6 +643,9 @@ class DingTalkAdapter(BasePlatformAdapter):
             user_id_alt=sender_staff_id if sender_staff_id else None,
             message_id=msg_id,
         )
+        if task_binding:
+            source_kwargs.update(board_slug=task_binding.board_slug, task_id=task_binding.task_id)
+        source = self.build_source(**source_kwargs)
 
         # Parse timestamp
         create_at = getattr(message, "create_at", None)

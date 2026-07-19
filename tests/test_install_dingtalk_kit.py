@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / ".baseline/hermes"
 SCRIPT = ROOT / "scripts/install_dingtalk_kit.py"
 DOCKERFILE = ROOT / "docker/Dockerfile"
-EXPECTED_VERIFIER_CHECKS = 51
+EXPECTED_VERIFIER_CHECKS = 53
 
 
 def load_installer():
@@ -71,6 +71,7 @@ class InstallDingTalkKitTest(unittest.TestCase):
         self.assertTrue((root / "plugins/platforms/dingtalk/adapter.py").is_file())
         self.assertTrue((root / "plugins/platforms/dingtalk/__init__.py").is_file())
         self.assertTrue((root / "plugins/platforms/dingtalk/plugin.yaml").is_file())
+        self.assertTrue((root / "plugins/platforms/dingtalk/task_binding.py").is_file())
         self.assertTrue((root / "plugins/product_confirmation/__init__.py").is_file())
         self.assertTrue((root / "plugins/product_confirmation/store.py").is_file())
         self.assertTrue((root / "plugins/product_confirmation/tools.py").is_file())
