@@ -623,17 +623,6 @@ class DingTalkAdapter(BasePlatformAdapter):
                 return
             task_binding = parsed_task_message.binding
             text = parsed_task_message.message_text
-
-        # DingTalk strips @-mention tokens from text.content server-side and
-        # only delivers the at list structurally; surface the non-bot entries
-        # so the model can resolve who "你/你们" refers to. Slash commands are
-        # consumed verbatim by the gateway (get_command_args, confirm/clarify
-        # matchers), so never append to them.
-        if is_group and not (text or "").lstrip().startswith("/"):
-            mention_meta = mention_meta_line(message, self.config.extra or {})
-            if mention_meta:
-                text = f"{text}\n\n{mention_meta}" if text else mention_meta
-
         source_kwargs = dict(
             chat_id=chat_id,
             chat_name=getattr(message, "conversation_title", None),
@@ -646,8 +635,26 @@ class DingTalkAdapter(BasePlatformAdapter):
         if task_binding:
             source_kwargs.update(board_slug=task_binding.board_slug, task_id=task_binding.task_id)
         source = self.build_source(**source_kwargs)
-
-        # Parse timestamp
+        if (task_binding is None and not (text or "").lstrip().startswith("/")
+                and (self.config.extra or {}).get("natural_task_intake") is True):
+            try:
+                from gateway.task_intake import resolve_natural_task_intake
+                intake = resolve_natural_task_intake(self._session_store, source, text or "", msg_id, enabled=True)
+                if intake.action not in {"pass_through", "reply_without_agent", "bound_source", "error_without_agent"}:
+                    raise ValueError(f"Unknown natural task intake action: {intake.action!r}")
+            except Exception:
+                logger.exception("[%s] Natural task intake failed", self.name)
+                await self.send(chat_id, "任务接入暂时不可用，请稍后重试。", reply_to=msg_id)
+                return
+            if intake.action in {"reply_without_agent", "error_without_agent"}:
+                await self.send(chat_id, intake.reply_text, reply_to=msg_id)
+                return
+            if intake.action == "bound_source":
+                source, text = intake.source, intake.text
+        if is_group and not (text or "").lstrip().startswith("/"):
+            mention_meta = mention_meta_line(message, self.config.extra or {})
+            if mention_meta:
+                text = f"{text}\n\n{mention_meta}" if text else mention_meta
         create_at = getattr(message, "create_at", None)
         try:
             timestamp = (
@@ -657,13 +664,11 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
-
         # T27: surface reply-to context for text quotes so the gateway can inject a
         # disambiguation pointer. File quotes keep flowing through the existing
         # document path (_get_replied_file_content) and are skipped here. Any failure
         # must degrade to "no reply context" and never break normal message handling.
         reply_kwargs = build_reply_kwargs(message)
-
         # A reply ID without the quoted text is not enough to identify the task.
         # Stop before MessageEvent reaches the model: guessing here can make Hermes
         # answer a different topic from the one the user actually quoted.
