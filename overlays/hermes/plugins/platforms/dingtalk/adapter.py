@@ -614,7 +614,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.debug("[%s] Empty message, skipping", self.name)
             return
 
-        task_binding = None
+        task_binding, intake_bound = None, False
         if (text or "").lstrip().startswith("#任务"):
             parsed_task_message = await resolve_task_binding(
                 self, text or "", chat_id=chat_id, message_id=msg_id,
@@ -650,7 +650,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                 await self.send(chat_id, intake.reply_text, reply_to=msg_id)
                 return
             if intake.action == "bound_source":
-                source, text = intake.source, intake.text
+                source, text, intake_bound = intake.source, intake.text, True
         if is_group and not (text or "").lstrip().startswith("/"):
             mention_meta = mention_meta_line(message, self.config.extra or {})
             if mention_meta:
@@ -668,7 +668,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # disambiguation pointer. File quotes keep flowing through the existing
         # document path (_get_replied_file_content) and are skipped here. Any failure
         # must degrade to "no reply context" and never break normal message handling.
-        reply_kwargs = build_reply_kwargs(message)
+        reply_kwargs = {} if intake_bound else build_reply_kwargs(message)
         # A reply ID without the quoted text is not enough to identify the task.
         # Stop before MessageEvent reaches the model: guessing here can make Hermes
         # answer a different topic from the one the user actually quoted.

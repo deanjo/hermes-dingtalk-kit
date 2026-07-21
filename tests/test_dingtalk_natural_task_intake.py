@@ -141,7 +141,7 @@ def load_on_message(*, with_media=False):
         "_is_placeholder_text": lambda value: False,
         "_log_forward_diag": lambda *args, **kwargs: None,
         "asyncio": asyncio,
-        "build_reply_kwargs": lambda message: {},
+        "build_reply_kwargs": lambda message: getattr(message, "_test_reply_kwargs", None) or {},
         "datetime": datetime,
         "extract_media": extract_media,
         "is_user_allowed": lambda *args, **kwargs: True,
@@ -403,6 +403,64 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual(1, len(adapter.events))
         self.assertEqual("普通聊天", adapter.events[0].text)
         self.assertIsNone(adapter.events[0].source.board_slug)
+
+    def test_quote_reply_confirm_consumed_by_intake_skips_reply_clarification(self):
+        """E2E F1: a quote-replied confirm word that the intake resolver
+        consumes (bound_source) must not be hijacked by the T1
+        reply-original-unavailable clarification — the bound first turn
+        reaches the gateway and no clarification is sent."""
+        bound = {
+            "chat_id": "conversation-1",
+            "chat_type": "group",
+            "user_id": "sender-1",
+            "message_id": "incoming-1",
+            "board_slug": "agong",
+            "task_id": "t_3852e516",
+        }
+        result = SimpleNamespace(
+            action="bound_source",
+            source=bound,
+            text="联系人为什么没显示",
+            reply_text=None,
+        )
+
+        def drive(adapter):
+            message = make_message("新建吧")
+            message._test_reply_kwargs = {
+                "reply_to_message_id": "quoted-1",
+                "reply_to_text": "reply unavailable",
+                "reply_to_is_own_message": False,
+            }
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("新建吧", result=result, drive=drive)
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertIs(bound, adapter.events[0].source)
+        self.assertEqual("联系人为什么没显示", adapter.events[0].text)
+
+    def test_quote_reply_pass_through_still_sends_reply_clarification(self):
+        """Guard: when the resolver does NOT consume the message, the T1
+        reply-original-unavailable clarification keeps its old behavior."""
+
+        def drive(adapter):
+            message = make_message("普通聊天")
+            message._test_reply_kwargs = {
+                "reply_to_message_id": "quoted-1",
+                "reply_to_text": "reply unavailable",
+                "reply_to_is_own_message": False,
+            }
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("普通聊天", drive=drive)
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], adapter.events)
+        self.assertEqual(1, len(adapter.sent))
+        self.assertEqual("reply clarification", adapter.sent[0]["content"])
+        self.assertEqual("incoming-1", adapter.sent[0]["reply_to"])
 
     def test_raw_binding_bypasses_natural_resolver_and_stays_per_message(self):
         adapter, calls = self.run_message(
