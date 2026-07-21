@@ -622,8 +622,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
             if parsed_task_message is None:
                 return
-            task_binding = parsed_task_message.binding
-            text = parsed_task_message.message_text
+            task_binding, text = parsed_task_message.binding, parsed_task_message.message_text
         source = self.build_source(
             chat_id=chat_id,
             chat_name=getattr(message, "conversation_title", None),
@@ -635,7 +634,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         )
         if task_binding:  # build_source() rejects the Kanban kwargs — stamp directly.
             source.board_slug, source.task_id = task_binding.board_slug, task_binding.task_id
-        if (task_binding is None and (text or "").strip()
+        # v1: any media bypasses task intake — a clarification branch would drop the attachment.
+        if (task_binding is None and (text or "").strip() and not media_urls
                 and not (text or "").lstrip().startswith("/")
                 and (self.config.extra or {}).get("natural_task_intake") is True):
             try:

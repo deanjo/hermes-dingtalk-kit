@@ -540,6 +540,35 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual(1, len(adapter.events))
         self.assertEqual(["https://cdn.example.com/img.png"], adapter.events[0].media_urls)
 
+    def test_media_with_text_bypasses_natural_resolver_and_keeps_both(self):
+        """Text + media must not enter task intake either (v1 boundary).
+
+        When the resolver asks for task selection (``reply_without_agent``),
+        the adapter replies and returns before building the MessageEvent, so
+        the attachment is lost — and Core's pending record has no media
+        fields to replay it after confirmation. v1 therefore bypasses the
+        resolver for ANY message with media; text and media both reach the
+        gateway on the legacy path.
+        """
+        adapter, calls = self.run_message(
+            "联系人为什么没显示",
+            resolver_override=lambda session_store, source, message_text, request_id, **kwargs: (
+                SimpleNamespace(
+                    action="reply_without_agent",
+                    source=None,
+                    text="",
+                    reply_text="我找到 2 个任务，请选择 1 或 2。",
+                )
+            ),
+            on_message=load_on_message(with_media=True),
+        )
+
+        self.assertEqual([], calls)
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertEqual("联系人为什么没显示", adapter.events[0].text)
+        self.assertEqual(["https://cdn.example.com/img.png"], adapter.events[0].media_urls)
+
 
 if __name__ == "__main__":
     unittest.main()
