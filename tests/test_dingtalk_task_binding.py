@@ -8,6 +8,7 @@ import copy
 import importlib.util
 import re
 import sys
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -290,6 +291,56 @@ class TaskBindingAdapterTest(unittest.TestCase):
         self.assertEqual(1, len(adapter.events))
         self.assertIsNone(adapter.events[0].source.board_slug)
         self.assertEqual("普通聊天", adapter.events[0].text)
+
+    def test_binding_lookup_runs_off_the_event_loop(self):
+        """A locked Kanban SQLite lookup must not stall the event loop.
+
+        ``task_binding_exists`` opens the board database with sqlite3's
+        default 5s lock timeout; held synchronously it froze the gateway
+        loop for the full timeout. It must be offloaded like the natural
+        resolver: a 20ms tick scheduled next to a 250ms lookup has to fire
+        BEFORE the lookup returns.
+        """
+        lookup_ended_at = []
+        tick_fired_at = []
+
+        def slow_exists(board_slug, task_id):
+            time.sleep(0.25)
+            lookup_ended_at.append(time.monotonic())
+            return True
+
+        on_message = load_on_message(self.binding, exists=True)
+        self.binding.task_binding_exists = slow_exists
+
+        async def main():
+            adapter = FakeAdapter()
+
+            async def ticker():
+                await asyncio.sleep(0.02)
+                tick_fired_at.append(time.monotonic())
+
+            await asyncio.gather(
+                on_message(adapter, make_message("#任务 agong/t_deadbeef 查询")),
+                ticker(),
+            )
+            return adapter
+
+        try:
+            adapter = asyncio.run(main())
+        finally:
+            self.binding.task_binding_exists = lambda board_slug, task_id: True
+
+        self.assertEqual(1, len(lookup_ended_at))
+        self.assertEqual(1, len(tick_fired_at))
+        self.assertLess(
+            tick_fired_at[0],
+            lookup_ended_at[0],
+            "event loop tick was blocked by the synchronous binding lookup",
+        )
+        # Semantics unchanged: a valid existing binding still reaches the gateway.
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertEqual("agong", adapter.events[0].source.board_slug)
 
 
 if __name__ == "__main__":

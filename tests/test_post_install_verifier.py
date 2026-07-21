@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +114,42 @@ class BasePlatformAdapter:
         )
 
         report = self.verifier.build_report(root)
+
+        probe = next(
+            item for item in report["checks"] if item["name"] == "plugin.build_source_signature"
+        )
+        self.assertEqual("failed", probe["status"], probe)
+        self.assertIn("user_id_alt", probe["message"])
+
+    def make_core_root(self, base_source: str) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        core = Path(tmp.name) / "core"
+        base_py = core / "gateway/platforms/base.py"
+        base_py.parent.mkdir(parents=True, exist_ok=True)
+        base_py.write_text(base_source, encoding="utf-8")
+        return core
+
+    def test_build_source_signature_probe_uses_core_root_override(self):
+        root = self.make_target()
+        core = self.make_core_root(self.REAL_BUILD_SOURCE_SIGNATURE)
+
+        with mock.patch.dict(os.environ, {"HERMES_DINGTALK_CORE_ROOT": str(core)}):
+            report = self.verifier.build_report(root)
+
+        probe = next(
+            item for item in report["checks"] if item["name"] == "plugin.build_source_signature"
+        )
+        self.assertEqual("ok", probe["status"], probe)
+
+    def test_build_source_signature_probe_core_root_override_detects_drift(self):
+        root = self.make_target()
+        core = self.make_core_root(
+            self.REAL_BUILD_SOURCE_SIGNATURE.replace("        user_id_alt=None,\n", "")
+        )
+
+        with mock.patch.dict(os.environ, {"HERMES_DINGTALK_CORE_ROOT": str(core)}):
+            report = self.verifier.build_report(root)
 
         probe = next(
             item for item in report["checks"] if item["name"] == "plugin.build_source_signature"

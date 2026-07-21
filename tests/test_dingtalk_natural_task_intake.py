@@ -83,7 +83,7 @@ def load_natural_intake():
     return module.resolve_natural_intake
 
 
-def load_on_message():
+def load_on_message(*, with_media=False):
     tree = ast.parse(ADAPTER_PATH.read_text(encoding="utf-8"), filename=str(ADAPTER_PATH))
     method = None
     for node in tree.body:
@@ -122,6 +122,13 @@ def load_on_message():
             message_text=message_text,
         )
 
+    if with_media:
+        def extract_media(message, message_type):
+            return message_type.TEXT, ["https://cdn.example.com/img.png"], ["image"]
+    else:
+        def extract_media(message, message_type):
+            return message_type.TEXT, [], []
+
     namespace = {
         "MessageEvent": FakeMessageEvent,
         "MessageType": MessageType,
@@ -136,7 +143,7 @@ def load_on_message():
         "asyncio": asyncio,
         "build_reply_kwargs": lambda message: {},
         "datetime": datetime,
-        "extract_media": lambda message, message_type: (message_type.TEXT, [], []),
+        "extract_media": extract_media,
         "is_user_allowed": lambda *args, **kwargs: True,
         "logger": FakeLogger(),
         "mention_meta_line": lambda *args, **kwargs: "",
@@ -265,6 +272,7 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         gateway_profile=None,
         resolver_override=None,
         drive=None,
+        on_message=None,
     ):
         calls = []
 
@@ -301,8 +309,9 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
                 send_success=send_success,
                 gateway_profile=gateway_profile,
             )
+            handler = on_message or self.on_message
             if drive is None:
-                asyncio.run(self.on_message(adapter, make_message(text)))
+                asyncio.run(handler(adapter, make_message(text)))
             else:
                 asyncio.run(drive(adapter))
         finally:
@@ -503,6 +512,33 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         # Core's real key rule: the two stamped profiles resolve to different
         # session-key namespaces, so their task-state keys cannot collide.
         self.assertNotEqual(namespace_of("default"), namespace_of("coder"))
+
+    def test_media_only_message_bypasses_natural_resolver_and_reaches_gateway(self):
+        """A media message with no text is not an (empty) task query.
+
+        With natural intake enabled, ``text == ""`` + media previously fell
+        into the resolver with an empty query and was answered with a
+        task-selection reply, so the media never reached the gateway. Textless
+        media must skip the resolver and continue the legacy media path.
+        """
+        adapter, calls = self.run_message(
+            "",
+            resolver_override=lambda session_store, source, message_text, request_id, **kwargs: (
+                SimpleNamespace(
+                    # What real Core returns for an empty query (task_intake.py:540).
+                    action="reply_without_agent",
+                    source=None,
+                    text="",
+                    reply_text="没有找到相关任务。要新建「Agong / 新任务」吗？回复“新建吧”。",
+                )
+            ),
+            on_message=load_on_message(with_media=True),
+        )
+
+        self.assertEqual([], calls)
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertEqual(["https://cdn.example.com/img.png"], adapter.events[0].media_urls)
 
 
 if __name__ == "__main__":

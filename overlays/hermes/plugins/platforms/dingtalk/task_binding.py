@@ -89,7 +89,11 @@ async def resolve_task_binding(
         parsed = None
     if parsed is not None and (
         parsed.binding is None
-        or task_binding_exists(parsed.binding.board_slug, parsed.binding.task_id)
+        # Synchronous SQLite probe (default 5s lock timeout) — keep it off
+        # the event loop, same as the natural resolver below.
+        or await asyncio.to_thread(
+            task_binding_exists, parsed.binding.board_slug, parsed.binding.task_id
+        )
     ):
         return parsed
     await adapter.send(chat_id, clarification, reply_to=message_id)
@@ -103,8 +107,10 @@ def resolve_gateway_profile() -> str | None:
     that profile's HERMES_HOME scope and the primary adapter under the
     process HERMES_HOME, so the active profile name resolved at construction
     time is exactly the profile the gateway stamps on ``source.profile`` /
-    falls back to for session and task-state keys. None => unknown; legacy
-    single-profile behavior is preserved.
+    falls back to for session and task-state keys. None => unknown. With
+    multiplexing off, the resolved value (usually ``"default"``) is inert
+    for session/task-state keys — they stay byte-identical — though a
+    serialized source may then carry ``"profile": "default"``.
     """
     try:
         from hermes_cli.profiles import get_active_profile_name
@@ -125,10 +131,12 @@ async def resolve_natural_intake(
     The Core resolver keys task state on ``source.profile``, but the gateway
     stamps the profile only after the adapter hands over the event — so the
     adapter's owning profile is stamped here first, and two multiplex
-    profiles in the same chat never share task state. The resolver itself is
-    synchronous (Kanban scan + SQLite lock waits), so it is offloaded with
-    ``asyncio.to_thread``; the return value and exception propagation match
-    a direct synchronous call.
+    profiles in the same chat never share task state. With multiplexing off
+    the stamp leaves every session/task-state key byte-identical (only a
+    serialized source may gain ``"profile": "default"``). The resolver
+    itself is synchronous (Kanban scan + SQLite lock waits), so it is
+    offloaded with ``asyncio.to_thread``; the return value and exception
+    propagation match a direct synchronous call.
     """
     from gateway.task_intake import resolve_natural_task_intake
 

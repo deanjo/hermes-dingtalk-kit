@@ -634,9 +634,9 @@ class DingTalkAdapter(BasePlatformAdapter):
             message_id=msg_id,
         )
         if task_binding:  # build_source() rejects the Kanban kwargs — stamp directly.
-            source.board_slug = task_binding.board_slug
-            source.task_id = task_binding.task_id
-        if (task_binding is None and not (text or "").lstrip().startswith("/")
+            source.board_slug, source.task_id = task_binding.board_slug, task_binding.task_id
+        if (task_binding is None and (text or "").strip()
+                and not (text or "").lstrip().startswith("/")
                 and (self.config.extra or {}).get("natural_task_intake") is True):
             try:
                 intake = await resolve_natural_intake(self, source, text or "", msg_id)

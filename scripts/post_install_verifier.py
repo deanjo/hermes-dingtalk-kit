@@ -515,7 +515,15 @@ def _build_source_signature_probe(root: Path) -> CheckResult:
     rel = str(PLUGIN_REL / "adapter.py")
     base_py = root / "gateway/platforms/base.py"
     if not base_py.is_file():
-        return _skip(name, "gateway/platforms/base.py", "core platform base not present in target root")
+        # Offline baseline roots lack the core platform tree; allow pointing
+        # at a real Core checkout so CI can enforce the seam instead of
+        # skipping it.
+        core_root = os.environ.get("HERMES_DINGTALK_CORE_ROOT", "").strip()
+        candidate = Path(core_root) / "gateway/platforms/base.py" if core_root else None
+        if candidate is not None and candidate.is_file():
+            base_py = candidate
+        else:
+            return _skip(name, "gateway/platforms/base.py", "core platform base not present in target root")
     try:
         accepted: set[str] | None = None
         for node in _read_tree(base_py).body:
