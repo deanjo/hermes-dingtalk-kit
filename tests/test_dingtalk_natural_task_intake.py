@@ -422,6 +422,7 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
             source=bound,
             text="联系人为什么没显示",
             reply_text=None,
+            control_consumed=True,
         )
 
         def drive(adapter):
@@ -461,6 +462,79 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual(1, len(adapter.sent))
         self.assertEqual("reply clarification", adapter.sent[0]["content"])
         self.assertEqual("incoming-1", adapter.sent[0]["reply_to"])
+
+    def test_current_task_quote_reply_without_original_still_clarifies(self):
+        """Codex rework: an ordinary quote-reply routed to the current task
+        (bound_source WITHOUT control_consumed) keeps the T1 clarification
+        when the quoted original is unavailable."""
+        bound = {
+            "chat_id": "conversation-1",
+            "chat_type": "group",
+            "user_id": "sender-1",
+            "message_id": "incoming-1",
+            "board_slug": "agong",
+            "task_id": "t_3852e516",
+        }
+        result = SimpleNamespace(
+            action="bound_source",
+            source=bound,
+            text="对",
+            reply_text=None,
+            control_consumed=False,
+        )
+
+        def drive(adapter):
+            message = make_message("对")
+            message._test_reply_kwargs = {
+                "reply_to_message_id": "quoted-1",
+                "reply_to_text": "reply unavailable",
+                "reply_to_is_own_message": False,
+            }
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("对", result=result, drive=drive)
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], adapter.events)
+        self.assertEqual(1, len(adapter.sent))
+        self.assertEqual("reply clarification", adapter.sent[0]["content"])
+        self.assertEqual("incoming-1", adapter.sent[0]["reply_to"])
+
+    def test_current_task_quote_reply_with_original_keeps_reply_context(self):
+        """Codex rework: an ordinary quote-reply routed to the current task
+        keeps its reply context so Core can inject the pointer."""
+        bound = {
+            "chat_id": "conversation-1",
+            "chat_type": "group",
+            "user_id": "sender-1",
+            "message_id": "incoming-1",
+            "board_slug": "agong",
+            "task_id": "t_3852e516",
+        }
+        result = SimpleNamespace(
+            action="bound_source",
+            source=bound,
+            text="对",
+            reply_text=None,
+            control_consumed=False,
+        )
+
+        def drive(adapter):
+            message = make_message("对")
+            message._test_reply_kwargs = {
+                "reply_to_message_id": "quoted-1",
+                "reply_to_text": "联系人任务的原消息",
+                "reply_to_is_own_message": False,
+            }
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("对", result=result, drive=drive)
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertEqual("quoted-1", adapter.events[0].reply_to_message_id)
+        self.assertEqual("联系人任务的原消息", adapter.events[0].reply_to_text)
 
     def test_raw_binding_bypasses_natural_resolver_and_stays_per_message(self):
         adapter, calls = self.run_message(

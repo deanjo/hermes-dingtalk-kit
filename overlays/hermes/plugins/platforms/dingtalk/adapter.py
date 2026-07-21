@@ -650,7 +650,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                 await self.send(chat_id, intake.reply_text, reply_to=msg_id)
                 return
             if intake.action == "bound_source":
-                source, text, intake_bound = intake.source, intake.text, True
+                source, text, intake_bound = intake.source, intake.text, bool(getattr(intake, "control_consumed", False))
         if is_group and not (text or "").lstrip().startswith("/"):
             mention_meta = mention_meta_line(message, self.config.extra or {})
             if mention_meta:
