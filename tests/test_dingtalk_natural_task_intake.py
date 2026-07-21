@@ -7,15 +7,19 @@ import asyncio
 import copy
 import re
 import sys
+import time
 import types
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER_PATH = ROOT / "overlays/hermes/plugins/platforms/dingtalk/adapter.py"
+BINDING_PATH = ROOT / "overlays/hermes/plugins/platforms/dingtalk/task_binding.py"
+SESSION_PATH = ROOT / "overlays/hermes/gateway/session.py"
 
 
 class FakeLogger:
@@ -36,6 +40,47 @@ class FakeMessageEvent:
 
 class MessageType:
     TEXT = "text"
+
+
+class FakeSource:
+    """Attribute mirror of the Core SessionSource fields this path touches."""
+
+    profile = None
+    board_slug = None
+    task_id = None
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def load_session_key_namespace():
+    """Load Core's real ``_session_key_namespace`` rule from the overlay."""
+    tree = ast.parse(SESSION_PATH.read_text(encoding="utf-8"), filename=str(SESSION_PATH))
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_session_key_namespace":
+            module = ast.Module(body=[node], type_ignores=[])
+            ast.fix_missing_locations(module)
+            namespace = {"Optional": Optional}
+            exec(compile(module, str(SESSION_PATH), "exec"), namespace)
+            return namespace["_session_key_namespace"]
+    raise RuntimeError("_session_key_namespace not found in overlay session.py")
+
+
+def load_natural_intake():
+    """Load the real ``resolve_natural_intake`` helper from task_binding.py.
+
+    The offload (``asyncio.to_thread``) and profile stamping under test live
+    in that helper, so the seam tests must drive the real implementation —
+    with ``gateway.task_intake`` still patched to a controllable fake.
+    """
+    import importlib.util
+
+    name = "dingtalk_task_binding_for_intake_uut"
+    spec = importlib.util.spec_from_file_location(name, BINDING_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.resolve_natural_intake
 
 
 def load_on_message():
@@ -95,6 +140,7 @@ def load_on_message():
         "is_user_allowed": lambda *args, **kwargs: True,
         "logger": FakeLogger(),
         "mention_meta_line": lambda *args, **kwargs: "",
+        "resolve_natural_intake": load_natural_intake(),
         "resolve_task_binding": resolve_task_binding,
         "should_process_message": lambda *args, **kwargs: True,
         "timezone": timezone,
@@ -105,7 +151,7 @@ def load_on_message():
 
 
 class FakeAdapter:
-    def __init__(self, *, enabled, send_success=True):
+    def __init__(self, *, enabled, send_success=True, gateway_profile=None):
         self.name = "dingtalk"
         self.config = SimpleNamespace(extra={"natural_task_intake": enabled})
         self._allowed_users = set()
@@ -115,6 +161,7 @@ class FakeAdapter:
         self._done_emoji_fired = set()
         self._session_webhooks = {}
         self._session_store = object()
+        self._gateway_profile = gateway_profile
         self.events = []
         self.sent = []
         self.send_success = send_success
@@ -127,8 +174,48 @@ class FakeAdapter:
         return None
 
     @staticmethod
-    def build_source(**kwargs):
-        return kwargs
+    def build_source(
+        chat_id,
+        chat_name=None,
+        chat_type="dm",
+        user_id=None,
+        user_name=None,
+        thread_id=None,
+        chat_topic=None,
+        user_id_alt=None,
+        chat_id_alt=None,
+        is_bot=False,
+        guild_id=None,
+        parent_chat_id=None,
+        message_id=None,
+        role_authorized=False,
+        auto_thread_created=False,
+        auto_thread_initial_name=None,
+    ):
+        """Exact signature mirror of Core ``BasePlatformAdapter.build_source``.
+
+        No ``**kwargs`` on purpose: any kwarg the adapter passes that Core
+        does not accept must raise ``TypeError`` here, so signature drift
+        between this overlay and Core turns the suite red.
+        """
+        return FakeSource(
+            chat_id=chat_id,
+            chat_name=chat_name,
+            chat_type=chat_type,
+            user_id=user_id,
+            user_name=user_name,
+            thread_id=thread_id,
+            chat_topic=chat_topic,
+            user_id_alt=user_id_alt,
+            chat_id_alt=chat_id_alt,
+            is_bot=is_bot,
+            guild_id=guild_id,
+            parent_chat_id=parent_chat_id,
+            message_id=message_id,
+            role_authorized=role_authorized,
+            auto_thread_created=auto_thread_created,
+            auto_thread_initial_name=auto_thread_initial_name,
+        )
 
     async def handle_message(self, event):
         self.events.append(event)
@@ -175,6 +262,9 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         result=None,
         raises=False,
         send_success=True,
+        gateway_profile=None,
+        resolver_override=None,
+        drive=None,
     ):
         calls = []
 
@@ -200,14 +290,21 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         gateway = types.ModuleType("gateway")
         gateway.__path__ = []
         task_intake = types.ModuleType("gateway.task_intake")
-        task_intake.resolve_natural_task_intake = resolver
+        task_intake.resolve_natural_task_intake = resolver_override or resolver
         old_gateway = sys.modules.get("gateway")
         old_task_intake = sys.modules.get("gateway.task_intake")
         sys.modules["gateway"] = gateway
         sys.modules["gateway.task_intake"] = task_intake
         try:
-            adapter = FakeAdapter(enabled=enabled, send_success=send_success)
-            asyncio.run(self.on_message(adapter, make_message(text)))
+            adapter = FakeAdapter(
+                enabled=enabled,
+                send_success=send_success,
+                gateway_profile=gateway_profile,
+            )
+            if drive is None:
+                asyncio.run(self.on_message(adapter, make_message(text)))
+            else:
+                asyncio.run(drive(adapter))
         finally:
             if old_gateway is None:
                 sys.modules.pop("gateway", None)
@@ -226,7 +323,7 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual([], adapter.sent)
         self.assertEqual(1, len(adapter.events))
         self.assertEqual("普通聊天", adapter.events[0].text)
-        self.assertNotIn("board_slug", adapter.events[0].source)
+        self.assertIsNone(adapter.events[0].source.board_slug)
 
     def test_reply_without_agent_sends_once_and_stops(self):
         result = SimpleNamespace(
@@ -296,7 +393,7 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual([], adapter.sent)
         self.assertEqual(1, len(adapter.events))
         self.assertEqual("普通聊天", adapter.events[0].text)
-        self.assertNotIn("board_slug", adapter.events[0].source)
+        self.assertIsNone(adapter.events[0].source.board_slug)
 
     def test_raw_binding_bypasses_natural_resolver_and_stays_per_message(self):
         adapter, calls = self.run_message(
@@ -305,8 +402,8 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
 
         self.assertEqual([], calls)
         self.assertEqual(1, len(adapter.events))
-        self.assertEqual("agong", adapter.events[0].source["board_slug"])
-        self.assertEqual("t_deadbeef", adapter.events[0].source["task_id"])
+        self.assertEqual("agong", adapter.events[0].source.board_slug)
+        self.assertEqual("t_deadbeef", adapter.events[0].source.task_id)
         self.assertEqual("联系人为什么没显示", adapter.events[0].text)
 
     def test_slash_command_bypasses_natural_resolver(self):
@@ -324,6 +421,88 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual([], adapter.events)
         self.assertEqual(1, len(adapter.sent))
         self.assertIn("任务接入暂时不可用", adapter.sent[0]["content"])
+
+    def test_resolver_runs_off_the_event_loop(self):
+        """A slow synchronous resolver must not stall the event loop.
+
+        The Core resolver scans Kanban and waits on SQLite locks, so it must
+        be offloaded (``asyncio.to_thread``). A 20ms tick scheduled next to a
+        250ms resolver has to fire BEFORE the resolver returns; an inline
+        synchronous call serializes them and the tick lands after.
+        """
+        resolver_ended_at = []
+        tick_fired_at = []
+
+        def slow_resolver(session_store, source, message_text, request_id, **kwargs):
+            time.sleep(0.25)
+            resolver_ended_at.append(time.monotonic())
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        async def drive(adapter):
+            async def ticker():
+                await asyncio.sleep(0.02)
+                tick_fired_at.append(time.monotonic())
+
+            await asyncio.gather(
+                self.on_message(adapter, make_message("普通聊天")),
+                ticker(),
+            )
+
+        adapter, calls = self.run_message(
+            "普通聊天",
+            resolver_override=slow_resolver,
+            drive=drive,
+        )
+
+        self.assertEqual(1, len(resolver_ended_at))
+        self.assertEqual(1, len(tick_fired_at))
+        self.assertLess(
+            tick_fired_at[0],
+            resolver_ended_at[0],
+            "event loop tick was blocked by the synchronous resolver",
+        )
+        # Return semantics are unchanged: pass_through still reaches the gateway.
+        self.assertEqual(1, len(adapter.events))
+        self.assertEqual("普通聊天", adapter.events[0].text)
+
+    def test_multiplex_profile_is_stamped_before_resolver_and_isolates_state(self):
+        """The resolver must see the profile the gateway will key state on.
+
+        The gateway stamps ``source.profile`` only after the adapter hands
+        over the event, but the task-state key (``task_state_key`` →
+        ``_resolve_profile_for_key``) reads it inside the resolver. The
+        adapter therefore stamps the profile it was constructed under, so
+        two multiplex profiles in the same chat never share task state.
+        """
+        namespace_of = load_session_key_namespace()
+        seen_profiles = []
+
+        def recording_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen_profiles.append(source.profile)
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        for profile in ("default", "coder", None):
+            adapter, calls = self.run_message(
+                "普通聊天",
+                gateway_profile=profile,
+                resolver_override=recording_resolver,
+            )
+            self.assertEqual(1, len(adapter.events))
+
+        self.assertEqual(["default", "coder", None], seen_profiles)
+        # Core's real key rule: the two stamped profiles resolve to different
+        # session-key namespaces, so their task-state keys cannot collide.
+        self.assertNotEqual(namespace_of("default"), namespace_of("coder"))
 
 
 if __name__ == "__main__":

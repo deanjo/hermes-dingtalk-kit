@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / ".baseline/hermes"
 SCRIPT = ROOT / "scripts/install_dingtalk_kit.py"
 DOCKERFILE = ROOT / "docker/Dockerfile"
-EXPECTED_VERIFIER_CHECKS = 53
+EXPECTED_VERIFIER_CHECKS = 54
 
 
 def load_installer():

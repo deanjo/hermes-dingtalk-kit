@@ -118,7 +118,7 @@ try:
         _log_forward_diag,
         build_reply_kwargs,
     )
-    from .task_binding import resolve_task_binding
+    from .task_binding import resolve_gateway_profile, resolve_natural_intake, resolve_task_binding
 except ImportError:
     import sys
     from pathlib import Path
@@ -137,7 +137,7 @@ except ImportError:
         _log_forward_diag,
         build_reply_kwargs,
     )
-    from task_binding import resolve_task_binding  # type: ignore
+    from task_binding import resolve_gateway_profile, resolve_natural_intake, resolve_task_binding  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +269,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Track fire-and-forget emoji/reaction coroutines so Python's GC
         # doesn't drop them mid-flight, and we can cancel them on disconnect.
         self._bg_tasks: Set[asyncio.Task] = set()
+        self._gateway_profile: Optional[str] = resolve_gateway_profile()  # owning multiplex profile
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -623,7 +624,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                 return
             task_binding = parsed_task_message.binding
             text = parsed_task_message.message_text
-        source_kwargs = dict(
+        source = self.build_source(
             chat_id=chat_id,
             chat_name=getattr(message, "conversation_title", None),
             chat_type=chat_type,
@@ -632,14 +633,13 @@ class DingTalkAdapter(BasePlatformAdapter):
             user_id_alt=sender_staff_id if sender_staff_id else None,
             message_id=msg_id,
         )
-        if task_binding:
-            source_kwargs.update(board_slug=task_binding.board_slug, task_id=task_binding.task_id)
-        source = self.build_source(**source_kwargs)
+        if task_binding:  # build_source() rejects the Kanban kwargs — stamp directly.
+            source.board_slug = task_binding.board_slug
+            source.task_id = task_binding.task_id
         if (task_binding is None and not (text or "").lstrip().startswith("/")
                 and (self.config.extra or {}).get("natural_task_intake") is True):
             try:
-                from gateway.task_intake import resolve_natural_task_intake
-                intake = resolve_natural_task_intake(self._session_store, source, text or "", msg_id, enabled=True)
+                intake = await resolve_natural_intake(self, source, text or "", msg_id)
                 if intake.action not in {"pass_through", "reply_without_agent", "bound_source", "error_without_agent"}:
                     raise ValueError(f"Unknown natural task intake action: {intake.action!r}")
             except Exception:

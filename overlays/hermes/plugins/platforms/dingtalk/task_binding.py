@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -93,3 +94,51 @@ async def resolve_task_binding(
         return parsed
     await adapter.send(chat_id, clarification, reply_to=message_id)
     return None
+
+
+def resolve_gateway_profile() -> str | None:
+    """Profile whose runtime scope constructed this adapter (multiplex).
+
+    A multiplex gateway constructs each secondary profile's adapters under
+    that profile's HERMES_HOME scope and the primary adapter under the
+    process HERMES_HOME, so the active profile name resolved at construction
+    time is exactly the profile the gateway stamps on ``source.profile`` /
+    falls back to for session and task-state keys. None => unknown; legacy
+    single-profile behavior is preserved.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or None
+    except Exception:  # noqa: BLE001 - profile discovery must never break startup
+        return None
+
+
+async def resolve_natural_intake(
+    adapter: object,
+    source: object,
+    text: str,
+    message_id: str,
+):
+    """Resolve one natural message via Core task intake, off the event loop.
+
+    The Core resolver keys task state on ``source.profile``, but the gateway
+    stamps the profile only after the adapter hands over the event — so the
+    adapter's owning profile is stamped here first, and two multiplex
+    profiles in the same chat never share task state. The resolver itself is
+    synchronous (Kanban scan + SQLite lock waits), so it is offloaded with
+    ``asyncio.to_thread``; the return value and exception propagation match
+    a direct synchronous call.
+    """
+    from gateway.task_intake import resolve_natural_task_intake
+
+    if not getattr(source, "profile", None):
+        source.profile = adapter._gateway_profile
+    return await asyncio.to_thread(
+        resolve_natural_task_intake,
+        adapter._session_store,
+        source,
+        text,
+        message_id,
+        enabled=True,
+    )

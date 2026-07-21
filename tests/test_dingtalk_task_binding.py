@@ -37,6 +37,17 @@ class MessageType:
     TEXT = "text"
 
 
+class FakeSource:
+    """Attribute mirror of the Core SessionSource fields this path touches."""
+
+    profile = None
+    board_slug = None
+    task_id = None
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
 def load_binding_module():
     name = "dingtalk_task_binding_uut"
     spec = importlib.util.spec_from_file_location(name, BINDING_PATH)
@@ -133,8 +144,48 @@ class FakeAdapter:
         return None
 
     @staticmethod
-    def build_source(**kwargs):
-        return kwargs
+    def build_source(
+        chat_id,
+        chat_name=None,
+        chat_type="dm",
+        user_id=None,
+        user_name=None,
+        thread_id=None,
+        chat_topic=None,
+        user_id_alt=None,
+        chat_id_alt=None,
+        is_bot=False,
+        guild_id=None,
+        parent_chat_id=None,
+        message_id=None,
+        role_authorized=False,
+        auto_thread_created=False,
+        auto_thread_initial_name=None,
+    ):
+        """Exact signature mirror of Core ``BasePlatformAdapter.build_source``.
+
+        No ``**kwargs`` on purpose: any kwarg the adapter passes that Core
+        does not accept must raise ``TypeError`` here, so signature drift
+        between this overlay and Core turns the suite red.
+        """
+        return FakeSource(
+            chat_id=chat_id,
+            chat_name=chat_name,
+            chat_type=chat_type,
+            user_id=user_id,
+            user_name=user_name,
+            thread_id=thread_id,
+            chat_topic=chat_topic,
+            user_id_alt=user_id_alt,
+            chat_id_alt=chat_id_alt,
+            is_bot=is_bot,
+            guild_id=guild_id,
+            parent_chat_id=parent_chat_id,
+            message_id=message_id,
+            role_authorized=role_authorized,
+            auto_thread_created=auto_thread_created,
+            auto_thread_initial_name=auto_thread_initial_name,
+        )
 
     async def handle_message(self, event):
         self.events.append(event)
@@ -216,8 +267,8 @@ class TaskBindingAdapterTest(unittest.TestCase):
         self.assertEqual([], adapter.sent)
         self.assertEqual(1, len(adapter.events))
         self.assertEqual("联系人为什么没显示", adapter.events[0].text)
-        self.assertEqual("agong", adapter.events[0].source["board_slug"])
-        self.assertEqual("t_deadbeef", adapter.events[0].source["task_id"])
+        self.assertEqual("agong", adapter.events[0].source.board_slug)
+        self.assertEqual("t_deadbeef", adapter.events[0].source.task_id)
 
     def test_unknown_binding_clarifies_once_and_never_starts_model(self):
         adapter = self.run_message(
@@ -237,7 +288,7 @@ class TaskBindingAdapterTest(unittest.TestCase):
         adapter = self.run_message("普通聊天", exists=False)
         self.assertEqual([], adapter.sent)
         self.assertEqual(1, len(adapter.events))
-        self.assertNotIn("board_slug", adapter.events[0].source)
+        self.assertIsNone(adapter.events[0].source.board_slug)
         self.assertEqual("普通聊天", adapter.events[0].text)
 
 

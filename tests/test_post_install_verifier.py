@@ -61,6 +61,64 @@ class PostInstallVerifierTest(unittest.TestCase):
         runtime = next(item for item in report["checks"] if item["name"] == "plugin.runtime_discovery")
         self.assertEqual("skipped", runtime["status"])
         self.assertEqual("Hermes runtime modules not present in target root", runtime["message"])
+        signature = next(
+            item for item in report["checks"] if item["name"] == "plugin.build_source_signature"
+        )
+        self.assertEqual("skipped", signature["status"])
+
+    REAL_BUILD_SOURCE_SIGNATURE = '''
+class BasePlatformAdapter:
+    def build_source(
+        self,
+        chat_id,
+        chat_name=None,
+        chat_type="dm",
+        user_id=None,
+        user_name=None,
+        thread_id=None,
+        chat_topic=None,
+        user_id_alt=None,
+        chat_id_alt=None,
+        is_bot=False,
+        guild_id=None,
+        parent_chat_id=None,
+        message_id=None,
+        role_authorized=False,
+        auto_thread_created=False,
+        auto_thread_initial_name=None,
+    ):
+        ...
+'''
+
+    def make_target_with_core_base(self, base_source: str) -> Path:
+        root = self.make_target()
+        base_py = root / "gateway/platforms/base.py"
+        base_py.parent.mkdir(parents=True, exist_ok=True)
+        base_py.write_text(base_source, encoding="utf-8")
+        return root
+
+    def test_build_source_signature_probe_passes_with_real_signature(self):
+        root = self.make_target_with_core_base(self.REAL_BUILD_SOURCE_SIGNATURE)
+
+        report = self.verifier.build_report(root)
+
+        probe = next(
+            item for item in report["checks"] if item["name"] == "plugin.build_source_signature"
+        )
+        self.assertEqual("ok", probe["status"], probe)
+
+    def test_build_source_signature_probe_fails_on_core_drift(self):
+        root = self.make_target_with_core_base(
+            self.REAL_BUILD_SOURCE_SIGNATURE.replace("        user_id_alt=None,\n", "")
+        )
+
+        report = self.verifier.build_report(root)
+
+        probe = next(
+            item for item in report["checks"] if item["name"] == "plugin.build_source_signature"
+        )
+        self.assertEqual("failed", probe["status"], probe)
+        self.assertIn("user_id_alt", probe["message"])
 
     def test_json_cli_is_machine_readable(self):
         completed = subprocess.run(

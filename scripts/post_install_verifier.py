@@ -502,6 +502,57 @@ def _assert_session_key_slash(root: Path) -> str:
     return "DingTalk base64 slash keys allowed and path-shaped keys blocked"
 
 
+def _build_source_signature_probe(root: Path) -> CheckResult:
+    """Guard the adapter ↔ Core ``build_source`` keyword seam.
+
+    Compares every keyword the plugin adapter passes to ``self.build_source``
+    against the signature of ``BasePlatformAdapter.build_source`` in the
+    TARGET root, so a Core-side signature change (or an adapter-side kwarg
+    Core never accepted, e.g. the Kanban binding fields) fails verification
+    instead of raising TypeError on the production inbound path.
+    """
+    name = "plugin.build_source_signature"
+    rel = str(PLUGIN_REL / "adapter.py")
+    base_py = root / "gateway/platforms/base.py"
+    if not base_py.is_file():
+        return _skip(name, "gateway/platforms/base.py", "core platform base not present in target root")
+    try:
+        accepted: set[str] | None = None
+        for node in _read_tree(base_py).body:
+            if not (isinstance(node, ast.ClassDef) and node.name == "BasePlatformAdapter"):
+                continue
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "build_source":
+                    accepted = {arg.arg for arg in item.args.args + item.args.kwonlyargs}
+        if accepted is None:
+            raise AssertionError("BasePlatformAdapter.build_source not found")
+        accepted.discard("self")
+        calls = [
+            node
+            for node in ast.walk(_read_tree(root / PLUGIN_REL / "adapter.py"))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "build_source"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+        ]
+        if not calls:
+            raise AssertionError("adapter never calls self.build_source")
+        for call in calls:
+            if any(keyword.arg is None for keyword in call.keywords):
+                raise AssertionError("self.build_source must use explicit keywords (no **kwargs)")
+            unknown = sorted(
+                keyword.arg for keyword in call.keywords if keyword.arg not in accepted
+            )
+            if unknown:
+                raise AssertionError("kwargs unsupported by core build_source: " + ", ".join(unknown))
+    except AssertionError as exc:
+        return _fail(name, rel, "failed", str(exc))
+    except Exception as exc:  # noqa: BLE001 - verifier boundary
+        return _fail(name, rel, "error", f"{type(exc).__name__}: {exc}")
+    return _ok(name, rel, "adapter kwargs accepted by core build_source")
+
+
 def _assert_session_context_bridge(root: Path) -> str:
     module = _load_module(
         root / "gateway/session_context.py",
@@ -760,6 +811,7 @@ def build_report(target: Path, *, require_compat: bool = True) -> dict[str, Any]
                     [
                         _run_check("plugin.manifest", str(PLUGIN_REL / "plugin.yaml"), lambda: _assert_plugin_manifest(root)),
                         _run_check("plugin.entry", str(PLUGIN_REL / "adapter.py"), lambda: _assert_plugin_entry(root)),
+                        _build_source_signature_probe(root),
                         _runtime_discovery_probe(root),
                         _run_check("plugin.raw_process_ack", str(PLUGIN_REL / "incoming.py"), lambda: _assert_raw_process_ack(root)),
                         _run_check("plugin.reply_context_kwargs", str(PLUGIN_REL / "reply_context.py"), lambda: _assert_reply_context(root)),
