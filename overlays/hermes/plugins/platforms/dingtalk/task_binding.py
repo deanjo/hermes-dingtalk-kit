@@ -308,13 +308,16 @@ def match_intake_prompt(registry, chat_id, message_id, *, now=None):
     if not chat_id or not message_id:
         return None
     now = time.monotonic() if now is None else now
+    # R4 M5: sweep globally on EVERY lookup — a live hit or an ordinary miss
+    # must reclaim other chats' expired entries too, not just an expired hit
+    # in the looked-up chat.
+    _sweep_expired_intake_prompts(registry, now)
     entries = registry.get(chat_id) or {}
     hit = entries.get(message_id)
     if hit is None:
         return None
     operation_id, phase, target_digest, expires_at = hit
-    if expires_at <= now:
-        _sweep_expired_intake_prompts(registry, now)
+    if expires_at <= now:  # defensive: the sweep above already purged it
         return None
     return {
         "operation_id": operation_id,

@@ -1749,6 +1749,40 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertNotIn("chat-x", registry)
         self.assertNotIn("chat-y", registry)  # swept although never touched
 
+    def test_prompt_registry_match_sweeps_globally_on_hit_and_miss(self):
+        """R4 M5: every match lookup sweeps expired entries in EVERY chat —
+        a live hit or an ordinary miss reclaims other chats' stale entries,
+        not just an expired hit in the looked-up chat."""
+        module = load_task_binding_module()
+        register = module.register_intake_prompt
+        match = module.match_intake_prompt
+        ttl = module._INTAKE_PROMPT_REGISTRY_TTL_SECONDS
+        now = 1000.0 + ttl + 1  # entries registered at 1000.0 are expired
+
+        # Live hit path: the stale chats are reclaimed as a side effect.
+        # (chat-live registers BEFORE the stale entries expire, so its own
+        # register-sweep cannot pre-clean them — the match must do it.)
+        registry = {}
+        register(registry, "chat-stale-1", "msg-a", "op-a", "choose_task", "digest-a", now=1000.0)
+        register(registry, "chat-stale-2", "msg-b", "op-b", "choose_task", "digest-b", now=1000.0)
+        register(registry, "chat-live", "msg-c", "op-c", "choose_task", "digest-c", now=2000.0)
+        self.assertEqual(
+            {"operation_id": "op-c", "phase": "choose_task", "target_digest": "digest-c"},
+            match(registry, "chat-live", "msg-c", now=now),
+        )
+        self.assertNotIn("chat-stale-1", registry)
+        self.assertNotIn("chat-stale-2", registry)
+
+        # Ordinary miss path: same global sweep, live entry untouched.
+        registry = {}
+        register(registry, "chat-stale-1", "msg-a", "op-a", "choose_task", "digest-a", now=1000.0)
+        register(registry, "chat-stale-2", "msg-b", "op-b", "choose_task", "digest-b", now=1000.0)
+        register(registry, "chat-live", "msg-c", "op-c", "choose_task", "digest-c", now=2000.0)
+        self.assertIsNone(match(registry, "chat-live", "unknown-msg", now=now))
+        self.assertNotIn("chat-stale-1", registry)
+        self.assertNotIn("chat-stale-2", registry)
+        self.assertIn("msg-c", registry["chat-live"])
+
     def test_prompt_registry_chat_cap_evicts_oldest_chat_with_warning(self):
         """R3 #7: the outer chat map is capped; evicting a chat logs a warning."""
         module = load_task_binding_module()
