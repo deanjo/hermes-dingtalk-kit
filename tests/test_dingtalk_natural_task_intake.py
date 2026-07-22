@@ -1541,6 +1541,149 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         }
         self.assertIn("validate_natural_intake_classifier_config", called)
 
+    # -- R3 #2/#3: malformed repliedMsg + direct quote clarification -----------
+
+    def test_malformed_replied_msg_is_explicit_unauthenticated_quote(self):
+        """R3 #2: a present-but-malformed repliedMsg must never read as 'no quote'.
+
+        None / non-dict / empty-dict values all yield an explicit
+        authenticated=False quote; the contract-Core answers with the quote
+        clarification action, so a control word can never be consumed as a
+        plain unquoted confirm.
+        """
+        module = load_task_binding_module()
+        for malformed in (None, "garbage-string", {}):
+            with self.subTest(malformed=repr(malformed)):
+                seen = []
+
+                def clarifying_resolver(session_store, source, message_text, request_id, **kwargs):
+                    seen.append(kwargs.get("quote"))
+                    return SimpleNamespace(
+                        action=module.QUOTE_CLARIFICATION_ACTION,
+                        source=None,
+                        text="",
+                        reply_text="我无法确认你引用的内容，请说明是哪条提示。",
+                    )
+
+                def drive(adapter):
+                    message = make_message("确认")
+                    message.text.extensions = {"repliedMsg": malformed}
+                    return self.on_message(adapter, message)
+
+                adapter, calls = self.run_message(
+                    "确认", resolver_override=clarifying_resolver, drive=drive
+                )
+
+                self.assertEqual(1, len(seen))
+                self.assertEqual(
+                    {
+                        "replied_message_id": None,
+                        "authenticated": False,
+                        "matched": None,
+                        "quoted_text": None,
+                    },
+                    seen[0],
+                )
+                self.assertEqual([], adapter.events)
+                self.assertEqual(1, len(adapter.sent))
+                self.assertIn("引用", adapter.sent[0]["content"])
+                self.assertEqual({}, adapter._intake_prompt_msgs)
+
+    def test_unauthenticated_control_quote_directly_clarified_by_core_action(self):
+        """R3 #3: an unauthenticated quote on a control intent is answered by
+        the gate itself — even when the quoted text IS available (the old
+        reply-context path would have let it reach the agent)."""
+        seen = []
+        module = load_task_binding_module()
+
+        def clarifying_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(kwargs.get("quote"))
+            return SimpleNamespace(
+                action=module.QUOTE_CLARIFICATION_ACTION,
+                source=None,
+                text="",
+                reply_text="我无法确认你引用的是哪条提示，请直接回复任务编号或重新选择。",
+            )
+
+        def drive(adapter):
+            message = make_message("确认")
+            message.text.extensions = {
+                "repliedMsg": {
+                    "msgId": "foreign-message-1",
+                    "msgType": "text",
+                    "content": {"text": "别人的消息原文"},
+                }
+            }
+            # No _test_reply_kwargs sentinel: a pass_through would sail
+            # straight into the agent with full reply context.
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("确认", resolver_override=clarifying_resolver, drive=drive)
+
+        self.assertEqual(1, len(seen))
+        self.assertFalse(seen[0]["authenticated"])
+        self.assertIsNone(seen[0]["matched"])
+        self.assertEqual("别人的消息原文", seen[0]["quoted_text"])
+        self.assertEqual([], adapter.events)  # never reached the agent
+        self.assertEqual(1, len(adapter.sent))
+        self.assertIn("引用", adapter.sent[0]["content"])
+        self.assertEqual("incoming-1", adapter.sent[0]["reply_to"])
+        # A clarification is not a confirmation prompt: nothing registers.
+        self.assertEqual({}, adapter._intake_prompt_msgs)
+
+    # -- R3 #7: registry global sweep + outer chat cap --------------------------
+
+    def test_prompt_registry_global_sweep_reclaims_idle_chats(self):
+        """R3 #7: register/match sweep expired entries in EVERY chat, so idle
+        chats are reclaimed even when they never see another prompt/quote."""
+        module = load_task_binding_module()
+        register = module.register_intake_prompt
+        match = module.match_intake_prompt
+        ttl = module._INTAKE_PROMPT_REGISTRY_TTL_SECONDS
+
+        registry = {}
+        register(registry, "chat-idle", "msg-a", "op-a", "choose_task", "digest-a", now=1000.0)
+        register(registry, "chat-live", "msg-b", "op-b", "choose_task", "digest-b", now=1000.0)
+        # Registering into a third chat past the TTL sweeps both idle chats.
+        register(registry, "chat-new", "msg-c", "op-c", "choose_task", "digest-c", now=1000.0 + ttl + 1)
+        self.assertNotIn("chat-idle", registry)
+        self.assertNotIn("chat-live", registry)
+        self.assertEqual(["msg-c"], list(registry["chat-new"]))
+
+        # An expired-hit match sweeps globally too, not just its own chat.
+        register(registry, "chat-x", "msg-x", "op-x", "choose_task", "digest-x", now=3000.0)
+        register(registry, "chat-y", "msg-y", "op-y", "choose_task", "digest-y", now=3000.0)
+        self.assertIsNone(match(registry, "chat-x", "msg-x", now=3000.0 + ttl))
+        self.assertNotIn("chat-x", registry)
+        self.assertNotIn("chat-y", registry)  # swept although never touched
+
+    def test_prompt_registry_chat_cap_evicts_oldest_chat_with_warning(self):
+        """R3 #7: the outer chat map is capped; evicting a chat logs a warning."""
+        module = load_task_binding_module()
+        register = module.register_intake_prompt
+        max_chats = module._INTAKE_PROMPT_REGISTRY_MAX_CHATS
+        self.assertEqual(256, max_chats)
+
+        registry = {}
+        for index in range(max_chats):
+            register(
+                registry, f"chat-{index}", f"msg-{index}", f"op-{index}",
+                "choose_task", f"digest-{index}", now=1000.0,
+            )
+        self.assertEqual(max_chats, len(registry))
+        with self.assertLogs(module.logger, level="WARNING") as captured:
+            register(
+                registry, "chat-new", "msg-new", "op-new",
+                "choose_task", "digest-new", now=1000.0,
+            )
+        self.assertEqual(max_chats, len(registry))
+        self.assertNotIn("chat-0", registry)  # oldest chat evicted first
+        self.assertIn("chat-new", registry)
+        self.assertTrue(
+            any("evicted" in line and "chat" in line for line in captured.output),
+            f"expected a chat-eviction warning, got: {captured.output}",
+        )
+
     # -- R9 #6 (D7): media keeps the current binding --------------------------
 
     def test_media_with_current_binding_restores_source(self):

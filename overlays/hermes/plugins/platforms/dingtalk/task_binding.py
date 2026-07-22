@@ -1,7 +1,8 @@
 """DingTalk task binding: explicit ``#任务`` prefix parsing plus the natural
-task intake seam (quote-aware confirmation R9 #3 hardened by R2 C1/C2 —
-prompts registered and matched as full ``(operation_id, phase,
-target_digest)`` triples with explicit quote authentication, media binding
+task intake seam (quote-aware confirmation R9 #3 hardened by R2 C1/C2 + R3
+#2/#3 — prompts registered and matched as full ``(operation_id, phase,
+target_digest)`` triples with explicit quote authentication, malformed
+``repliedMsg`` fail-closed, direct quote clarification, media binding
 restore R9 #6, sender/inbound-msgId fail-closed R9 #9 + R2)."""
 
 from __future__ import annotations
@@ -231,11 +232,15 @@ async def materialize_natural_binding(adapter: object, source: object):
 # only authenticates the exact phase it was prompted for. The TTL must
 # outlive the Core pending it points at (AWAITING_TTL_SECONDS=900) so a quote
 # arriving near pending expiry still matches and lets Core decide; the
-# per-chat FIFO cap keeps a busy group from growing the map without bound.
-# In-memory only (accepted residual R5): a restart degrades a quoted confirm
-# to the T1 reply clarification — the safe direction, never a wrong consume.
+# per-chat FIFO cap keeps a busy group from growing the map without bound,
+# and R3 #7 adds a lazy global expiry sweep (run from register/match) plus a
+# cap on the number of outer chat keys so idle chats can't accumulate
+# without bound either. In-memory only (accepted residual R5): a restart
+# degrades a quoted confirm to the T1 reply clarification — the safe
+# direction, never a wrong consume.
 _INTAKE_PROMPT_REGISTRY_TTL_SECONDS = 1200.0
 _INTAKE_PROMPT_REGISTRY_MAX_PER_CHAT = 8
+_INTAKE_PROMPT_REGISTRY_MAX_CHATS = 256
 
 
 def register_intake_prompt(
@@ -247,7 +252,7 @@ def register_intake_prompt(
     if not chat_id or not message_id or not operation_id:
         return
     now = time.monotonic() if now is None else now
-    _purge_expired_intake_prompts(registry, chat_id, now)
+    _sweep_expired_intake_prompts(registry, now)
     entries = registry.setdefault(chat_id, {})
     while len(entries) >= _INTAKE_PROMPT_REGISTRY_MAX_PER_CHAT:
         evicted_id = next(iter(entries))
@@ -263,6 +268,14 @@ def register_intake_prompt(
         target_digest,
         now + _INTAKE_PROMPT_REGISTRY_TTL_SECONDS,
     )
+    while len(registry) > _INTAKE_PROMPT_REGISTRY_MAX_CHATS:
+        evicted_chat = next(iter(registry))
+        registry.pop(evicted_chat, None)
+        logger.warning(
+            "Intake prompt registry chat count exceeds %d; evicted oldest chat has_chat_id=%s",
+            _INTAKE_PROMPT_REGISTRY_MAX_CHATS,
+            bool(evicted_chat),
+        )
 
 
 def _purge_expired_intake_prompts(registry, chat_id, now):
@@ -278,6 +291,16 @@ def _purge_expired_intake_prompts(registry, chat_id, now):
         registry.pop(chat_id, None)
 
 
+def _sweep_expired_intake_prompts(registry, now):
+    """Global lazy expiry sweep across every chat (R3 #7).
+
+    Runs from register/match so entries of chats that never see another
+    prompt or quote are still reclaimed, and their emptied outer keys drop.
+    """
+    for chat_id in list(registry):
+        _purge_expired_intake_prompts(registry, chat_id, now)
+
+
 def match_intake_prompt(registry, chat_id, message_id, *, now=None):
     """Return the ``{"operation_id", "phase", "target_digest"}`` triple whose
     confirmation prompt was ``message_id``, or None when the quoted message
@@ -291,7 +314,7 @@ def match_intake_prompt(registry, chat_id, message_id, *, now=None):
         return None
     operation_id, phase, target_digest, expires_at = hit
     if expires_at <= now:
-        _purge_expired_intake_prompts(registry, chat_id, now)
+        _sweep_expired_intake_prompts(registry, now)
         return None
     return {
         "operation_id": operation_id,
@@ -332,7 +355,7 @@ def build_intake_quote(registry, chat_id, message):
     """Assemble the quote payload for Core, or None for a non-quote message.
 
     Every quote-reply yields a payload with an explicit authentication
-    verdict (R2 C1/C2):
+    verdict (R2 C1/C2, R3 #2):
 
     * ``authenticated=True`` and ``matched`` = the registered
       ``{"operation_id", "phase", "target_digest"}`` triple — only when the
@@ -340,20 +363,24 @@ def build_intake_quote(registry, chat_id, message):
       chat.
     * ``authenticated=False`` and ``matched=None`` for everything else:
       unknown/expired/another chat's message, a ``repliedMsg`` without
-      ``msgId``, or a webhook-delivered prompt (its ``SendResult.message_id``
-      is a locally synthesized uuid DingTalk never echoes back, so it can
-      never match). ``quoted_text`` still rides along for Core to display —
-      it never authenticates anything.
+      ``msgId``, a malformed ``repliedMsg`` (non-dict, empty, or null — the
+      key's mere presence makes the message a quote; R3 #2 forbids silently
+      degrading it to "not a quote"), or a webhook-delivered prompt (its
+      ``SendResult.message_id`` is a locally synthesized uuid DingTalk never
+      echoes back, so it can never match). ``quoted_text`` still rides along
+      for Core to display — it never authenticates anything.
     """
     try:
         from .reply_context import _extract_replied_text_original, _get_text_extensions
     except ImportError:  # standalone (non-package) module load
         from reply_context import _extract_replied_text_original, _get_text_extensions  # type: ignore
 
-    replied = (_get_text_extensions(message) or {}).get("repliedMsg")
-    if not isinstance(replied, dict) or not replied:
+    extensions = _get_text_extensions(message) or {}
+    if "repliedMsg" not in extensions:
         return None
-    replied_message_id = str(replied.get("msgId") or replied.get("msgid") or "").strip()
+    replied = extensions.get("repliedMsg")
+    replied_map = replied if isinstance(replied, dict) else {}
+    replied_message_id = str(replied_map.get("msgId") or replied_map.get("msgid") or "").strip()
     matched = None
     if replied_message_id:
         matched = match_intake_prompt(registry, chat_id, replied_message_id)
@@ -361,7 +388,7 @@ def build_intake_quote(registry, chat_id, message):
         "replied_message_id": replied_message_id or None,
         "authenticated": matched is not None,
         "matched": matched,
-        "quoted_text": _extract_replied_text_original(replied) or None,
+        "quoted_text": _extract_replied_text_original(replied_map) or None,
     }
 
 
@@ -373,6 +400,14 @@ class NaturalIntakeGateResult:
     source: object = None
     text: str = ""
     control_consumed: bool = False
+
+
+# R3 #3: Core's action for "a quote is present but unauthenticated — ask for
+# clarification". Kit replies directly and never lets the message reach the
+# agent, instead of relying on the reply-context sentinel. The exact action
+# name is pending Core's report (以 Core 汇报为准); reconcile this constant
+# at integration time if Core chose a different name.
+QUOTE_CLARIFICATION_ACTION = "quote_clarification_without_agent"
 
 
 def has_stable_message_id(message: object) -> bool:
@@ -420,6 +455,10 @@ async def run_natural_intake_gate(
       by its outbound message id together with the full prompt triple
       (``register_delivered_prompt``) so a later quote can only authenticate
       the exact phase it replied to.
+    * R3 #3: Core's quote-clarification action (an unauthenticated quote on
+      a control intent) is answered directly here and never reaches the
+      agent — no reliance on the reply-context sentinel (see
+      ``QUOTE_CLARIFICATION_ACTION``).
 
     ``handled=True`` means a reply was already sent (or the resolver failed
     after the user was told) and the adapter must return. Otherwise the
@@ -470,13 +509,19 @@ async def run_natural_intake_gate(
     quote = build_intake_quote(adapter._intake_prompt_msgs, chat_id, message)
     try:
         intake = await resolve_natural_intake(adapter, source, text or "", message_id, quote=quote)
-        if intake.action not in {"pass_through", "reply_without_agent", "bound_source", "error_without_agent"}:
+        if intake.action not in {
+            "pass_through",
+            "reply_without_agent",
+            "bound_source",
+            "error_without_agent",
+            QUOTE_CLARIFICATION_ACTION,
+        }:
             raise ValueError(f"Unknown natural task intake action: {intake.action!r}")
     except Exception:
         logger.exception("[%s] Natural task intake failed", getattr(adapter, "name", "dingtalk"))
         await adapter.send(chat_id, "任务接入暂时不可用，请稍后重试。", reply_to=message_id)
         return NaturalIntakeGateResult(handled=True)
-    if intake.action in {"reply_without_agent", "error_without_agent"}:
+    if intake.action in {"reply_without_agent", "error_without_agent", QUOTE_CLARIFICATION_ACTION}:
         send_result = await adapter.send(chat_id, intake.reply_text, reply_to=message_id)
         register_delivered_prompt(adapter._intake_prompt_msgs, chat_id, intake, send_result)
         return NaturalIntakeGateResult(handled=True)
