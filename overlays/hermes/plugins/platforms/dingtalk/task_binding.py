@@ -128,6 +128,38 @@ def resolve_gateway_profile() -> str | None:
         return None
 
 
+def validate_natural_intake_classifier_config(extra, adapter_name):
+    """Startup fail-closed probe for the intent classifier config (R2 C3).
+
+    Runs only when ``natural_task_intake`` is on, mirroring Core's call-time
+    check ``validate_intent_classifier_config(read_intent_classification_config())``
+    so a missing/malformed ``auxiliary.intent_classification`` surfaces at
+    connect time as a CRITICAL, ops-visible log. The feature is NOT silently
+    disabled and startup never aborts — Core still fails honestly per
+    message; this probe only makes the misconfiguration visible early. An
+    old Core without the helpers is skipped gracefully.
+    """
+    if (extra or {}).get("natural_task_intake") is not True:
+        return
+    try:
+        from gateway.intent_classifier import (
+            read_intent_classification_config,
+            validate_intent_classifier_config,
+        )
+    except Exception:  # noqa: BLE001 - old Core without R2 C3 helpers: skip
+        return
+    try:
+        validate_intent_classifier_config(read_intent_classification_config())
+    except Exception:  # noqa: BLE001 - probe must never break startup
+        logger.critical(
+            "[%s] natural_task_intake is on but auxiliary.intent_classification "
+            "is missing or malformed; natural intake will fail honestly per "
+            "message until it is fixed",
+            adapter_name,
+            exc_info=True,
+        )
+
+
 async def resolve_natural_intake(
     adapter: object,
     source: object,

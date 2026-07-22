@@ -119,6 +119,7 @@ try:
         build_reply_kwargs,
     )
     from .task_binding import resolve_gateway_profile, resolve_task_binding, run_natural_intake_gate
+    from .task_binding import validate_natural_intake_classifier_config
 except ImportError:
     import sys
     from pathlib import Path
@@ -138,6 +139,7 @@ except ImportError:
         build_reply_kwargs,
     )
     from task_binding import resolve_gateway_profile, resolve_task_binding, run_natural_intake_gate  # type: ignore
+    from task_binding import validate_natural_intake_classifier_config  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +279,8 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to DingTalk via Stream Mode."""
+        # R2 C3: malformed classifier config => CRITICAL startup log (never aborts).
+        validate_natural_intake_classifier_config(self.config.extra or {}, self.name)
         if not DINGTALK_STREAM_AVAILABLE:
             logger.warning(
                 "[%s] dingtalk-stream not installed. Run: pip install 'dingtalk-stream>=0.20'",
@@ -284,14 +288,10 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
             return False
         if not HTTPX_AVAILABLE:
-            logger.warning(
-                "[%s] httpx not installed. Run: pip install httpx", self.name
-            )
+            logger.warning("[%s] httpx not installed. Run: pip install httpx", self.name)
             return False
         if not self._client_id or not self._client_secret:
-            logger.warning(
-                "[%s] DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET required", self.name
-            )
+            logger.warning("[%s] DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET required", self.name)
             return False
 
         try:

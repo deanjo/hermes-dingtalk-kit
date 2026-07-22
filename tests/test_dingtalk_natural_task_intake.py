@@ -1425,6 +1425,122 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual(1, len(adapter.events))
         self.assertEqual("联系人为什么没显示", adapter.events[0].text)
 
+    # -- R2 C3: startup classifier-config validation --------------------------
+
+    @staticmethod
+    def _install_fake_intent_classifier(*, validate=None, read=None):
+        """Install a fake ``gateway.intent_classifier``; return a restore hook."""
+        gateway = types.ModuleType("gateway")
+        gateway.__path__ = []
+        intent_classifier = types.ModuleType("gateway.intent_classifier")
+        if validate is not None:
+            intent_classifier.validate_intent_classifier_config = validate
+        if read is not None:
+            intent_classifier.read_intent_classification_config = read
+        keys = ("gateway", "gateway.intent_classifier")
+        saved = {key: sys.modules.get(key) for key in keys}
+        sys.modules["gateway"] = gateway
+        sys.modules["gateway.intent_classifier"] = intent_classifier
+
+        def restore():
+            for key, value in saved.items():
+                if value is None:
+                    sys.modules.pop(key, None)
+                else:
+                    sys.modules[key] = value
+
+        return restore
+
+    def test_classifier_config_startup_check_logs_critical_on_malformed(self):
+        """R2 C3: feature on + malformed config => CRITICAL log, never raises.
+
+        The feature is not silently disabled and the probe never aborts the
+        connect — the log is the ops-visible signal; Core keeps failing
+        honestly per message.
+        """
+        module = load_task_binding_module()
+
+        class IntentConfigError(Exception):
+            pass
+
+        def validate(raw):
+            raise IntentConfigError("auxiliary.intent_classification 配置缺失或不是对象")
+
+        restore = self._install_fake_intent_classifier(validate=validate, read=lambda: None)
+        try:
+            with self.assertLogs(module.logger, level="CRITICAL") as captured:
+                module.validate_natural_intake_classifier_config(
+                    {"natural_task_intake": True}, "dingtalk"
+                )
+        finally:
+            restore()
+
+        self.assertTrue(
+            any("intent_classification" in line for line in captured.output),
+            f"expected the config key in the CRITICAL log, got: {captured.output}",
+        )
+
+    def test_classifier_config_startup_check_skips_old_core_and_feature_off(self):
+        """R2 C3 compat: an old Core without the helper is skipped gracefully;
+        feature off never validates; a valid config stays silent."""
+        module = load_task_binding_module()
+
+        # (a) old Core: the module exists but has no validate function.
+        restore = self._install_fake_intent_classifier()
+        try:
+            with self.assertNoLogs(module.logger, level="CRITICAL"):
+                module.validate_natural_intake_classifier_config(
+                    {"natural_task_intake": True}, "dingtalk"
+                )
+        finally:
+            restore()
+
+        calls = []
+
+        # (b) feature off: the validator must not even be consulted.
+        restore = self._install_fake_intent_classifier(
+            validate=lambda raw: calls.append(raw), read=lambda: None
+        )
+        try:
+            module.validate_natural_intake_classifier_config({}, "dingtalk")
+            module.validate_natural_intake_classifier_config(
+                {"natural_task_intake": False}, "dingtalk"
+            )
+        finally:
+            restore()
+        self.assertEqual([], calls)
+
+        # (c) valid config: validated with the raw value, no CRITICAL.
+        restore = self._install_fake_intent_classifier(
+            validate=lambda raw: calls.append(raw) or raw,
+            read=lambda: {"provider": "openai", "model": "gpt-x"},
+        )
+        try:
+            with self.assertNoLogs(module.logger, level="CRITICAL"):
+                module.validate_natural_intake_classifier_config(
+                    {"natural_task_intake": True}, "dingtalk"
+                )
+        finally:
+            restore()
+        self.assertEqual([{"provider": "openai", "model": "gpt-x"}], calls)
+
+    def test_connect_runs_classifier_config_startup_check(self):
+        """Wiring (R2 C3): adapter.connect() must invoke the startup check."""
+        tree = ast.parse(ADAPTER_PATH.read_text(encoding="utf-8"), filename=str(ADAPTER_PATH))
+        connect = next(
+            item
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DingTalkAdapter"
+            for item in node.body
+            if isinstance(item, ast.AsyncFunctionDef) and item.name == "connect"
+        )
+        called = {
+            node.func.id
+            for node in ast.walk(connect)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertIn("validate_natural_intake_classifier_config", called)
+
     # -- R9 #6 (D7): media keeps the current binding --------------------------
 
     def test_media_with_current_binding_restores_source(self):
