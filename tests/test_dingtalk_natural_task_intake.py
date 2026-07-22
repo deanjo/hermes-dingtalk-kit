@@ -744,7 +744,9 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
     # -- R9 #3 (D6): quote-aware confirmation --------------------------------
 
     @staticmethod
-    def _prompt_result(operation_id="op-1"):
+    def _prompt_result(
+        operation_id="op-1", phase="choose_task", target_digest="digest-1"
+    ):
         """A Core reply that installs a pending and sends a confirmation prompt."""
         return SimpleNamespace(
             action="reply_without_agent",
@@ -752,6 +754,8 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
             text="",
             reply_text="我找到 2 个任务，请选择 1 或 2。",
             prompt_operation_id=operation_id,
+            prompt_phase=phase,
+            prompt_target_digest=target_digest,
         )
 
     def test_plain_message_passes_quote_none(self):
@@ -763,7 +767,7 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertIsNone(calls[0]["kwargs"]["quote"])
 
     def test_prompt_send_registers_msg_id(self):
-        """A delivered confirmation prompt is registered chat_id -> msg_id -> op."""
+        """A delivered confirmation prompt is registered chat_id -> msg_id -> triple."""
         adapter, calls = self.run_message("联系人为什么没显示", result=self._prompt_result())
 
         self.assertEqual(1, len(calls))
@@ -772,8 +776,10 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         entries = adapter._intake_prompt_msgs.get("conversation-1")
         self.assertIsNotNone(entries)
         self.assertIn(sent_message_id, entries)
-        operation_id, expires_at = entries[sent_message_id]
+        operation_id, phase, target_digest, expires_at = entries[sent_message_id]
         self.assertEqual("op-1", operation_id)
+        self.assertEqual("choose_task", phase)
+        self.assertEqual("digest-1", target_digest)
         self.assertGreater(expires_at, time.monotonic())
 
     def test_prompt_registration_requires_successful_send_and_operation(self):
@@ -796,18 +802,44 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
             text="",
             reply_text="任务账本暂时无法安全检索。",
             prompt_operation_id="op-err",
+            prompt_phase="choose_task",
+            prompt_target_digest="digest-err",
         )
         adapter, _ = self.run_message("联系人为什么没显示", result=error)
+        self.assertEqual({}, adapter._intake_prompt_msgs)
+
+    def test_prompt_registration_requires_complete_triple(self):
+        """R2 C1: an operation id without phase/digest must not be registered —
+        a quote of that prompt simply stays unauthenticated (fail closed)."""
+        incomplete = SimpleNamespace(
+            action="reply_without_agent",
+            source=None,
+            text="",
+            reply_text="请选择 1 或 2。",
+            prompt_operation_id="op-1",
+        )
+        adapter, _ = self.run_message("联系人为什么没显示", result=incomplete)
+        self.assertEqual({}, adapter._intake_prompt_msgs)
+
+        partial = SimpleNamespace(
+            action="reply_without_agent",
+            source=None,
+            text="",
+            reply_text="请选择 1 或 2。",
+            prompt_operation_id="op-1",
+            prompt_phase="choose_task",
+        )
+        adapter, _ = self.run_message("联系人为什么没显示", result=partial)
         self.assertEqual({}, adapter._intake_prompt_msgs)
 
     def test_quote_of_registered_prompt_passes_matched_op_and_confirm_consumed(self):
         """G3: quoting the bot's confirmation prompt with '确认' confirms normally.
 
-        The resolver must receive quote.matched_operation_id == the pending
-        operation; when Core consumes the control word (bound_source +
-        control_consumed) the first bound turn reaches the gateway and the T1
-        reply clarification stays silent — no regression of the plain-text
-        confirm flow.
+        The resolver must receive an authenticated quote whose matched triple
+        is the pending operation's; when Core consumes the control word
+        (bound_source + control_consumed) the first bound turn reaches the
+        gateway and the T1 reply clarification stays silent — no regression
+        of the plain-text confirm flow.
         """
         seen = []
         bound = {
@@ -854,7 +886,12 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual(
             {
                 "replied_message_id": "outbound-1",
-                "matched_operation_id": "op-1",
+                "authenticated": True,
+                "matched": {
+                    "operation_id": "op-1",
+                    "phase": "choose_task",
+                    "target_digest": "digest-1",
+                },
                 "quoted_text": None,
             },
             seen[1]["quote"],
@@ -904,7 +941,12 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual(
             {
                 "replied_message_id": "outbound-1",
-                "matched_operation_id": "op-1",
+                "authenticated": True,
+                "matched": {
+                    "operation_id": "op-1",
+                    "phase": "choose_task",
+                    "target_digest": "digest-1",
+                },
                 "quoted_text": "我找到 2 个任务，请选择 1 或 2。",
             },
             seen[1],
@@ -913,16 +955,17 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
     def test_quote_of_foreign_message_passes_none_and_clarifies(self):
         """G3: quoting someone else's message with '确认' is consumed 0 times.
 
-        The registry has no entry for the quoted id, so the resolver sees
-        matched_operation_id=None; Core answers pass_through (pending left
-        untouched) and the adapter falls back to the T1 reply clarification.
+        The registry has no entry for the quoted id, so the resolver sees an
+        unauthenticated quote (matched=None); Core answers pass_through
+        (pending left untouched) and the adapter falls back to the T1 reply
+        clarification.
         """
         seen = []
 
         def recording_resolver(session_store, source, message_text, request_id, **kwargs):
             seen.append(kwargs.get("quote"))
-            # What the new Core returns for a control word whose quote does not
-            # match the pending operation: refuse to consume.
+            # What the new Core returns for a control word whose quote is not
+            # authenticated for the pending operation: refuse to consume.
             return SimpleNamespace(
                 action="pass_through",
                 source=source,
@@ -946,7 +989,8 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
 
         self.assertEqual(1, len(seen))
         self.assertEqual("foreign-message-1", seen[0]["replied_message_id"])
-        self.assertIsNone(seen[0]["matched_operation_id"])
+        self.assertFalse(seen[0]["authenticated"])
+        self.assertIsNone(seen[0]["matched"])
         # Consumed 0 times: nothing reaches the gateway, the T1 clarification fires.
         self.assertEqual([], adapter.events)
         self.assertEqual(1, len(adapter.sent))
@@ -989,7 +1033,8 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         adapter, calls = self.run_message("确认", resolver_override=staged_resolver, drive=drive)
 
         self.assertEqual(2, len(seen))
-        self.assertIsNone(seen[1]["matched_operation_id"])
+        self.assertFalse(seen[1]["authenticated"])
+        self.assertIsNone(seen[1]["matched"])
         # Chat B got the T1 clarification; chat A's registry entry is intact.
         self.assertEqual([], adapter.events)
         self.assertEqual(2, len(adapter.sent))  # chat A's prompt + chat B's clarification
@@ -1012,7 +1057,7 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
 
         def drive(adapter):
             adapter._intake_prompt_msgs["conversation-1"] = {
-                "stale-prompt": ("op-old", time.monotonic() - 1.0)
+                "stale-prompt": ("op-old", "choose_task", "digest-old", time.monotonic() - 1.0)
             }
             message = make_message("确认")
             message.text.extensions = {
@@ -1028,8 +1073,10 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         adapter, calls = self.run_message("确认", resolver_override=recording_resolver, drive=drive)
 
         self.assertEqual(1, len(seen))
-        self.assertIsNone(seen[0]["matched_operation_id"])
-        self.assertNotIn("stale-prompt", adapter._intake_prompt_msgs.get("conversation-1", {}))
+        self.assertFalse(seen[0]["authenticated"])
+        self.assertIsNone(seen[0]["matched"])
+        # Purged on lookup — the emptied chat key is removed too (M11).
+        self.assertNotIn("conversation-1", adapter._intake_prompt_msgs)
         self.assertEqual([], adapter.events)
         self.assertEqual(1, len(adapter.sent))
         self.assertEqual("reply clarification", adapter.sent[0]["content"])
@@ -1047,23 +1094,336 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
 
         registry = {}
         for index in range(max_per_chat + 3):
-            register(registry, "chat-1", f"msg-{index}", f"op-{index}", now=1000.0 + index)
+            register(
+                registry, "chat-1", f"msg-{index}", f"op-{index}",
+                "choose_task", f"digest-{index}", now=1000.0 + index,
+            )
         entries = registry["chat-1"]
         self.assertEqual(max_per_chat, len(entries))
         self.assertNotIn("msg-2", entries)  # oldest evicted first (FIFO)
         self.assertIn(f"msg-{max_per_chat + 2}", entries)
         self.assertEqual(
-            f"op-{max_per_chat + 2}",
+            {
+                "operation_id": f"op-{max_per_chat + 2}",
+                "phase": "choose_task",
+                "target_digest": f"digest-{max_per_chat + 2}",
+            },
             match(registry, "chat-1", f"msg-{max_per_chat + 2}", now=2000.0),
         )
         # Chat isolation: an id from chat-1 is unknown in chat-2.
         self.assertIsNone(match(registry, "chat-2", f"msg-{max_per_chat + 2}", now=2000.0))
 
         # TTL: a hit before expiry matches; at expiry it misses and is purged.
-        register(registry, "chat-2", "msg-x", "op-x", now=1000.0)
-        self.assertEqual("op-x", match(registry, "chat-2", "msg-x", now=1000.0 + ttl - 1))
+        register(registry, "chat-2", "msg-x", "op-x", "confirm_create", "digest-x", now=1000.0)
+        self.assertEqual(
+            {
+                "operation_id": "op-x",
+                "phase": "confirm_create",
+                "target_digest": "digest-x",
+            },
+            match(registry, "chat-2", "msg-x", now=1000.0 + ttl - 1),
+        )
         self.assertIsNone(match(registry, "chat-2", "msg-x", now=1000.0 + ttl))
-        self.assertNotIn("msg-x", registry["chat-2"])
+        # The purged chat left no empty outer key behind (M11).
+        self.assertNotIn("chat-2", registry)
+
+    def test_prompt_registry_eviction_logs_warning(self):
+        """M11: FIFO eviction of the oldest entry is observable."""
+        module = load_task_binding_module()
+        register = module.register_intake_prompt
+        max_per_chat = module._INTAKE_PROMPT_REGISTRY_MAX_PER_CHAT
+
+        registry = {}
+        for index in range(max_per_chat):
+            register(
+                registry, "chat-1", f"msg-{index}", f"op-{index}",
+                "choose_task", f"digest-{index}", now=1000.0 + index,
+            )
+        with self.assertLogs(module.logger, level="WARNING") as captured:
+            register(
+                registry, "chat-1", "msg-new", "op-new",
+                "choose_task", "digest-new", now=2000.0,
+            )
+        self.assertTrue(
+            any("evicted" in line for line in captured.output),
+            f"expected an eviction warning, got: {captured.output}",
+        )
+        self.assertNotIn("msg-0", registry["chat-1"])
+        self.assertIn("msg-new", registry["chat-1"])
+
+    def test_prompt_registry_expiry_purge_drops_empty_chat_key(self):
+        """M11: expiring the last entry of a chat removes the outer chat key."""
+        module = load_task_binding_module()
+        register = module.register_intake_prompt
+        ttl = module._INTAKE_PROMPT_REGISTRY_TTL_SECONDS
+
+        registry = {}
+        register(registry, "chat-1", "msg-a", "op-a", "choose_task", "digest-a", now=1000.0)
+        register(registry, "chat-1", "msg-b", "op-b", "choose_task", "digest-b", now=1000.0)
+        # Registering a fresh entry past the TTL purges both stale ones and
+        # leaves only the new entry under the surviving chat key.
+        register(registry, "chat-1", "msg-c", "op-c", "choose_task", "digest-c", now=1000.0 + ttl + 1)
+        self.assertEqual(["msg-c"], list(registry["chat-1"]))
+        # A later register after that entry too expired must not leave an
+        # empty ``{}`` behind: the chat key is dropped and recreated.
+        registry2 = {}
+        register(registry2, "chat-9", "msg-z", "op-z", "choose_task", "digest-z", now=1000.0)
+        self.assertIsNone(
+            module.match_intake_prompt(registry2, "chat-9", "msg-z", now=1000.0 + ttl)
+        )
+        self.assertNotIn("chat-9", registry2)
+
+    # -- R2 C1/C2: quote authentication hardening -----------------------------
+
+    def test_quote_of_old_phase_prompt_delivers_its_registered_triple(self):
+        """R2 C1: quoting an OLD phase's prompt must not confirm the new phase.
+
+        The same operation reuses its id across phase transitions; the Kit's
+        job is to deliver the quoted prompt's OWN registered triple, so Core
+        can see it differs from the current pending triple and refuse to
+        consume (pass_through → T1 clarification).
+        """
+        seen = []
+
+        def staged_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(kwargs.get("quote"))
+            if len(seen) <= 2:
+                # Two prompts for the same operation id at two phases.
+                return (
+                    self._prompt_result(phase="choose_task", target_digest="digest-old")
+                    if len(seen) == 1
+                    else self._prompt_result(phase="confirm_create", target_digest="digest-new")
+                )
+            # Contract-Core: matched triple != current pending triple => do
+            # not consume the control word.
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            async def flow():
+                await self.on_message(adapter, make_message("联系人为什么没显示"))
+                phase_two = make_message("2")
+                phase_two.message_id = "incoming-2"
+                await self.on_message(adapter, phase_two)
+                confirm = make_message("确认")
+                confirm.message_id = "incoming-3"
+                # The user quotes the FIRST (old-phase) prompt, not the second.
+                confirm.text.extensions = {
+                    "repliedMsg": {"msgId": "outbound-1", "msgType": "markdown"}
+                }
+                confirm._test_reply_kwargs = {
+                    "reply_to_message_id": "outbound-1",
+                    "reply_to_text": "reply unavailable",
+                    "reply_to_is_own_message": False,
+                }
+                await self.on_message(adapter, confirm)
+
+            return flow()
+
+        adapter, calls = self.run_message("确认", resolver_override=staged_resolver, drive=drive)
+
+        self.assertEqual(3, len(seen))
+        self.assertEqual(
+            {
+                "replied_message_id": "outbound-1",
+                "authenticated": True,
+                "matched": {
+                    "operation_id": "op-1",
+                    "phase": "choose_task",
+                    "target_digest": "digest-old",
+                },
+                "quoted_text": None,
+            },
+            seen[2],
+        )
+        # Core refused to consume: nothing reached the gateway, the T1
+        # clarification fired after the two prompts.
+        self.assertEqual([], adapter.events)
+        self.assertEqual(3, len(adapter.sent))
+        self.assertEqual("reply clarification", adapter.sent[2]["content"])
+        # Both prompts stay registered under their own triples.
+        entries = adapter._intake_prompt_msgs["conversation-1"]
+        self.assertEqual("digest-old", entries["outbound-1"][2])
+        self.assertEqual("digest-new", entries["outbound-2"][2])
+
+    def test_quote_missing_msgid_is_unauthenticated_and_clarifies(self):
+        """R2 C2: a repliedMsg WITHOUT msgId used to degrade to 'not a quote'.
+
+        It must now stay an explicit unauthenticated quote (fail closed):
+        ``replied_message_id=None``, ``authenticated=False``, ``matched=None``
+        — while ``quoted_text`` still rides along for display only. A control
+        word is then never consumed (Core pass_through → T1 clarification).
+        """
+        seen = []
+
+        def recording_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(kwargs.get("quote"))
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            message = make_message("确认")
+            message.text.extensions = {
+                "repliedMsg": {
+                    "msgType": "text",
+                    "content": {"text": "我找到 2 个任务，请选择 1 或 2。"},
+                }
+            }
+            message._test_reply_kwargs = {
+                "reply_to_text": "reply unavailable",
+                "reply_to_is_own_message": False,
+            }
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("确认", resolver_override=recording_resolver, drive=drive)
+
+        self.assertEqual(1, len(seen))
+        self.assertEqual(
+            {
+                "replied_message_id": None,
+                "authenticated": False,
+                "matched": None,
+                "quoted_text": "我找到 2 个任务，请选择 1 或 2。",
+            },
+            seen[0],
+        )
+        self.assertEqual([], adapter.events)
+        self.assertEqual(1, len(adapter.sent))
+        self.assertEqual("reply clarification", adapter.sent[0]["content"])
+
+    def test_quote_of_webhook_prompt_is_unauthenticated_despite_quoted_text(self):
+        """R2 C2: a webhook-delivered prompt can never authenticate a quote.
+
+        The webhook send path returns a locally synthesized uuid as
+        ``SendResult.message_id``; DingTalk assigns its own msgId to the
+        delivered message, so a later quote of that prompt references an id
+        the registry never saw. Even with the prompt text echoed back as
+        ``quoted_text``, the quote stays unauthenticated — the text is
+        display-only, never an authorization signal.
+        """
+        seen = []
+
+        def staged_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(kwargs.get("quote"))
+            if len(seen) == 1:
+                return self._prompt_result()
+            # Contract-Core: unauthenticated quote => do not consume.
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            async def flow():
+                await self.on_message(adapter, make_message("联系人为什么没显示"))
+                # Simulate the production webhook layout: the registry holds
+                # the synthetic local id, while the quote carries the real
+                # platform msgId of the same visible prompt.
+                synthetic = adapter._intake_prompt_msgs["conversation-1"].pop("outbound-1")
+                adapter._intake_prompt_msgs["conversation-1"]["a1b2c3d4e5f6"] = synthetic
+                confirm = make_message("确认")
+                confirm.message_id = "incoming-2"
+                confirm.text.extensions = {
+                    "repliedMsg": {
+                        "msgId": "dingtalk-platform-msg-9",
+                        "msgType": "markdown",
+                        "content": {"text": "我找到 2 个任务，请选择 1 或 2。"},
+                    }
+                }
+                confirm._test_reply_kwargs = {
+                    "reply_to_message_id": "dingtalk-platform-msg-9",
+                    "reply_to_text": "reply unavailable",
+                    "reply_to_is_own_message": False,
+                }
+                await self.on_message(adapter, confirm)
+
+            return flow()
+
+        adapter, calls = self.run_message("确认", resolver_override=staged_resolver, drive=drive)
+
+        self.assertEqual(2, len(seen))
+        self.assertEqual(
+            {
+                "replied_message_id": "dingtalk-platform-msg-9",
+                "authenticated": False,
+                "matched": None,
+                "quoted_text": "我找到 2 个任务，请选择 1 或 2。",
+            },
+            seen[1],
+        )
+        self.assertEqual([], adapter.events)
+        self.assertEqual(2, len(adapter.sent))
+        self.assertEqual("reply clarification", adapter.sent[1]["content"])
+
+    def test_missing_inbound_message_id_skips_intake_but_reaches_gateway(self):
+        """R2: no platform-stable inbound msgId => intake never runs.
+
+        ``_on_message`` still synthesizes a UUID for dedup, but a random UUID
+        must never serve as the intake request/operation number — the gate
+        fails closed (0 resolver calls, no pending created or consumed) while
+        the normal message flow is unaffected.
+        """
+        seen = []
+
+        def recording_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append({"text": message_text, "request_id": request_id})
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            message = make_message("联系人为什么没显示")
+            message.message_id = None  # platform delivered no stable id
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message(
+            "联系人为什么没显示", resolver_override=recording_resolver, drive=drive
+        )
+
+        self.assertEqual([], seen)
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertEqual("联系人为什么没显示", adapter.events[0].text)
+
+    def test_blank_inbound_message_id_skips_intake_but_reaches_gateway(self):
+        """R2: a whitespace-only inbound msgId is not stable either (fail closed)."""
+        seen = []
+
+        def recording_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(message_text)
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            message = make_message("联系人为什么没显示")
+            message.message_id = "   "
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message(
+            "联系人为什么没显示", resolver_override=recording_resolver, drive=drive
+        )
+
+        self.assertEqual([], seen)
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertEqual("联系人为什么没显示", adapter.events[0].text)
 
     # -- R9 #6 (D7): media keeps the current binding --------------------------
 

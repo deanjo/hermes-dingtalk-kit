@@ -270,7 +270,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # doesn't drop them mid-flight, and we can cancel them on disconnect.
         self._bg_tasks: Set[asyncio.Task] = set()
         self._gateway_profile: Optional[str] = resolve_gateway_profile()  # owning multiplex profile
-        # R9 #3 (D6): chat_id -> {msg_id: (operation_id, expires_at)}; see task_binding.
+        # R9 #3 (D6) + R2 C1/C2: chat_id -> {msg_id: (op, phase, digest, expires_at)}; see task_binding.
         self._intake_prompt_msgs: Dict[str, Dict[str, tuple]] = {}
 
     # -- Connection lifecycle -----------------------------------------------
