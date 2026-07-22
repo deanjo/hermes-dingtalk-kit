@@ -19,6 +19,7 @@ from typing import Optional
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER_PATH = ROOT / "overlays/hermes/plugins/platforms/dingtalk/adapter.py"
 BINDING_PATH = ROOT / "overlays/hermes/plugins/platforms/dingtalk/task_binding.py"
+REPLY_CONTEXT_PATH = ROOT / "overlays/hermes/plugins/platforms/dingtalk/reply_context.py"
 SESSION_PATH = ROOT / "overlays/hermes/gateway/session.py"
 
 
@@ -66,21 +67,41 @@ def load_session_key_namespace():
     raise RuntimeError("_session_key_namespace not found in overlay session.py")
 
 
-def load_natural_intake():
-    """Load the real ``resolve_natural_intake`` helper from task_binding.py.
+def load_reply_context_module():
+    """Load the real reply_context.py quote-metadata extractors.
 
-    The offload (``asyncio.to_thread``) and profile stamping under test live
-    in that helper, so the seam tests must drive the real implementation —
-    with ``gateway.task_intake`` still patched to a controllable fake.
+    Also registered under its plain module name: task_binding.py loads
+    standalone in these tests, so its lazy ``from reply_context import ...``
+    fallback inside ``build_intake_quote`` resolves here.
     """
     import importlib.util
 
+    name = "dingtalk_reply_context_for_intake_uut"
+    spec = importlib.util.spec_from_file_location(name, REPLY_CONTEXT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    sys.modules.setdefault("reply_context", module)
+    return module
+
+
+def load_task_binding_module():
+    """Load the real task_binding.py helpers under test.
+
+    The offload (``asyncio.to_thread``), profile stamping, prompt registry,
+    and intake gate under test live in that module, so the seam tests must
+    drive the real implementations — with ``gateway.task_intake`` still
+    patched to a controllable fake.
+    """
+    import importlib.util
+
+    load_reply_context_module()
     name = "dingtalk_task_binding_for_intake_uut"
     spec = importlib.util.spec_from_file_location(name, BINDING_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-    return module.resolve_natural_intake
+    return module
 
 
 def load_on_message(*, with_media=False):
@@ -129,6 +150,7 @@ def load_on_message(*, with_media=False):
         def extract_media(message, message_type):
             return message_type.TEXT, [], []
 
+    task_binding_module = load_task_binding_module()
     namespace = {
         "MessageEvent": FakeMessageEvent,
         "MessageType": MessageType,
@@ -147,8 +169,8 @@ def load_on_message(*, with_media=False):
         "is_user_allowed": lambda *args, **kwargs: True,
         "logger": FakeLogger(),
         "mention_meta_line": lambda *args, **kwargs: "",
-        "resolve_natural_intake": load_natural_intake(),
         "resolve_task_binding": resolve_task_binding,
+        "run_natural_intake_gate": task_binding_module.run_natural_intake_gate,
         "should_process_message": lambda *args, **kwargs: True,
         "timezone": timezone,
         "uuid": SimpleNamespace(uuid4=lambda: SimpleNamespace(hex="generated-message-id")),
@@ -169,6 +191,7 @@ class FakeAdapter:
         self._session_webhooks = {}
         self._session_store = object()
         self._gateway_profile = gateway_profile
+        self._intake_prompt_msgs = {}
         self.events = []
         self.sent = []
         self.send_success = send_success
@@ -228,15 +251,17 @@ class FakeAdapter:
         self.events.append(event)
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
+        message_id = f"outbound-{len(self.sent) + 1}"
         self.sent.append(
             {
                 "chat_id": chat_id,
                 "content": content,
                 "reply_to": reply_to,
                 "metadata": metadata,
+                "message_id": message_id,
             }
         )
-        return SimpleNamespace(success=self.send_success)
+        return SimpleNamespace(success=self.send_success, message_id=message_id)
 
 
 def make_message(text):
@@ -271,10 +296,13 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         send_success=True,
         gateway_profile=None,
         resolver_override=None,
+        materialize_result=None,
+        materialize_raises=False,
         drive=None,
         on_message=None,
     ):
         calls = []
+        materialize_calls = []
 
         def resolver(session_store, source, message_text, request_id, **kwargs):
             calls.append(
@@ -295,10 +323,21 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
                 reply_text=None,
             )
 
+        def recording_materialize(session_store, source):
+            materialize_calls.append(
+                {"session_store": session_store, "source": source}
+            )
+            if materialize_raises:
+                raise RuntimeError("task-selection state unavailable")
+            # The real Core helper returns the source unchanged when there is
+            # no current binding (task_intake.py:1339).
+            return source if materialize_result is None else materialize_result
+
         gateway = types.ModuleType("gateway")
         gateway.__path__ = []
         task_intake = types.ModuleType("gateway.task_intake")
         task_intake.resolve_natural_task_intake = resolver_override or resolver
+        task_intake.materialize_current_task_source = recording_materialize
         old_gateway = sys.modules.get("gateway")
         old_task_intake = sys.modules.get("gateway.task_intake")
         sys.modules["gateway"] = gateway
@@ -309,6 +348,7 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
                 send_success=send_success,
                 gateway_profile=gateway_profile,
             )
+            adapter.materialize_calls = materialize_calls
             handler = on_message or self.on_message
             if drive is None:
                 asyncio.run(handler(adapter, make_message(text)))
@@ -700,6 +740,436 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual(1, len(adapter.events))
         self.assertEqual("联系人为什么没显示", adapter.events[0].text)
         self.assertEqual(["https://cdn.example.com/img.png"], adapter.events[0].media_urls)
+
+    # -- R9 #3 (D6): quote-aware confirmation --------------------------------
+
+    @staticmethod
+    def _prompt_result(operation_id="op-1"):
+        """A Core reply that installs a pending and sends a confirmation prompt."""
+        return SimpleNamespace(
+            action="reply_without_agent",
+            source=None,
+            text="",
+            reply_text="我找到 2 个任务，请选择 1 或 2。",
+            prompt_operation_id=operation_id,
+        )
+
+    def test_plain_message_passes_quote_none(self):
+        """No repliedMsg => quote=None: today's behavior is unchanged."""
+        adapter, calls = self.run_message("普通聊天")
+
+        self.assertEqual(1, len(calls))
+        self.assertIn("quote", calls[0]["kwargs"])
+        self.assertIsNone(calls[0]["kwargs"]["quote"])
+
+    def test_prompt_send_registers_msg_id(self):
+        """A delivered confirmation prompt is registered chat_id -> msg_id -> op."""
+        adapter, calls = self.run_message("联系人为什么没显示", result=self._prompt_result())
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual(1, len(adapter.sent))
+        sent_message_id = adapter.sent[0]["message_id"]
+        entries = adapter._intake_prompt_msgs.get("conversation-1")
+        self.assertIsNotNone(entries)
+        self.assertIn(sent_message_id, entries)
+        operation_id, expires_at = entries[sent_message_id]
+        self.assertEqual("op-1", operation_id)
+        self.assertGreater(expires_at, time.monotonic())
+
+    def test_prompt_registration_requires_successful_send_and_operation(self):
+        """Failed sends, missing operation ids, and error actions register nothing."""
+        # (a) the prompt send failed — nothing to quote later.
+        adapter, _ = self.run_message(
+            "联系人为什么没显示", result=self._prompt_result(), send_success=False
+        )
+        self.assertEqual({}, adapter._intake_prompt_msgs)
+        # (b) a legacy Core result without prompt_operation_id.
+        legacy = SimpleNamespace(
+            action="reply_without_agent", source=None, text="", reply_text="请选择 1 或 2。"
+        )
+        adapter, _ = self.run_message("联系人为什么没显示", result=legacy)
+        self.assertEqual({}, adapter._intake_prompt_msgs)
+        # (c) error_without_agent is never a confirmation prompt.
+        error = SimpleNamespace(
+            action="error_without_agent",
+            source=None,
+            text="",
+            reply_text="任务账本暂时无法安全检索。",
+            prompt_operation_id="op-err",
+        )
+        adapter, _ = self.run_message("联系人为什么没显示", result=error)
+        self.assertEqual({}, adapter._intake_prompt_msgs)
+
+    def test_quote_of_registered_prompt_passes_matched_op_and_confirm_consumed(self):
+        """G3: quoting the bot's confirmation prompt with '确认' confirms normally.
+
+        The resolver must receive quote.matched_operation_id == the pending
+        operation; when Core consumes the control word (bound_source +
+        control_consumed) the first bound turn reaches the gateway and the T1
+        reply clarification stays silent — no regression of the plain-text
+        confirm flow.
+        """
+        seen = []
+        bound = {
+            "chat_id": "conversation-1",
+            "chat_type": "group",
+            "user_id": "sender-1",
+            "message_id": "incoming-2",
+            "board_slug": "agong",
+            "task_id": "t_3852e516",
+        }
+        staged_results = iter(
+            [
+                self._prompt_result(),
+                SimpleNamespace(
+                    action="bound_source",
+                    source=bound,
+                    text="联系人为什么没显示",
+                    reply_text=None,
+                    control_consumed=True,
+                ),
+            ]
+        )
+
+        def staged_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append({"text": message_text, "quote": kwargs.get("quote")})
+            return next(staged_results)
+
+        def drive(adapter):
+            async def flow():
+                await self.on_message(adapter, make_message("联系人为什么没显示"))
+                confirm = make_message("确认")
+                confirm.message_id = "incoming-2"
+                confirm.text.extensions = {
+                    "repliedMsg": {"msgId": "outbound-1", "msgType": "markdown"}
+                }
+                await self.on_message(adapter, confirm)
+
+            return flow()
+
+        adapter, calls = self.run_message("确认", resolver_override=staged_resolver, drive=drive)
+
+        self.assertEqual(2, len(seen))
+        self.assertIsNone(seen[0]["quote"])
+        self.assertEqual(
+            {
+                "replied_message_id": "outbound-1",
+                "matched_operation_id": "op-1",
+                "quoted_text": None,
+            },
+            seen[1]["quote"],
+        )
+        # Exactly one send: the confirmation prompt. No T1 clarification.
+        self.assertEqual(1, len(adapter.sent))
+        self.assertEqual("我找到 2 个任务，请选择 1 或 2。", adapter.sent[0]["content"])
+        # The consumed confirm delivered the bound first turn to the gateway.
+        self.assertEqual(1, len(adapter.events))
+        self.assertIs(bound, adapter.events[0].source)
+        self.assertEqual("联系人为什么没显示", adapter.events[0].text)
+
+    def test_quote_of_registered_prompt_carries_quoted_text(self):
+        """The replied original (when DingTalk delivers it) rides along as quoted_text."""
+        seen = []
+
+        def staged_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(kwargs.get("quote"))
+            if len(seen) == 1:
+                return self._prompt_result()
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            async def flow():
+                await self.on_message(adapter, make_message("联系人为什么没显示"))
+                quoted = make_message("这是指的哪个任务？")
+                quoted.message_id = "incoming-2"
+                quoted.text.extensions = {
+                    "repliedMsg": {
+                        "msgId": "outbound-1",
+                        "msgType": "markdown",
+                        "content": {"text": "我找到 2 个任务，请选择 1 或 2。"},
+                    }
+                }
+                await self.on_message(adapter, quoted)
+
+            return flow()
+
+        adapter, calls = self.run_message("这是指的哪个任务？", resolver_override=staged_resolver, drive=drive)
+
+        self.assertEqual(2, len(seen))
+        self.assertEqual(
+            {
+                "replied_message_id": "outbound-1",
+                "matched_operation_id": "op-1",
+                "quoted_text": "我找到 2 个任务，请选择 1 或 2。",
+            },
+            seen[1],
+        )
+
+    def test_quote_of_foreign_message_passes_none_and_clarifies(self):
+        """G3: quoting someone else's message with '确认' is consumed 0 times.
+
+        The registry has no entry for the quoted id, so the resolver sees
+        matched_operation_id=None; Core answers pass_through (pending left
+        untouched) and the adapter falls back to the T1 reply clarification.
+        """
+        seen = []
+
+        def recording_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(kwargs.get("quote"))
+            # What the new Core returns for a control word whose quote does not
+            # match the pending operation: refuse to consume.
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            message = make_message("确认")
+            message.text.extensions = {
+                "repliedMsg": {"msgId": "foreign-message-1", "msgType": "text"}
+            }
+            message._test_reply_kwargs = {
+                "reply_to_message_id": "foreign-message-1",
+                "reply_to_text": "reply unavailable",
+                "reply_to_is_own_message": False,
+            }
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("确认", resolver_override=recording_resolver, drive=drive)
+
+        self.assertEqual(1, len(seen))
+        self.assertEqual("foreign-message-1", seen[0]["replied_message_id"])
+        self.assertIsNone(seen[0]["matched_operation_id"])
+        # Consumed 0 times: nothing reaches the gateway, the T1 clarification fires.
+        self.assertEqual([], adapter.events)
+        self.assertEqual(1, len(adapter.sent))
+        self.assertEqual("reply clarification", adapter.sent[0]["content"])
+        self.assertEqual("incoming-1", adapter.sent[0]["reply_to"])
+
+    def test_quote_of_other_chat_prompt_passes_none(self):
+        """A prompt registered in chat A must not match a quote sent in chat B."""
+        seen = []
+
+        def staged_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(kwargs.get("quote"))
+            if len(seen) == 1:
+                return self._prompt_result()
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            async def flow():
+                await self.on_message(adapter, make_message("联系人为什么没显示"))
+                other_chat = make_message("确认")
+                other_chat.message_id = "incoming-2"
+                other_chat.conversation_id = "conversation-2"
+                other_chat.text.extensions = {
+                    "repliedMsg": {"msgId": "outbound-1", "msgType": "markdown"}
+                }
+                other_chat._test_reply_kwargs = {
+                    "reply_to_message_id": "outbound-1",
+                    "reply_to_text": "reply unavailable",
+                    "reply_to_is_own_message": False,
+                }
+                await self.on_message(adapter, other_chat)
+
+            return flow()
+
+        adapter, calls = self.run_message("确认", resolver_override=staged_resolver, drive=drive)
+
+        self.assertEqual(2, len(seen))
+        self.assertIsNone(seen[1]["matched_operation_id"])
+        # Chat B got the T1 clarification; chat A's registry entry is intact.
+        self.assertEqual([], adapter.events)
+        self.assertEqual(2, len(adapter.sent))  # chat A's prompt + chat B's clarification
+        self.assertEqual("conversation-2", adapter.sent[1]["chat_id"])
+        self.assertEqual("reply clarification", adapter.sent[1]["content"])
+        self.assertIn("outbound-1", adapter._intake_prompt_msgs["conversation-1"])
+
+    def test_quote_of_expired_prompt_passes_none_and_clarifies(self):
+        """An expired registry entry is a miss (and purged), never a match."""
+        seen = []
+
+        def recording_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(kwargs.get("quote"))
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            adapter._intake_prompt_msgs["conversation-1"] = {
+                "stale-prompt": ("op-old", time.monotonic() - 1.0)
+            }
+            message = make_message("确认")
+            message.text.extensions = {
+                "repliedMsg": {"msgId": "stale-prompt", "msgType": "markdown"}
+            }
+            message._test_reply_kwargs = {
+                "reply_to_message_id": "stale-prompt",
+                "reply_to_text": "reply unavailable",
+                "reply_to_is_own_message": False,
+            }
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("确认", resolver_override=recording_resolver, drive=drive)
+
+        self.assertEqual(1, len(seen))
+        self.assertIsNone(seen[0]["matched_operation_id"])
+        self.assertNotIn("stale-prompt", adapter._intake_prompt_msgs.get("conversation-1", {}))
+        self.assertEqual([], adapter.events)
+        self.assertEqual(1, len(adapter.sent))
+        self.assertEqual("reply clarification", adapter.sent[0]["content"])
+
+    def test_prompt_registry_bounded_and_expires(self):
+        """Unit: per-chat FIFO cap + TTL, with an injected monotonic clock."""
+        module = load_task_binding_module()
+        register = module.register_intake_prompt
+        match = module.match_intake_prompt
+        ttl = module._INTAKE_PROMPT_REGISTRY_TTL_SECONDS
+        max_per_chat = module._INTAKE_PROMPT_REGISTRY_MAX_PER_CHAT
+
+        # The registry must outlive the Core pending TTL (900s) it points at.
+        self.assertGreater(ttl, 900.0)
+
+        registry = {}
+        for index in range(max_per_chat + 3):
+            register(registry, "chat-1", f"msg-{index}", f"op-{index}", now=1000.0 + index)
+        entries = registry["chat-1"]
+        self.assertEqual(max_per_chat, len(entries))
+        self.assertNotIn("msg-2", entries)  # oldest evicted first (FIFO)
+        self.assertIn(f"msg-{max_per_chat + 2}", entries)
+        self.assertEqual(
+            f"op-{max_per_chat + 2}",
+            match(registry, "chat-1", f"msg-{max_per_chat + 2}", now=2000.0),
+        )
+        # Chat isolation: an id from chat-1 is unknown in chat-2.
+        self.assertIsNone(match(registry, "chat-2", f"msg-{max_per_chat + 2}", now=2000.0))
+
+        # TTL: a hit before expiry matches; at expiry it misses and is purged.
+        register(registry, "chat-2", "msg-x", "op-x", now=1000.0)
+        self.assertEqual("op-x", match(registry, "chat-2", "msg-x", now=1000.0 + ttl - 1))
+        self.assertIsNone(match(registry, "chat-2", "msg-x", now=1000.0 + ttl))
+        self.assertNotIn("msg-x", registry["chat-2"])
+
+    # -- R9 #6 (D7): media keeps the current binding --------------------------
+
+    def test_media_with_current_binding_restores_source(self):
+        """G4: a bound user's media recovers its task context before the gateway."""
+        bound_source = FakeSource(
+            chat_id="conversation-1",
+            chat_type="group",
+            user_id="sender-1",
+            board_slug="agong",
+            task_id="t_deadbeef",
+        )
+        adapter, calls = self.run_message(
+            "看这个截图",
+            materialize_result=bound_source,
+            on_message=load_on_message(with_media=True),
+        )
+
+        self.assertEqual([], calls)  # resolver never called — media never enters intake
+        self.assertEqual(1, len(adapter.materialize_calls))
+        self.assertIsNone(adapter.materialize_calls[0]["source"].board_slug)
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertIs(bound_source, adapter.events[0].source)
+        self.assertEqual("agong", adapter.events[0].source.board_slug)
+        self.assertEqual("t_deadbeef", adapter.events[0].source.task_id)
+        self.assertEqual(["https://cdn.example.com/img.png"], adapter.events[0].media_urls)
+
+    def test_media_without_binding_stays_unbound(self):
+        """G4: no current binding => the media event is delivered as before."""
+        adapter, calls = self.run_message(
+            "看这个截图",
+            on_message=load_on_message(with_media=True),
+        )
+
+        self.assertEqual([], calls)
+        self.assertEqual(1, len(adapter.materialize_calls))
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertIsNone(adapter.events[0].source.board_slug)
+        self.assertIsNone(adapter.events[0].source.task_id)
+
+    def test_media_materialize_failure_still_delivers_unbound(self):
+        """G4: a materialize failure is logged and never drops the media."""
+        adapter, calls = self.run_message(
+            "看这个截图",
+            materialize_raises=True,
+            on_message=load_on_message(with_media=True),
+        )
+
+        self.assertEqual([], calls)
+        self.assertEqual(1, len(adapter.materialize_calls))
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertIsNone(adapter.events[0].source.board_slug)
+        self.assertEqual(["https://cdn.example.com/img.png"], adapter.events[0].media_urls)
+
+    # -- R9 #9 (D10): missing stable sender id fails closed -------------------
+
+    def test_missing_sender_ids_skips_intake_but_reaches_gateway(self):
+        """#9: no sender_id and no sender_staff_id => intake never runs (0 pending
+        operations possible), while the normal message flow is unaffected."""
+        seen = []
+
+        def recording_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(message_text)
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            message = make_message("联系人为什么没显示")
+            message.sender_id = "   "  # whitespace-only is not a stable id either
+            message.sender_staff_id = ""
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message(
+            "联系人为什么没显示", resolver_override=recording_resolver, drive=drive
+        )
+
+        self.assertEqual([], seen)
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertEqual("联系人为什么没显示", adapter.events[0].text)
+
+    def test_missing_sender_ids_skips_media_materialize_but_reaches_gateway(self):
+        """#9: an anonymous media message must not inherit a shared binding."""
+        def drive(adapter):
+            message = make_message("看这个截图")
+            message.sender_id = ""
+            message.sender_staff_id = ""
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message(
+            "看这个截图",
+            drive=drive,
+            on_message=load_on_message(with_media=True),
+        )
+
+        self.assertEqual([], calls)
+        self.assertEqual([], adapter.materialize_calls)
+        self.assertEqual(1, len(adapter.events))
+        self.assertIsNone(adapter.events[0].source.board_slug)
 
 
 if __name__ == "__main__":

@@ -118,7 +118,7 @@ try:
         _log_forward_diag,
         build_reply_kwargs,
     )
-    from .task_binding import resolve_gateway_profile, resolve_natural_intake, resolve_task_binding
+    from .task_binding import resolve_gateway_profile, resolve_task_binding, run_natural_intake_gate
 except ImportError:
     import sys
     from pathlib import Path
@@ -137,7 +137,7 @@ except ImportError:
         _log_forward_diag,
         build_reply_kwargs,
     )
-    from task_binding import resolve_gateway_profile, resolve_natural_intake, resolve_task_binding  # type: ignore
+    from task_binding import resolve_gateway_profile, resolve_task_binding, run_natural_intake_gate  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +270,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         # doesn't drop them mid-flight, and we can cancel them on disconnect.
         self._bg_tasks: Set[asyncio.Task] = set()
         self._gateway_profile: Optional[str] = resolve_gateway_profile()  # owning multiplex profile
+        # R9 #3 (D6): chat_id -> {msg_id: (operation_id, expires_at)}; see task_binding.
+        self._intake_prompt_msgs: Dict[str, Dict[str, tuple]] = {}
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -429,6 +431,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._message_contexts.clear()
         self._streaming_cards.clear()
         self._done_emoji_fired.clear()
+        self._intake_prompt_msgs.clear()
         self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
 
@@ -516,6 +519,11 @@ class DingTalkAdapter(BasePlatformAdapter):
         sender_id = getattr(message, "sender_id", "") or ""
         sender_nick = getattr(message, "sender_nick", "") or sender_id
         sender_staff_id = getattr(message, "sender_staff_id", "") or ""
+        # R9 #9 (D10): with neither id the task-state key is shared by every
+        # anonymous sender — natural intake must fail closed (never create or
+        # consume a pending, never restore a shared binding). The message
+        # itself still flows to the agent main loop.
+        has_stable_sender = bool((sender_id or "").strip() or (sender_staff_id or "").strip())
 
         chat_id = conversation_id or sender_id
         chat_type = "group" if is_group else "dm"
@@ -634,23 +642,15 @@ class DingTalkAdapter(BasePlatformAdapter):
         )
         if task_binding:  # build_source() rejects the Kanban kwargs — stamp directly.
             source.board_slug, source.task_id = task_binding.board_slug, task_binding.task_id
-        # v1: any media bypasses task intake — a clarification branch would drop the attachment.
-        if (task_binding is None and (text or "").strip() and not media_urls
-                and not (text or "").lstrip().startswith("/")
-                and (self.config.extra or {}).get("natural_task_intake") is True):
-            try:
-                intake = await resolve_natural_intake(self, source, text or "", msg_id)
-                if intake.action not in {"pass_through", "reply_without_agent", "bound_source", "error_without_agent"}:
-                    raise ValueError(f"Unknown natural task intake action: {intake.action!r}")
-            except Exception:
-                logger.exception("[%s] Natural task intake failed", self.name)
-                await self.send(chat_id, "任务接入暂时不可用，请稍后重试。", reply_to=msg_id)
-                return
-            if intake.action in {"reply_without_agent", "error_without_agent"}:
-                await self.send(chat_id, intake.reply_text, reply_to=msg_id)
-                return
-            if intake.action == "bound_source":
-                source, text, intake_bound = intake.source, intake.text, bool(getattr(intake, "control_consumed", False))
+        # Natural task intake seam — R9 #3 quote registry, R9 #6 media binding
+        # restore, R9 #9 sender fail-closed (task_binding.run_natural_intake_gate).
+        gate = await run_natural_intake_gate(
+            self, source, text, msg_id, chat_id, message,
+            media_urls=media_urls, has_stable_sender=has_stable_sender, task_binding=task_binding,
+        )
+        if gate.handled:
+            return
+        source, text, intake_bound = gate.source, gate.text, gate.control_consumed
         if is_group and not (text or "").lstrip().startswith("/"):
             mention_meta = mention_meta_line(message, self.config.extra or {})
             if mention_meta:

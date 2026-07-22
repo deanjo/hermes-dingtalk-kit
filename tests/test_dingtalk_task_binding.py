@@ -115,6 +115,7 @@ def load_on_message(binding, *, exists):
         "logger": FakeLogger(),
         "mention_meta_line": lambda *args, **kwargs: "",
         "resolve_task_binding": binding.resolve_task_binding,
+        "run_natural_intake_gate": binding.run_natural_intake_gate,
         "should_process_message": lambda *args, **kwargs: True,
         "timezone": timezone,
         "uuid": SimpleNamespace(uuid4=lambda: SimpleNamespace(hex="generated-message-id")),
