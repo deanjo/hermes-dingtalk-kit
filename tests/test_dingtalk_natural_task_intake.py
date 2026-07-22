@@ -1628,8 +1628,100 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual(1, len(adapter.sent))
         self.assertIn("引用", adapter.sent[0]["content"])
         self.assertEqual("incoming-1", adapter.sent[0]["reply_to"])
-        # A clarification is not a confirmation prompt: nothing registers.
+        # No live pending => the clarification carries no triple => no registration.
         self.assertEqual({}, adapter._intake_prompt_msgs)
+
+    def test_quote_clarification_with_live_pending_registers_and_authenticates(self):
+        """R3 #3 closed loop: a quote clarification restating the live
+        pending's prompt carries its full triple, so the delivered
+        clarification registers — quoting IT with '确认' then authenticates
+        and consumes exactly like quoting the original prompt."""
+        module = load_task_binding_module()
+        seen = []
+        bound = {
+            "chat_id": "conversation-1",
+            "chat_type": "group",
+            "user_id": "sender-1",
+            "message_id": "incoming-3",
+            "board_slug": "agong",
+            "task_id": "t_3852e516",
+        }
+        triple = {
+            "prompt_operation_id": "op-1",
+            "prompt_phase": "choose_task",
+            "prompt_target_digest": "digest-1",
+        }
+        staged_results = iter(
+            [
+                self._prompt_result(),  # outbound-1: the original prompt
+                # Contract-Core: unauthenticated quote + live pending =>
+                # quote_clarification restating the pending with its triple.
+                SimpleNamespace(
+                    action=module.QUOTE_CLARIFICATION_ACTION,
+                    source=None,
+                    text="",
+                    reply_text="你引用的消息未能核验为当前待确认的提示。\n当前待确认：\n我找到 2 个任务，请选择 1 或 2。",
+                    **triple,
+                ),
+                SimpleNamespace(
+                    action="bound_source",
+                    source=bound,
+                    text="联系人为什么没显示",
+                    reply_text=None,
+                    control_consumed=True,
+                ),
+            ]
+        )
+
+        def staged_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(kwargs.get("quote"))
+            return next(staged_results)
+
+        def drive(adapter):
+            async def flow():
+                await self.on_message(adapter, make_message("联系人为什么没显示"))
+                bad_quote = make_message("确认")
+                bad_quote.message_id = "incoming-2"
+                bad_quote.text.extensions = {
+                    "repliedMsg": {"msgId": "foreign-message-1", "msgType": "text"}
+                }
+                await self.on_message(adapter, bad_quote)
+                good_quote = make_message("确认")
+                good_quote.message_id = "incoming-3"
+                # The user now quotes the CLARIFICATION message (outbound-2).
+                good_quote.text.extensions = {
+                    "repliedMsg": {"msgId": "outbound-2", "msgType": "markdown"}
+                }
+                await self.on_message(adapter, good_quote)
+
+            return flow()
+
+        adapter, calls = self.run_message("确认", resolver_override=staged_resolver, drive=drive)
+
+        self.assertEqual(3, len(seen))
+        self.assertIsNone(seen[0])
+        self.assertFalse(seen[1]["authenticated"])
+        # The clarification was registered under its real outbound id with the
+        # live pending's triple — quoting it authenticates.
+        self.assertEqual(
+            {
+                "replied_message_id": "outbound-2",
+                "authenticated": True,
+                "matched": {
+                    "operation_id": "op-1",
+                    "phase": "choose_task",
+                    "target_digest": "digest-1",
+                },
+                "quoted_text": None,
+            },
+            seen[2],
+        )
+        entries = adapter._intake_prompt_msgs["conversation-1"]
+        self.assertEqual("digest-1", entries["outbound-1"][2])
+        self.assertEqual("digest-1", entries["outbound-2"][2])
+        # The consumed confirm delivered the bound first turn to the gateway.
+        self.assertEqual(1, len(adapter.events))
+        self.assertIs(bound, adapter.events[0].source)
 
     # -- R3 #7: registry global sweep + outer chat cap --------------------------
 

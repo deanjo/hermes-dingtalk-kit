@@ -326,13 +326,18 @@ def match_intake_prompt(registry, chat_id, message_id, *, now=None):
 def register_delivered_prompt(registry, chat_id, intake, send_result, *, now=None):
     """Register a confirmation prompt after it was actually delivered (D6).
 
-    Only a ``reply_without_agent`` carrying a complete prompt triple
-    (``prompt_operation_id`` + ``prompt_phase`` + ``prompt_target_digest``)
-    whose send succeeded with a real outbound message id is registered;
-    anything else (errors, legacy results, failed sends, incomplete triples)
-    is a no-op — a quote of that prompt then simply stays unauthenticated.
+    A ``reply_without_agent`` — or a ``quote_clarification`` restating a
+    live pending's prompt (R3 #3) — is registered only when it carries a
+    complete prompt triple (``prompt_operation_id`` + ``prompt_phase`` +
+    ``prompt_target_digest``) and its send succeeded with a real outbound
+    message id; anything else (errors, legacy results, failed sends,
+    incomplete triples, a no-pending clarification) is a no-op — a quote of
+    that message then simply stays unauthenticated.
     """
-    if getattr(intake, "action", None) != "reply_without_agent":
+    if getattr(intake, "action", None) not in {
+        "reply_without_agent",
+        QUOTE_CLARIFICATION_ACTION,
+    }:
         return
     operation_id = getattr(intake, "prompt_operation_id", None)
     phase = getattr(intake, "prompt_phase", None)
@@ -403,11 +408,13 @@ class NaturalIntakeGateResult:
 
 
 # R3 #3: Core's action for "a quote is present but unauthenticated — ask for
-# clarification". Kit replies directly and never lets the message reach the
-# agent, instead of relying on the reply-context sentinel. The exact action
-# name is pending Core's report (以 Core 汇报为准); reconcile this constant
-# at integration time if Core chose a different name.
-QUOTE_CLARIFICATION_ACTION = "quote_clarification_without_agent"
+# clarification" (name confirmed by Core R3). Kit replies directly and never
+# lets the message reach the agent, instead of relying on the reply-context
+# sentinel. With a live pending Core restates its prompt and attaches the
+# full prompt triple, so the clarification itself is registrable
+# (``register_delivered_prompt``) — quoting it then authenticates like
+# quoting any fresh prompt.
+QUOTE_CLARIFICATION_ACTION = "quote_clarification"
 
 
 def has_stable_message_id(message: object) -> bool:
