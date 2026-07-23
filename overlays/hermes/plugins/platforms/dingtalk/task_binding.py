@@ -473,6 +473,50 @@ QUOTE_CLARIFICATION_ACTION = "quote_clarification"
 # sends this and stops instead of letting the message reach the main agent.
 _MISSING_IDENTITY_REPLY = "消息缺少稳定身份/编号，无法安全处理任务。"
 
+# R6 M4: per-(chat, reason) cooldown for the refusal receipt. A storm of
+# malformed messages (each msgId-less callback arrives with a fresh dedup
+# UUID, invisible to dedup) must not flood the chat — inside the window the
+# message is still handled (zero state writes, zero agent delivery) but
+# nothing is re-sent. In-memory and lazily expired on access, same
+# lifecycle as the prompt registry.
+_INTAKE_REFUSAL_COOLDOWN_SECONDS = 300.0
+_INTAKE_REFUSAL_COOLDOWN_MAX_KEYS = 256
+
+
+async def _send_intake_refusal(adapter: object, chat_id: str, message_id: str, reason: str):
+    """Send the R5 I1 refusal receipt at most once per (chat, reason) window.
+
+    R6 M4: cooled-down repeats return silently (the caller still ends the
+    message handled). R6 I2: a failed or raising send only logs — the stamp
+    is NOT set, so the next malformed message retries the receipt; there is
+    never a second send attempt for the same message.
+    """
+    now = time.monotonic()
+    stamps = getattr(adapter, "_intake_refusal_stamps", None)
+    if stamps is None:
+        stamps = adapter._intake_refusal_stamps = {}
+    for key in [k for k, sent_at in stamps.items() if now - sent_at >= _INTAKE_REFUSAL_COOLDOWN_SECONDS]:
+        stamps.pop(key, None)
+    key = (chat_id, reason)
+    if key in stamps:
+        return
+    name = getattr(adapter, "name", "dingtalk")
+    try:
+        send_result = await adapter.send(chat_id, _MISSING_IDENTITY_REPLY, reply_to=message_id)
+    except Exception:  # noqa: BLE001 - receipt failure must never break the gate
+        logger.warning(
+            "[%s] Intake refusal receipt send raised (reason=%s)", name, reason, exc_info=True
+        )
+        return
+    if not getattr(send_result, "success", False):
+        logger.warning(
+            "[%s] Intake refusal receipt was not delivered (reason=%s)", name, reason
+        )
+        return
+    if len(stamps) >= _INTAKE_REFUSAL_COOLDOWN_MAX_KEYS:
+        stamps.pop(next(iter(stamps)), None)
+    stamps[key] = now
+
 
 def has_stable_message_id(message: object) -> bool:
     """True when the raw inbound message carries a platform-stable msgId.
@@ -509,15 +553,18 @@ async def run_natural_intake_gate(
       and the media is delivered unbound — never dropped.
     * R9 #9 (D10) + R5 I1: an intake-eligible text without a stable sender
       id fails closed AND loud — the gate sends an honest error and stops;
-      the message never reaches the tool-wielding main agent.
+      the message never reaches the tool-wielding main agent. R6 M4: the
+      receipt is cooled down per (chat, reason); R6 I2: a failed/raising
+      receipt send only logs.
     * R2 + R5 I1: same for a missing platform-stable inbound message id — a
       random UUID must never serve as the intake request number, so the
       resolver is skipped (no pending created or consumed) and the user
       gets the honest error instead of a silent agent dispatch.
-    * R5 I2: when delivering a confirmation/clarification prompt fails, the
-      pending it points at is withdrawn via Core's
-      ``discard_natural_intake_pending`` so a blind confirm can't consume
-      an unseen prompt; registration only happens on successful delivery.
+    * R5 I2 + R6 I2: when delivering a confirmation/clarification prompt
+      fails OR the send raises, the pending it points at is withdrawn via
+      Core's ``discard_natural_intake_pending`` so a blind confirm can't
+      consume an unseen prompt; registration only happens on successful
+      delivery and the exception never escapes the gate.
     * R9 #3 (D6) + R2 C1/C2: a quote-reply is resolved through
       ``build_intake_quote``; Core decides whether a control intent may
       consume that operation. A delivered confirmation prompt is registered
@@ -562,11 +609,12 @@ async def run_natural_intake_gate(
         # text message without a stable sender identity gets an honest error
         # and stops; it must NOT fall through to the tool-wielding main
         # agent, where it would bypass the intake confirmation/CAS guards.
+        # R6 M4: the receipt itself is cooled down per chat+reason.
         logger.warning(
             "[%s] Natural task intake refused: no stable sender identity",
             getattr(adapter, "name", "dingtalk"),
         )
-        await adapter.send(chat_id, _MISSING_IDENTITY_REPLY, reply_to=message_id)
+        await _send_intake_refusal(adapter, chat_id, message_id, "no_sender")
         return NaturalIntakeGateResult(handled=True)
     if not has_stable_message_id(message):
         # R2 + R5 I1: same contract — without a platform-stable inbound msgId
@@ -577,7 +625,7 @@ async def run_natural_intake_gate(
             "[%s] Natural task intake refused: no stable inbound message id",
             getattr(adapter, "name", "dingtalk"),
         )
-        await adapter.send(chat_id, _MISSING_IDENTITY_REPLY, reply_to=message_id)
+        await _send_intake_refusal(adapter, chat_id, message_id, "no_message_id")
         return NaturalIntakeGateResult(handled=True)
     quote = build_intake_quote(adapter._intake_prompt_msgs, chat_id, message)
     try:
@@ -595,7 +643,18 @@ async def run_natural_intake_gate(
         await adapter.send(chat_id, "任务接入暂时不可用，请稍后重试。", reply_to=message_id)
         return NaturalIntakeGateResult(handled=True)
     if intake.action in {"reply_without_agent", "error_without_agent", QUOTE_CLARIFICATION_ACTION}:
-        send_result = await adapter.send(chat_id, intake.reply_text, reply_to=message_id)
+        try:
+            send_result = await adapter.send(chat_id, intake.reply_text, reply_to=message_id)
+        except Exception:
+            # R6 I2: a raising send is a failed delivery too — withdraw the
+            # pending below and end handled; never let the exception escape
+            # into _safe_on_message with the pending alive.
+            logger.warning(
+                "[%s] Intake prompt send raised; treating as undelivered",
+                getattr(adapter, "name", "dingtalk"),
+                exc_info=True,
+            )
+            send_result = None
         if getattr(send_result, "success", False):
             register_delivered_prompt(adapter._intake_prompt_msgs, chat_id, intake, send_result)
         else:

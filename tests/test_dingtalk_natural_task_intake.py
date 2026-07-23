@@ -180,7 +180,7 @@ def load_on_message(*, with_media=False):
 
 
 class FakeAdapter:
-    def __init__(self, *, enabled, send_success=True, gateway_profile=None):
+    def __init__(self, *, enabled, send_success=True, gateway_profile=None, send_raises=False):
         self.name = "dingtalk"
         self.config = SimpleNamespace(extra={"natural_task_intake": enabled})
         self._allowed_users = set()
@@ -195,6 +195,7 @@ class FakeAdapter:
         self.events = []
         self.sent = []
         self.send_success = send_success
+        self.send_raises = send_raises
 
     @staticmethod
     def _extract_text(message):
@@ -251,6 +252,8 @@ class FakeAdapter:
         self.events.append(event)
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
+        if self.send_raises:
+            raise RuntimeError("send exploded")
         message_id = f"outbound-{len(self.sent) + 1}"
         self.sent.append(
             {
@@ -294,6 +297,7 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         result=None,
         raises=False,
         send_success=True,
+        send_raises=False,
         gateway_profile=None,
         resolver_override=None,
         materialize_result=None,
@@ -349,6 +353,7 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
             adapter = FakeAdapter(
                 enabled=enabled,
                 send_success=send_success,
+                send_raises=send_raises,
                 gateway_profile=gateway_profile,
             )
             adapter.materialize_calls = materialize_calls
@@ -1820,6 +1825,144 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
             any("evicted" in line and "chat" in line for line in captured.output),
             f"expected a chat-eviction warning, got: {captured.output}",
         )
+
+    # -- R5 I2: undelivered prompt withdraws the pending -----------------------
+
+    def test_prompt_send_raise_discards_pending_and_stays_handled(self):
+        """R6 I2: a prompt send that RAISES is a failed delivery too — the
+        pending is withdrawn with the full triple, the exception never
+        escapes the gate (no _safe_on_message swallow), handled=True."""
+        discards = []
+
+        def fake_discard(session_store, source, *, operation_id, phase, target_digest, now=None):
+            discards.append(
+                {
+                    "session_store": session_store,
+                    "source": source,
+                    "operation_id": operation_id,
+                    "phase": phase,
+                    "target_digest": target_digest,
+                }
+            )
+            return True
+
+        adapter, calls = self.run_message(
+            "联系人为什么没显示",
+            result=self._prompt_result(),
+            send_raises=True,
+            discard=fake_discard,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual(1, len(discards))
+        self.assertEqual("op-1", discards[0]["operation_id"])
+        self.assertEqual("choose_task", discards[0]["phase"])
+        self.assertEqual("digest-1", discards[0]["target_digest"])
+        self.assertEqual({}, adapter._intake_prompt_msgs)  # never registered
+        self.assertEqual([], adapter.events)  # handled; agent never saw it
+        self.assertEqual([], adapter.sent)  # the send raised before recording
+
+    def test_identity_refusal_send_raise_only_warns_and_stays_handled(self):
+        """R6 I2: a refusal receipt that raises is logged, never re-sent, and
+        the exception never escapes the gate (message still handled)."""
+        module = load_task_binding_module()
+
+        def drive(adapter):
+            message = make_message("联系人为什么没显示")
+            message.message_id = None
+            return self.on_message(adapter, message)
+
+        with self.assertLogs(module.logger, level="WARNING") as captured:
+            adapter, calls = self.run_message(
+                "联系人为什么没显示", send_raises=True, drive=drive
+            )
+
+        self.assertEqual([], calls)
+        self.assertEqual([], adapter.events)
+        self.assertEqual([], adapter.sent)
+        self.assertTrue(
+            any("refusal" in line for line in captured.output),
+            f"expected a refusal-receipt warning, got: {captured.output}",
+        )
+        # The stamp is NOT set on failure — the next message retries.
+        self.assertEqual({}, adapter._intake_refusal_stamps)
+
+    # -- R6 M4: refusal receipt cooldown ---------------------------------------
+
+    def test_identity_refusal_is_cooled_down_per_chat_and_reason(self):
+        """R6 M4: a malformed-message storm gets ONE refusal per chat+reason
+        per window; repeats are still handled (zero resolver calls, zero
+        agent delivery) without resending; after expiry it sends again."""
+        module = load_task_binding_module()
+        seen = []
+
+        def recording_resolver(session_store, source, message_text, request_id, **kwargs):
+            seen.append(message_text)
+            return SimpleNamespace(
+                action="pass_through",
+                source=source,
+                text=message_text,
+                reply_text=None,
+            )
+
+        def drive(adapter):
+            async def flow():
+                for _ in range(3):
+                    message = make_message("联系人为什么没显示")
+                    message.message_id = None  # each callback: fresh dedup UUID
+                    await self.on_message(adapter, message)
+
+            return flow()
+
+        adapter, calls = self.run_message(
+            "联系人为什么没显示", resolver_override=recording_resolver, drive=drive
+        )
+
+        self.assertEqual([], seen)
+        self.assertEqual([], adapter.events)
+        self.assertEqual(1, len(adapter.sent))  # one receipt for three messages
+        self.assertIn("无法安全处理任务", adapter.sent[0]["content"])
+
+        # A different reason (same chat) and a different chat (same reason)
+        # each get their own receipt.
+        def drive_variants(adapter):
+            async def flow():
+                no_sender = make_message("联系人为什么没显示")
+                no_sender.sender_id = "   "
+                no_sender.sender_staff_id = ""
+                await self.on_message(adapter, no_sender)
+                other_chat = make_message("联系人为什么没显示")
+                other_chat.message_id = None
+                other_chat.conversation_id = "conversation-2"
+                await self.on_message(adapter, other_chat)
+
+            return flow()
+
+        adapter, calls = self.run_message("联系人为什么没显示", drive=drive_variants)
+        self.assertEqual([], adapter.events)
+        self.assertEqual(2, len(adapter.sent))
+        self.assertEqual({"conversation-1", "conversation-2"}, {s["chat_id"] for s in adapter.sent})
+
+        # After the cooldown window the receipt is sent again.
+        cooldown = module._INTAKE_REFUSAL_COOLDOWN_SECONDS
+
+        def drive_after_expiry(adapter):
+            async def flow():
+                await self.on_message(adapter, _msgidless())
+                for key in list(adapter._intake_refusal_stamps):
+                    adapter._intake_refusal_stamps[key] -= cooldown + 1
+                await self.on_message(adapter, _msgidless())
+
+            return flow()
+
+        def _msgidless():
+            message = make_message("联系人为什么没显示")
+            message.message_id = None
+            return message
+
+        adapter, calls = self.run_message("联系人为什么没显示", drive=drive_after_expiry)
+        self.assertEqual([], adapter.events)
+        self.assertEqual(2, len(adapter.sent))
 
     # -- R5 I2: undelivered prompt withdraws the pending -----------------------
 
