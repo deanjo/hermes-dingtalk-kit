@@ -298,6 +298,7 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         resolver_override=None,
         materialize_result=None,
         materialize_raises=False,
+        discard=None,
         drive=None,
         on_message=None,
     ):
@@ -338,6 +339,8 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         task_intake = types.ModuleType("gateway.task_intake")
         task_intake.resolve_natural_task_intake = resolver_override or resolver
         task_intake.materialize_current_task_source = recording_materialize
+        if discard is not None:
+            task_intake.discard_natural_intake_pending = discard
         old_gateway = sys.modules.get("gateway")
         old_task_intake = sys.modules.get("gateway.task_intake")
         sys.modules["gateway"] = gateway
@@ -1365,14 +1368,10 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual(2, len(adapter.sent))
         self.assertEqual("reply clarification", adapter.sent[1]["content"])
 
-    def test_missing_inbound_message_id_skips_intake_but_reaches_gateway(self):
-        """R2: no platform-stable inbound msgId => intake never runs.
-
-        ``_on_message`` still synthesizes a UUID for dedup, but a random UUID
-        must never serve as the intake request/operation number — the gate
-        fails closed (0 resolver calls, no pending created or consumed) while
-        the normal message flow is unaffected.
-        """
+    def test_missing_inbound_message_id_gets_honest_error_and_stops(self):
+        """R5 I1: an intake-eligible text without a platform msgId is refused
+        loudly — honest error sent, resolver never called, and the message
+        never reaches the tool-wielding main agent."""
         seen = []
 
         def recording_resolver(session_store, source, message_text, request_id, **kwargs):
@@ -1394,12 +1393,12 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         )
 
         self.assertEqual([], seen)
-        self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assertEqual("联系人为什么没显示", adapter.events[0].text)
+        self.assertEqual([], adapter.events)  # NOT handed to the agent
+        self.assertEqual(1, len(adapter.sent))
+        self.assertIn("无法安全处理任务", adapter.sent[0]["content"])
 
-    def test_blank_inbound_message_id_skips_intake_but_reaches_gateway(self):
-        """R2: a whitespace-only inbound msgId is not stable either (fail closed)."""
+    def test_blank_inbound_message_id_gets_honest_error_and_stops(self):
+        """R5 I1: a whitespace-only inbound msgId is refused the same way."""
         seen = []
 
         def recording_resolver(session_store, source, message_text, request_id, **kwargs):
@@ -1421,9 +1420,9 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         )
 
         self.assertEqual([], seen)
-        self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assertEqual("联系人为什么没显示", adapter.events[0].text)
+        self.assertEqual([], adapter.events)
+        self.assertEqual(1, len(adapter.sent))
+        self.assertIn("无法安全处理任务", adapter.sent[0]["content"])
 
     # -- R2 C3: startup classifier-config validation --------------------------
 
@@ -1783,6 +1782,18 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertNotIn("chat-stale-2", registry)
         self.assertIn("msg-c", registry["chat-live"])
 
+    def test_prompt_registry_match_sweeps_even_with_empty_arguments(self):
+        """R5 M5: the global sweep runs before the empty-parameter check —
+        even a degenerate match call reclaims expired entries."""
+        module = load_task_binding_module()
+        registry = {}
+        module.register_intake_prompt(
+            registry, "chat-1", "msg-a", "op-a", "choose_task", "digest-a", now=1000.0
+        )
+        ttl = module._INTAKE_PROMPT_REGISTRY_TTL_SECONDS
+        self.assertIsNone(module.match_intake_prompt(registry, "", None, now=1000.0 + ttl))
+        self.assertNotIn("chat-1", registry)
+
     def test_prompt_registry_chat_cap_evicts_oldest_chat_with_warning(self):
         """R3 #7: the outer chat map is capped; evicting a chat logs a warning."""
         module = load_task_binding_module()
@@ -1809,6 +1820,109 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
             any("evicted" in line and "chat" in line for line in captured.output),
             f"expected a chat-eviction warning, got: {captured.output}",
         )
+
+    # -- R5 I2: undelivered prompt withdraws the pending -----------------------
+
+    def test_prompt_send_failure_discards_pending_with_triple(self):
+        """R5 I2: a failed prompt/clarification send withdraws the pending via
+        Core's discard with the full triple; nothing is registered and the
+        flow stays handled (agent never involved)."""
+        module = load_task_binding_module()
+        results = {
+            "reply_without_agent": self._prompt_result(),
+            "quote_clarification": SimpleNamespace(
+                action=module.QUOTE_CLARIFICATION_ACTION,
+                source=None,
+                text="",
+                reply_text="你引用的消息未能核验为当前待确认的提示。",
+                prompt_operation_id="op-1",
+                prompt_phase="choose_task",
+                prompt_target_digest="digest-1",
+            ),
+        }
+        for name, result in results.items():
+            with self.subTest(action=name):
+                discards = []
+
+                def fake_discard(session_store, source, *, operation_id, phase, target_digest, now=None):
+                    discards.append(
+                        {
+                            "session_store": session_store,
+                            "source": source,
+                            "operation_id": operation_id,
+                            "phase": phase,
+                            "target_digest": target_digest,
+                        }
+                    )
+                    return True
+
+                adapter, calls = self.run_message(
+                    "联系人为什么没显示",
+                    result=result,
+                    send_success=False,
+                    discard=fake_discard,
+                )
+
+                self.assertEqual(1, len(calls))
+                self.assertEqual(1, len(discards))
+                self.assertEqual("op-1", discards[0]["operation_id"])
+                self.assertEqual("choose_task", discards[0]["phase"])
+                self.assertEqual("digest-1", discards[0]["target_digest"])
+                self.assertIs(adapter._session_store, discards[0]["session_store"])
+                self.assertIsNotNone(discards[0]["source"])
+                self.assertEqual({}, adapter._intake_prompt_msgs)  # never registered
+                self.assertEqual([], adapter.events)  # handled; agent never saw it
+                self.assertEqual(1, len(adapter.sent))  # only the failed prompt send
+
+    def test_prompt_send_failure_discard_problems_only_warn(self):
+        """R5 I2: discard returning False / raising / missing on an old Core
+        degrades to a warning — never a crash, never an extra send."""
+        module = load_task_binding_module()
+
+        # (a) discard returns False (the pending moved on): warning, no crash.
+        with self.assertLogs(module.logger, level="WARNING") as captured:
+            adapter, _ = self.run_message(
+                "联系人为什么没显示",
+                result=self._prompt_result(),
+                send_success=False,
+                discard=lambda *args, **kwargs: False,
+            )
+        self.assertTrue(
+            any("undelivered" in line for line in captured.output),
+            f"expected an undelivered-pending warning, got: {captured.output}",
+        )
+        self.assertEqual(1, len(adapter.sent))
+        self.assertEqual([], adapter.events)
+
+        # (b) discard raises: warning (with exc_info), no crash.
+        def raising_discard(*args, **kwargs):
+            raise RuntimeError("cas failed")
+
+        with self.assertLogs(module.logger, level="WARNING") as captured:
+            adapter, _ = self.run_message(
+                "联系人为什么没显示",
+                result=self._prompt_result(),
+                send_success=False,
+                discard=raising_discard,
+            )
+        self.assertTrue(
+            any("undelivered" in line for line in captured.output),
+            f"expected an undelivered-pending warning, got: {captured.output}",
+        )
+
+        # (c) old Core without the helper: skipped gracefully with a warning.
+        with self.assertLogs(module.logger, level="WARNING") as captured:
+            adapter, _ = self.run_message(
+                "联系人为什么没显示",
+                result=self._prompt_result(),
+                send_success=False,
+            )
+        self.assertTrue(
+            any("undelivered" in line for line in captured.output),
+            f"expected an undelivered-pending warning, got: {captured.output}",
+        )
+        self.assertEqual(1, len(adapter.sent))
+        self.assertEqual([], adapter.events)
 
     # -- R9 #6 (D7): media keeps the current binding --------------------------
 
@@ -1868,9 +1982,10 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
 
     # -- R9 #9 (D10): missing stable sender id fails closed -------------------
 
-    def test_missing_sender_ids_skips_intake_but_reaches_gateway(self):
-        """#9: no sender_id and no sender_staff_id => intake never runs (0 pending
-        operations possible), while the normal message flow is unaffected."""
+    def test_missing_sender_ids_gets_honest_error_and_stops(self):
+        """#9 + R5 I1: no stable sender identity => intake never runs AND the
+        intake-eligible text is refused with an honest error instead of
+        reaching the tool-wielding main agent."""
         seen = []
 
         def recording_resolver(session_store, source, message_text, request_id, **kwargs):
@@ -1893,26 +2008,31 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         )
 
         self.assertEqual([], seen)
-        self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assertEqual("联系人为什么没显示", adapter.events[0].text)
+        self.assertEqual([], adapter.events)  # NOT handed to the agent
+        self.assertEqual(1, len(adapter.sent))
+        self.assertIn("无法安全处理任务", adapter.sent[0]["content"])
 
     def test_missing_sender_ids_skips_media_materialize_but_reaches_gateway(self):
-        """#9: an anonymous media message must not inherit a shared binding."""
+        """#9 + R5 I1: an anonymous MEDIA message is not intake-eligible — it
+        skips binding restore and is delivered unbound, with no honest-error
+        send (behavior for non-eligible messages is unchanged)."""
+        media_on_message = load_on_message(with_media=True)
+
         def drive(adapter):
             message = make_message("看这个截图")
             message.sender_id = ""
             message.sender_staff_id = ""
-            return self.on_message(adapter, message)
+            return media_on_message(adapter, message)
 
         adapter, calls = self.run_message(
             "看这个截图",
             drive=drive,
-            on_message=load_on_message(with_media=True),
+            on_message=media_on_message,
         )
 
         self.assertEqual([], calls)
         self.assertEqual([], adapter.materialize_calls)
+        self.assertEqual([], adapter.sent)  # media is not refused — it flows on
         self.assertEqual(1, len(adapter.events))
         self.assertIsNone(adapter.events[0].source.board_slug)
 

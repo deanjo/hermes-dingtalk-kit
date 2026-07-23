@@ -3,7 +3,8 @@ task intake seam (quote-aware confirmation R9 #3 hardened by R2 C1/C2 + R3
 #2/#3 — prompts registered and matched as full ``(operation_id, phase,
 target_digest)`` triples with explicit quote authentication, malformed
 ``repliedMsg`` fail-closed, direct quote clarification, media binding
-restore R9 #6, sender/inbound-msgId fail-closed R9 #9 + R2)."""
+restore R9 #6, sender/inbound-msgId honest refusal R9 #9 + R2/R5 I1,
+undelivered-prompt withdrawal R5 I2)."""
 
 from __future__ import annotations
 
@@ -305,13 +306,13 @@ def match_intake_prompt(registry, chat_id, message_id, *, now=None):
     """Return the ``{"operation_id", "phase", "target_digest"}`` triple whose
     confirmation prompt was ``message_id``, or None when the quoted message
     was never registered (or has expired)."""
+    now = time.monotonic() if now is None else now
+    # R4/R5 M5: sweep globally on EVERY call — even a degenerate one with
+    # empty parameters — before the empty-check and any lookup, so expired
+    # entries of any chat are always reclaimed.
+    _sweep_expired_intake_prompts(registry, now)
     if not chat_id or not message_id:
         return None
-    now = time.monotonic() if now is None else now
-    # R4 M5: sweep globally on EVERY lookup — a live hit or an ordinary miss
-    # must reclaim other chats' expired entries too, not just an expired hit
-    # in the looked-up chat.
-    _sweep_expired_intake_prompts(registry, now)
     entries = registry.get(chat_id) or {}
     hit = entries.get(message_id)
     if hit is None:
@@ -357,6 +358,53 @@ def register_delivered_prompt(registry, chat_id, intake, send_result, *, now=Non
     register_intake_prompt(
         registry, chat_id, message_id, operation_id, phase, target_digest, now=now
     )
+
+
+async def discard_undelivered_intake_pending(adapter: object, source: object, intake: object):
+    """Withdraw the pending after its confirmation prompt failed to deliver (R5 I2).
+
+    Calls Core's ``discard_natural_intake_pending`` with the intake result's
+    full prompt triple — Core CAS-clears the pending only when the live
+    triple still matches, zero side effects otherwise — so a blind "确认"
+    can't consume a prompt the user never saw. A False return or any failure
+    (including an old Core without the helper) degrades to a warning: the
+    pending may linger undelivered. Offloaded like the resolver (SQLite CAS).
+    """
+    operation_id = getattr(intake, "prompt_operation_id", None)
+    phase = getattr(intake, "prompt_phase", None)
+    target_digest = getattr(intake, "prompt_target_digest", None)
+    if not operation_id or not phase or not target_digest:
+        return  # no pending triple on this result — nothing to withdraw
+    name = getattr(adapter, "name", "dingtalk")
+    try:
+        from gateway.task_intake import discard_natural_intake_pending
+    except Exception:  # noqa: BLE001 - old Core without the R5 I2 helper
+        logger.warning(
+            "[%s] Prompt delivery failed but this Core cannot discard the pending; it may linger undelivered",
+            name,
+        )
+        return
+    try:
+        discarded = await asyncio.to_thread(
+            discard_natural_intake_pending,
+            adapter._session_store,
+            source,
+            operation_id=operation_id,
+            phase=phase,
+            target_digest=target_digest,
+        )
+    except Exception:  # noqa: BLE001 - the send already failed; never crash the gate
+        logger.warning(
+            "[%s] Failed to discard the undelivered intake pending; it may linger undelivered",
+            name,
+            exc_info=True,
+        )
+        return
+    if not discarded:
+        logger.warning(
+            "[%s] Undelivered intake pending was not discarded (already changed or gone); it may linger undelivered",
+            name,
+        )
 
 
 def build_intake_quote(registry, chat_id, message):
@@ -420,6 +468,12 @@ class NaturalIntakeGateResult:
 QUOTE_CLARIFICATION_ACTION = "quote_clarification"
 
 
+# R5 I1: honest user-facing error when an intake-eligible text message
+# lacks the critical identifiers (stable sender / inbound msgId) — the gate
+# sends this and stops instead of letting the message reach the main agent.
+_MISSING_IDENTITY_REPLY = "消息缺少稳定身份/编号，无法安全处理任务。"
+
+
 def has_stable_message_id(message: object) -> bool:
     """True when the raw inbound message carries a platform-stable msgId.
 
@@ -453,12 +507,17 @@ async def run_natural_intake_gate(
       bound user's media keeps its task context via Core's read-only
       ``materialize_current_task_source``; a restore failure logs a warning
       and the media is delivered unbound — never dropped.
-    * R9 #9 (D10): without a stable sender id the gate fails closed — no
-      pending is created or consumed; the message still reaches the agent.
-    * R2: without a platform-stable inbound message id the gate also fails
-      closed — a random UUID must never serve as the intake request number,
-      so the resolver is skipped entirely (no pending created or consumed)
-      and the message flows on normally.
+    * R9 #9 (D10) + R5 I1: an intake-eligible text without a stable sender
+      id fails closed AND loud — the gate sends an honest error and stops;
+      the message never reaches the tool-wielding main agent.
+    * R2 + R5 I1: same for a missing platform-stable inbound message id — a
+      random UUID must never serve as the intake request number, so the
+      resolver is skipped (no pending created or consumed) and the user
+      gets the honest error instead of a silent agent dispatch.
+    * R5 I2: when delivering a confirmation/clarification prompt fails, the
+      pending it points at is withdrawn via Core's
+      ``discard_natural_intake_pending`` so a blind confirm can't consume
+      an unseen prompt; registration only happens on successful delivery.
     * R9 #3 (D6) + R2 C1/C2: a quote-reply is resolved through
       ``build_intake_quote``; Core decides whether a control intent may
       consume that operation. A delivered confirmation prompt is registered
@@ -499,23 +558,27 @@ async def run_natural_intake_gate(
     if not (text or "").strip() or (text or "").lstrip().startswith("/"):
         return NaturalIntakeGateResult(handled=False, source=source, text=text)
     if not has_stable_sender:
-        # R9 #9 (D10): fail closed — no pending for an unidentifiable sender;
-        # the message still reaches the agent main loop.
+        # R9 #9 (D10) + R5 I1: fail closed AND fail loud — an intake-eligible
+        # text message without a stable sender identity gets an honest error
+        # and stops; it must NOT fall through to the tool-wielding main
+        # agent, where it would bypass the intake confirmation/CAS guards.
         logger.warning(
-            "[%s] Natural task intake skipped: no stable sender identity",
+            "[%s] Natural task intake refused: no stable sender identity",
             getattr(adapter, "name", "dingtalk"),
         )
-        return NaturalIntakeGateResult(handled=False, source=source, text=text)
+        await adapter.send(chat_id, _MISSING_IDENTITY_REPLY, reply_to=message_id)
+        return NaturalIntakeGateResult(handled=True)
     if not has_stable_message_id(message):
-        # R2: fail closed — without a platform-stable inbound msgId the intake
-        # request number would have to be the random UUID ``_on_message``
-        # synthesizes for dedup, so no pending may be created or consumed;
-        # the message still reaches the agent main loop.
+        # R2 + R5 I1: same contract — without a platform-stable inbound msgId
+        # the intake request number would have to be the random UUID
+        # ``_on_message`` synthesizes for dedup, so no pending may be created
+        # or consumed; the user gets the honest error and the message stops.
         logger.warning(
-            "[%s] Natural task intake skipped: no stable inbound message id",
+            "[%s] Natural task intake refused: no stable inbound message id",
             getattr(adapter, "name", "dingtalk"),
         )
-        return NaturalIntakeGateResult(handled=False, source=source, text=text)
+        await adapter.send(chat_id, _MISSING_IDENTITY_REPLY, reply_to=message_id)
+        return NaturalIntakeGateResult(handled=True)
     quote = build_intake_quote(adapter._intake_prompt_msgs, chat_id, message)
     try:
         intake = await resolve_natural_intake(adapter, source, text or "", message_id, quote=quote)
@@ -533,7 +596,12 @@ async def run_natural_intake_gate(
         return NaturalIntakeGateResult(handled=True)
     if intake.action in {"reply_without_agent", "error_without_agent", QUOTE_CLARIFICATION_ACTION}:
         send_result = await adapter.send(chat_id, intake.reply_text, reply_to=message_id)
-        register_delivered_prompt(adapter._intake_prompt_msgs, chat_id, intake, send_result)
+        if getattr(send_result, "success", False):
+            register_delivered_prompt(adapter._intake_prompt_msgs, chat_id, intake, send_result)
+        else:
+            # R5 I2: the prompt never reached the user — withdraw the pending
+            # it points at so a blind "确认" can't consume an unseen prompt.
+            await discard_undelivered_intake_pending(adapter, source, intake)
         return NaturalIntakeGateResult(handled=True)
     if intake.action == "bound_source":
         return NaturalIntakeGateResult(

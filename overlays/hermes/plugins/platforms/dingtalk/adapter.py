@@ -521,8 +521,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         sender_staff_id = getattr(message, "sender_staff_id", "") or ""
         # R9 #9 (D10): with neither id the task-state key is shared by every
         # anonymous sender — natural intake must fail closed (never create or
-        # consume a pending, never restore a shared binding). The message
-        # itself still flows to the agent main loop.
+        # consume a pending, never restore a shared binding). Intake-eligible
+        # text gets an honest error and stops (R5 I1); other messages flow on.
         has_stable_sender = bool((sender_id or "").strip() or (sender_staff_id or "").strip())
 
         chat_id = conversation_id or sender_id
