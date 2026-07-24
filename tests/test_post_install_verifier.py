@@ -40,6 +40,10 @@ class PostInstallVerifierTest(unittest.TestCase):
             OVERLAY / "plugins/product_confirmation",
             root / "plugins/product_confirmation",
         )
+        shutil.copytree(
+            OVERLAY / "plugins/h1_intake_proposal",
+            root / "plugins/h1_intake_proposal",
+        )
         return root
 
     def test_overlay_installation_report_passes(self):
@@ -57,6 +61,10 @@ class PostInstallVerifierTest(unittest.TestCase):
         self.assertIn("product.manifest", check_names)
         self.assertIn("product.entry", check_names)
         self.assertIn("product.public_hook_contract", check_names)
+        self.assertIn("h1_intake_proposal.file.__init__.py", check_names)
+        self.assertIn("h1_intake_proposal.file.plugin.yaml", check_names)
+        self.assertIn("h1_intake_proposal.file.tools.py", check_names)
+        self.assertIn("h1_intake_proposal.line_count.tools.py", check_names)
         self.assertIn("gateway.session_key_slash", check_names)
         self.assertIn("gateway.session_context_bridge", check_names)
         runtime = next(item for item in report["checks"] if item["name"] == "plugin.runtime_discovery")

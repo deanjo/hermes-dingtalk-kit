@@ -169,6 +169,7 @@ def load_on_message(*, with_media=False):
         "is_user_allowed": lambda *args, **kwargs: True,
         "logger": FakeLogger(),
         "mention_meta_line": lambda *args, **kwargs: "",
+        "gate_bound_reply_kwargs": task_binding_module.gate_bound_reply_kwargs,
         "resolve_task_binding": resolve_task_binding,
         "run_natural_intake_gate": task_binding_module.run_natural_intake_gate,
         "should_process_message": lambda *args, **kwargs: True,
@@ -489,6 +490,116 @@ class DingTalkNaturalTaskIntakeTest(unittest.TestCase):
         self.assertEqual(1, len(adapter.events))
         self.assertIs(bound, adapter.events[0].source)
         self.assertEqual("联系人为什么没显示", adapter.events[0].text)
+
+    def _consumed_bound_result(self):
+        bound = {
+            "chat_id": "conversation-1",
+            "chat_type": "group",
+            "user_id": "sender-1",
+            "message_id": "incoming-1",
+            "board_slug": "agong",
+            "task_id": "t_3852e516",
+        }
+        return SimpleNamespace(
+            action="bound_source",
+            source=bound,
+            text="帮我排查下这个报错",
+            reply_text=None,
+            control_consumed=True,
+        )
+
+    @staticmethod
+    def _quoted_message(text, *, replied_msg_id, quoted_text):
+        message = make_message(text)
+        message.text = SimpleNamespace(
+            content=text,
+            extensions={
+                "repliedMsg": {
+                    "msgId": replied_msg_id,
+                    "msgType": "text",
+                    "content": quoted_text,
+                }
+            },
+        )
+        return message
+
+    def test_consumed_bound_turn_keeps_quoted_original(self):
+        """D2.3: the bound first turn after a consumed confirmation carries
+        the quoted original to the gateway (the gate extracted it once) —
+        no more silent reply-context drop."""
+        result = self._consumed_bound_result()
+
+        def drive(adapter):
+            message = self._quoted_message(
+                "确认",
+                replied_msg_id="msg-888",
+                quoted_text="同步任务失败：索引 agong_company_info_active 写入冲突",
+            )
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("确认", result=result, drive=drive)
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], adapter.sent)  # never the T1 clarification
+        self.assertEqual(1, len(adapter.events))
+        event = adapter.events[0]
+        self.assertEqual(
+            "同步任务失败：索引 agong_company_info_active 写入冲突",
+            event.reply_to_text,
+        )
+        self.assertEqual("msg-888", event.reply_to_message_id)
+        # The quoted message is NOT a registered bot prompt → not ours.
+        self.assertFalse(event.reply_to_is_own_message)
+
+    def test_consumed_bound_turn_marks_registered_prompt_as_own(self):
+        """D2.3: quoting the bot's OWN registered proposal marks
+        reply_to_is_own_message=True (run.py phrases it as 'your previous
+        message')."""
+        result = self._consumed_bound_result()
+
+        def drive(adapter):
+            # Pre-register the quoted outbound message as an intake prompt.
+            load_task_binding_module().register_intake_prompt(
+                adapter._intake_prompt_msgs,
+                "conversation-1",
+                "msg-prop-1",
+                "task-intake-op-1",
+                "confirm_create",
+                "d" * 32,
+            )
+            message = self._quoted_message(
+                "确认",
+                replied_msg_id="msg-prop-1",
+                quoted_text="要我建个任务跟踪到底吗？",
+            )
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("确认", result=result, drive=drive)
+
+        self.assertEqual(1, len(adapter.events))
+        event = adapter.events[0]
+        self.assertEqual("要我建个任务跟踪到底吗？", event.reply_to_text)
+        self.assertTrue(event.reply_to_is_own_message)
+
+    def test_consumed_bound_turn_without_quoted_text_stays_silent(self):
+        """D2.3: a consumed confirm whose quote carried no original text
+        (DingTalk sentinel case) gets NO reply kwargs and NEVER the T1
+        clarification — confirming must not be answered with
+        'what are you quoting?'."""
+        result = self._consumed_bound_result()
+
+        def drive(adapter):
+            # repliedMsg present but with no content at all.
+            message = self._quoted_message("确认", replied_msg_id="msg-888", quoted_text="")
+            return self.on_message(adapter, message)
+
+        adapter, calls = self.run_message("确认", result=result, drive=drive)
+
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        event = adapter.events[0]
+        self.assertIsNone(getattr(event, "reply_to_message_id", None))
+        self.assertIsNone(getattr(event, "reply_to_text", None))
 
     def test_quote_reply_pass_through_still_sends_reply_clarification(self):
         """Guard: when the resolver does NOT consume the message, the T1

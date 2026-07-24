@@ -66,7 +66,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/compat_patcher.py --target /opt/her
 
 ## Local Install Chain
 
-`scripts/install_dingtalk_kit.py` 把当前 DingTalk Kit 安装到一个 Hermes root：按声明清单复制 `plugins/platforms/dingtalk/` 和 `plugins/product_confirmation/`，再运行 post-install verifier。每个新插件目录先在目标目录旁边、同一文件系统内完成 staging（预备副本），再用“旧目录改名 → 新目录改名”切换；第二步失败会立即把旧目录改回。默认模式保留已有 compat patcher；任一步失败都会恢复安装前的 gateway 三文件和两个旧插件目录。
+`scripts/install_dingtalk_kit.py` 把当前 DingTalk Kit 安装到一个 Hermes root：按声明清单复制 `plugins/platforms/dingtalk/`、`plugins/product_confirmation/` 和 `plugins/h1_intake_proposal/`，再运行 post-install verifier。每个新插件目录先在目标目录旁边、同一文件系统内完成 staging（预备副本），再用“旧目录改名 → 新目录改名”切换；第二步失败会立即把旧目录改回。默认模式保留已有 compat patcher；任一步失败都会恢复安装前的 gateway 三文件和三个旧插件目录。
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/install_dingtalk_kit.py --target /opt/hermes

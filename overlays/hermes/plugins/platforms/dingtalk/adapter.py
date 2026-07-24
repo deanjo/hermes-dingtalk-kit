@@ -119,7 +119,7 @@ try:
         build_reply_kwargs,
     )
     from .task_binding import resolve_gateway_profile, resolve_task_binding, run_natural_intake_gate
-    from .task_binding import validate_natural_intake_classifier_config
+    from .task_binding import validate_natural_intake_classifier_config, capture_h1_run_outcome, gate_bound_reply_kwargs, record_h1_final_reply
 except ImportError:
     import sys
     from pathlib import Path
@@ -139,7 +139,7 @@ except ImportError:
         build_reply_kwargs,
     )
     from task_binding import resolve_gateway_profile, resolve_task_binding, run_natural_intake_gate  # type: ignore
-    from task_binding import validate_natural_intake_classifier_config  # type: ignore
+    from task_binding import validate_natural_intake_classifier_config, capture_h1_run_outcome, gate_bound_reply_kwargs, record_h1_final_reply  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -664,11 +664,10 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
-        # T27: surface reply-to context for text quotes so the gateway can inject a
-        # disambiguation pointer. File quotes keep flowing through the existing
-        # document path (_get_replied_file_content) and are skipped here. Any failure
-        # must degrade to "no reply context" and never break normal message handling.
-        reply_kwargs = {} if intake_bound else build_reply_kwargs(message)
+        # T27: surface reply-to context for text quotes so the gateway can
+        # inject a disambiguation pointer (file quotes keep the document
+        # path; failures degrade to "no reply context", never a breakage).
+        reply_kwargs = gate_bound_reply_kwargs(gate) if intake_bound else build_reply_kwargs(message)
         # A reply ID without the quoted text is not enough to identify the task.
         # Stop before MessageEvent reaches the model: guessing here can make Hermes
         # answer a different topic from the one the user actually quoted.
@@ -756,6 +755,9 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     # -- Outbound messaging -------------------------------------------------
 
+    async def on_processing_complete(self, event, outcome) -> None:
+        capture_h1_run_outcome(self, event, outcome)  # H1 C1 outcome capture
+
     async def send(
         self,
         chat_id: str,
@@ -798,14 +800,10 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Look up the inbound message for this chat (for AI Card routing)
         current_message = self._message_contexts.get(chat_id)
 
-        # ``reply_to`` is the signal that this send is the FINAL response
-        # to an inbound user message — only `base.py:_send_with_retry` sets
-        # it.  Tool-progress, commentary, and stream-consumer first-sends
-        # all leave it None.  We use it for two orthogonal decisions:
-        #   1. finalize on create?  Yes if final reply, No if intermediate
-        #      (intermediate cards stay in streaming state so edit_message
-        #      updates don't flicker closed→streaming→closed repeatedly).
-        #   2. fire Done reaction?  Only when this is the final reply.
+        # ``reply_to`` is the signal that this send is the FINAL response to
+        # an inbound user message — only `base.py:_send_with_retry` sets it.
+        # Decisions keyed on it: finalize-on-create + fire Done only for
+        # final replies; intermediate sends stay in streaming state.
         is_final_reply = reply_to is not None
 
         # Structured @-mentions requested by the caller (e.g. the
@@ -839,6 +837,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                 if is_final_reply:
                     # Final reply: card closed, swap Thinking → Done.
                     self._fire_done_reaction(chat_id)
+                    record_h1_final_reply(self, result.message_id)  # H1 C1 delivery evidence
                 else:
                     # Intermediate (tool progress / commentary / streaming
                     # first chunk): keep the card open and track it so the
@@ -1164,6 +1163,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                     self.name, message_id,
                 )
                 self._fire_done_reaction(chat_id)
+                record_h1_final_reply(self, message_id)  # H1 C1 delivery evidence
             else:
                 # Non-final edit reopens the card into streaming state —
                 # track it so the next send() can auto-close it as a

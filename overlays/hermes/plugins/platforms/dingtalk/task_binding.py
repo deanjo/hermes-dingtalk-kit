@@ -9,6 +9,7 @@ undelivered-prompt withdrawal R5 I2)."""
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import re
 import sqlite3
@@ -456,6 +457,11 @@ class NaturalIntakeGateResult:
     source: object = None
     text: str = ""
     control_consumed: bool = False
+    # D2: quoted-original passthrough for the bound first turn after a
+    # consumed confirmation (display-only — NEVER an authorization signal).
+    quoted_text: object = None
+    quote_authenticated: bool = False
+    replied_message_id: object = None
 
 
 # R3 #3: Core's action for "a quote is present but unauthenticated — ask for
@@ -466,6 +472,24 @@ class NaturalIntakeGateResult:
 # (``register_delivered_prompt``) — quoting it then authenticates like
 # quoting any fresh prompt.
 QUOTE_CLARIFICATION_ACTION = "quote_clarification"
+
+
+def gate_bound_reply_kwargs(gate: NaturalIntakeGateResult) -> dict:
+    """D2.3: reply-context kwargs for the bound first turn after a consumed
+    confirmation.  The gate already extracted the quoted original (zero
+    re-parse); a quote of the bot's own registered proposal marks
+    ``reply_to_is_own_message``.  ``quoted_text`` empty (DingTalk delivered
+    no original) → ``{}`` — the bound first turn NEVER triggers the T1
+    clarification (confirming must not be answered with "what are you
+    quoting?").  ``quoted_text`` is display-only, never an authorization
+    signal."""
+    if not gate.quoted_text:
+        return {}
+    return {
+        "reply_to_message_id": gate.replied_message_id,
+        "reply_to_text": gate.quoted_text,
+        "reply_to_is_own_message": bool(gate.quote_authenticated),
+    }
 
 
 # R5 I1: honest user-facing error when an intake-eligible text message
@@ -582,6 +606,9 @@ async def run_natural_intake_gate(
     message was consumed are handed back — a consumed control makes the
     adapter drop the reply context so the T1 clarification stays silent.
     """
+    # H1 C1: publish this turn's dispatch scope for the delivery record
+    # points — every message reaching the gate is a potential proposal turn.
+    set_h1_dispatch_scope(source=source, text=text, message_id=message_id)
     if (adapter.config.extra or {}).get("natural_task_intake") is not True:
         return NaturalIntakeGateResult(handled=False, source=source, text=text)
     if task_binding is not None:
@@ -668,5 +695,280 @@ async def run_natural_intake_gate(
             source=intake.source,
             text=intake.text,
             control_consumed=bool(getattr(intake, "control_consumed", False)),
+            # D2: pass the already-extracted quote payload through so the
+            # bound first turn after a consumed confirmation keeps the
+            # quoted original (zero re-parse; display-only, never auth).
+            quoted_text=(quote or {}).get("quoted_text") if isinstance(quote, dict) else None,
+            quote_authenticated=bool((quote or {}).get("authenticated")) if isinstance(quote, dict) else False,
+            replied_message_id=(quote or {}).get("replied_message_id") if isinstance(quote, dict) else None,
         )
     return NaturalIntakeGateResult(handled=False, source=source, text=text)
+
+
+# ---------------------------------------------------------------------------
+# H1 intake proposal seam (C1): one-shot slot + post-delivery install.
+#
+# The h1_intake_propose tool (plugins/h1_intake_proposal) only validates and
+# slots a proposal (zero Kanban writes, zero pending installs).  The pending
+# installs ONLY after the turn's NON-RECEIPT final reply is provably
+# delivered (C1) — outcome==SUCCESS AND a generation-matched delivery record
+# — and is registered for quote authentication atomically in the same
+# callback.  Delivery failure / exception turn / sanitized failure receipt
+# (R3) / state drift => the slot is dropped with a warning; nothing was ever
+# installed, so nothing needs withdrawal.
+#
+# All mutable state lives on the adapter instance (lazy attrs), so any
+# loaded instance of this module drives the same coherent behavior.
+# ---------------------------------------------------------------------------
+
+# Same TTL as Core's AWAITING_TTL_SECONDS — a slot must never outlive the
+# pending it points at.
+_H1_PROPOSAL_SLOT_TTL_SECONDS = 900.0
+_H1_PROPOSAL_MAX_KEYS = 256
+
+# Per-turn dispatch scope, published by the adapter's ``_on_message`` right
+# before dispatch (ContextVar: the background processing task inherits a
+# copy at creation, so the delivery record points see exactly this turn's
+# source/text — generation-correlated, never "chat latest outbound", I3).
+_h1_dispatch_scope: contextvars.ContextVar = contextvars.ContextVar(
+    "h1_intake_dispatch_scope", default=None
+)
+
+
+def set_h1_dispatch_scope(*, source, text, message_id):
+    _h1_dispatch_scope.set(
+        {"source": source, "text": text, "message_id": message_id}
+    )
+
+
+def h1_dispatch_scope():
+    return _h1_dispatch_scope.get()
+
+
+def session_key_for_h1(adapter, source):
+    """Session key for the proposal slot — derived exactly like base.py's."""
+    from gateway.session import build_session_key
+
+    extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+    return build_session_key(
+        source,
+        group_sessions_per_user=extra.get("group_sessions_per_user", True),
+        thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+    )
+
+
+def current_h1_generation(adapter, session_key):
+    """The gateway run generation bound to the session's active interrupt
+    event (run.py ``_bind_adapter_run_generation``), or None when unknown."""
+    active = getattr(adapter, "_active_sessions", None) or {}
+    event = active.get(session_key)
+    return getattr(event, "_hermes_run_generation", None) if event is not None else None
+
+
+def slot_h1_proposal(adapter, session_key, *, pending, source, generation):
+    """One-shot proposal slot.  Returns ``None`` when the slot was taken,
+    ``"already_slotted"`` for an idempotent repeat of the SAME operation
+    (message redelivery, M5), or ``"slot_busy"`` when a different proposal
+    is already slotted for this session (one proposal per turn)."""
+    if not session_key:
+        return "slot_busy"
+    slots = getattr(adapter, "_h1_proposal_slots", None)
+    if slots is None:
+        slots = adapter._h1_proposal_slots = {}
+    now = time.monotonic()
+    for key in [k for k, s in slots.items() if s["expires_at"] <= now]:
+        slots.pop(key, None)
+    existing = slots.get(session_key)
+    if existing is not None:
+        if existing["pending"].get("operation_id") == pending.get("operation_id"):
+            return "already_slotted"
+        return "slot_busy"
+    if len(slots) >= _H1_PROPOSAL_MAX_KEYS:
+        slots.pop(next(iter(slots)), None)
+    slots[session_key] = {
+        "pending": pending,
+        "source": source,
+        "session_key": session_key,
+        "generation": generation,
+        "expires_at": now + _H1_PROPOSAL_SLOT_TTL_SECONDS,
+    }
+    return None
+
+
+def pop_h1_proposal_slot(adapter, session_key):
+    slots = getattr(adapter, "_h1_proposal_slots", None)
+    if not slots:
+        return None
+    return slots.pop(session_key, None)
+
+
+def record_h1_run_outcome(adapter, session_key, generation, outcome):
+    """Capture the run outcome for the post-delivery install gate."""
+    if not session_key or generation is None:
+        return
+    outcomes = getattr(adapter, "_h1_run_outcomes", None)
+    if outcomes is None:
+        outcomes = adapter._h1_run_outcomes = {}
+    if len(outcomes) >= _H1_PROPOSAL_MAX_KEYS:
+        outcomes.pop(next(iter(outcomes)), None)
+    outcomes[(session_key, int(generation))] = outcome
+
+
+def record_h1_final_reply_delivery(adapter, session_key, generation, message_id):
+    """Record the delivered final reply id for (session, generation)."""
+    if not session_key or generation is None or not message_id:
+        return
+    records = getattr(adapter, "_h1_final_reply_records", None)
+    if records is None:
+        records = adapter._h1_final_reply_records = {}
+    if len(records) >= _H1_PROPOSAL_MAX_KEYS:
+        records.pop(next(iter(records)), None)
+    records[(session_key, int(generation))] = message_id
+
+
+def capture_h1_run_outcome(adapter, event, outcome):
+    """on_processing_complete seam: capture the outcome against the run's
+    (session_key, generation) — the install gate's SUCCESS evidence."""
+    source = getattr(event, "source", None)
+    if source is None:
+        return
+    try:
+        session_key = session_key_for_h1(adapter, source)
+    except Exception:
+        return
+    generation = current_h1_generation(adapter, session_key)
+    record_h1_run_outcome(adapter, session_key, generation, outcome)
+
+
+def _failure_receipt_marked() -> bool:
+    """True when the turn's outgoing final reply was stamped as a failure
+    receipt at its production point (Core gateway.honest_failure, R3).
+
+    An old Core without the helper cannot tell a sanitized provider-error
+    receipt from the agent's own words — fail closed (treat as marked):
+    the record is skipped, the proposal simply never installs.
+    """
+    try:
+        from gateway.honest_failure import is_failure_receipt
+
+        return bool(is_failure_receipt())
+    except Exception:  # noqa: BLE001 - no mark readable => fail closed
+        return True
+
+
+def record_h1_final_reply(adapter, message_id):
+    """Delivery record point for the turn's final reply (card finalize /
+    final card send success).  Records ONLY when the turn's dispatch scope
+    is known and the reply is NOT a stamped failure receipt (R3)."""
+    if not message_id:
+        return
+    if _failure_receipt_marked():
+        logger.debug(
+            "[%s] H1 final-reply record skipped: failure receipt",
+            getattr(adapter, "name", "dingtalk"),
+        )
+        return
+    scope = _h1_dispatch_scope.get()
+    if not scope or scope.get("source") is None:
+        return
+    try:
+        session_key = session_key_for_h1(adapter, scope["source"])
+    except Exception:
+        return
+    generation = current_h1_generation(adapter, session_key)
+    record_h1_final_reply_delivery(adapter, session_key, generation, message_id)
+
+
+def _outcome_is_success(outcome) -> bool:
+    return getattr(outcome, "name", outcome) == "SUCCESS"
+
+
+async def install_h1_proposal_after_delivery(adapter, session_key):
+    """C1 post-delivery gate — the ONLY pending install point for proposals.
+
+    Atomic three steps behind one check: ① the turn ended outcome==SUCCESS
+    AND a generation-matched NON-RECEIPT final-reply delivery record exists
+    (R3: failure receipts never record); ② re-read state (drift recheck)
+    and ``_cas_install_prompt`` the slotted pending; ③ register the prompt
+    triple against the delivered final reply's message id.  Any failure
+    drops the slot with a warning — nothing was installed, nothing to
+    withdraw (C1).
+    """
+    slot = pop_h1_proposal_slot(adapter, session_key)
+    if slot is None:
+        return
+    name = getattr(adapter, "name", "dingtalk")
+    generation = slot["generation"]
+    outcome = (getattr(adapter, "_h1_run_outcomes", None) or {}).get(
+        (session_key, generation)
+    )
+    delivered_id = (getattr(adapter, "_h1_final_reply_records", None) or {}).get(
+        (session_key, generation)
+    )
+    if not _outcome_is_success(outcome) or not delivered_id:
+        logger.warning(
+            "[%s] H1 intake proposal dropped: delivery gate unmet "
+            "(outcome=%r, final_reply_recorded=%s); nothing was installed",
+            name,
+            outcome,
+            bool(delivered_id),
+        )
+        return
+    pending = slot["pending"]
+    source = slot["source"]
+    try:
+        from gateway.task_intake import (
+            _awaiting_is_live,
+            _cas_install_prompt,
+            _state_copy,
+        )
+    except Exception:  # noqa: BLE001 - old Core without the helpers
+        logger.warning(
+            "[%s] H1 intake proposal dropped: Core install helpers unavailable",
+            name,
+        )
+        return
+
+    def _install():
+        state = _state_copy(adapter._session_store.get_task_state(source))
+        existing = state.get("pending_confirmation")
+        if isinstance(existing, dict) and (
+            existing.get("state") == "applying"
+            or _awaiting_is_live(existing, time.time())
+        ):
+            return "drift"
+        replacement, install_error = _cas_install_prompt(
+            adapter._session_store,
+            source,
+            state,
+            pending,
+            str(pending.get("original_text") or ""),
+        )
+        if install_error is not None or replacement is None:
+            return None
+        return replacement
+
+    try:
+        installed = await asyncio.to_thread(_install)
+    except Exception:  # noqa: BLE001 - the delivery already happened; never crash
+        logger.warning(
+            "[%s] H1 intake proposal install raised; nothing was installed",
+            name,
+            exc_info=True,
+        )
+        return
+    if installed is None or installed == "drift":
+        logger.warning(
+            "[%s] H1 intake proposal not installed (state drift or CAS "
+            "failure); nothing was installed",
+            name,
+        )
+        return
+    register_intake_prompt(
+        adapter._intake_prompt_msgs,
+        getattr(source, "chat_id", None),
+        delivered_id,
+        pending.get("operation_id"),
+        pending.get("phase"),
+        pending.get("target_digest"),
+    )

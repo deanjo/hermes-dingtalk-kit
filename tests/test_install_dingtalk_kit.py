@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / ".baseline/hermes"
 SCRIPT = ROOT / "scripts/install_dingtalk_kit.py"
 DOCKERFILE = ROOT / "docker/Dockerfile"
-EXPECTED_VERIFIER_CHECKS = 54
+EXPECTED_VERIFIER_CHECKS = 59
 
 
 def load_installer():
@@ -58,8 +58,10 @@ class InstallDingTalkKitTest(unittest.TestCase):
                 "target.resolve",
                 "dingtalk.source",
                 "product_confirmation.source",
+                "h1_intake_proposal.source",
                 "dingtalk.copy",
                 "product_confirmation.copy",
+                "h1_intake_proposal.copy",
                 "compat.apply",
                 "post_install.verify",
             ],
@@ -75,8 +77,11 @@ class InstallDingTalkKitTest(unittest.TestCase):
         self.assertTrue((root / "plugins/product_confirmation/__init__.py").is_file())
         self.assertTrue((root / "plugins/product_confirmation/store.py").is_file())
         self.assertTrue((root / "plugins/product_confirmation/tools.py").is_file())
+        self.assertTrue((root / "plugins/h1_intake_proposal/__init__.py").is_file())
+        self.assertTrue((root / "plugins/h1_intake_proposal/plugin.yaml").is_file())
+        self.assertTrue((root / "plugins/h1_intake_proposal/tools.py").is_file())
         self.assertEqual(
-            ["plugins/platforms/dingtalk", "plugins/product_confirmation"],
+            ["plugins/platforms/dingtalk", "plugins/product_confirmation", "plugins/h1_intake_proposal"],
             report["owned_plugin_paths"],
         )
 
@@ -91,7 +96,7 @@ class InstallDingTalkKitTest(unittest.TestCase):
 
         self.assertTrue(second["ok"], second)
         self.assertEqual(0, second["compat"]["changed_count"], second)
-        for operation_name in ("dingtalk.copy", "product_confirmation.copy"):
+        for operation_name in ("dingtalk.copy", "product_confirmation.copy", "h1_intake_proposal.copy"):
             plugin_copy = next(
                 item for item in second["operations"] if item["name"] == operation_name
             )

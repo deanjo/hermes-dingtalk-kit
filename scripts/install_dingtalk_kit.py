@@ -43,6 +43,13 @@ PRODUCT_PLUGIN_FILES = (
     "store.py",
     "tools.py",
 )
+SOURCE_H1_PLUGIN_DIR = ROOT / "overlays/hermes/plugins/h1_intake_proposal"
+H1_PLUGIN_REL = Path("plugins/h1_intake_proposal")
+H1_PLUGIN_FILES = (
+    "__init__.py",
+    "plugin.yaml",
+    "tools.py",
+)
 CORE_REL_PATHS = (
     Path("gateway/run.py"),
     Path("gateway/session.py"),
@@ -347,8 +354,11 @@ def build_report(target: Path, *, plugins_only: bool = False) -> dict[str, Any]:
         "product_confirmation": _source_manifest(
             SOURCE_PRODUCT_PLUGIN_DIR, PRODUCT_PLUGIN_FILES
         ),
+        "h1_intake_proposal": _source_manifest(
+            SOURCE_H1_PLUGIN_DIR, H1_PLUGIN_FILES
+        ),
     }
-    owned_plugin_paths = [str(PLUGIN_REL), str(PRODUCT_PLUGIN_REL)]
+    owned_plugin_paths = [str(PLUGIN_REL), str(PRODUCT_PLUGIN_REL), str(H1_PLUGIN_REL)]
 
     def finish(
         *,
@@ -406,6 +416,11 @@ def build_report(target: Path, *, plugins_only: bool = False) -> dict[str, Any]:
             PRODUCT_PLUGIN_FILES,
             "product_confirmation.source",
         ),
+        _validate_source_plugin(
+            SOURCE_H1_PLUGIN_DIR,
+            H1_PLUGIN_FILES,
+            "h1_intake_proposal.source",
+        ),
     ]
     operations.extend(source_checks)
     if any(check.status != "ok" for check in source_checks):
@@ -430,6 +445,11 @@ def build_report(target: Path, *, plugins_only: bool = False) -> dict[str, Any]:
                     temp_root,
                     "previous_product_confirmation_plugin",
                 ),
+                _take_tree_snapshot(
+                    root / H1_PLUGIN_REL,
+                    temp_root,
+                    "previous_h1_intake_proposal_plugin",
+                ),
             ]
             operations.append(
                 _install_plugin_tree(
@@ -449,6 +469,16 @@ def build_report(target: Path, *, plugins_only: bool = False) -> dict[str, Any]:
                     PRODUCT_PLUGIN_FILES,
                     "product_confirmation.copy",
                     "staged_product_confirmation_plugin",
+                )
+            )
+            operations.append(
+                _install_plugin_tree(
+                    SOURCE_H1_PLUGIN_DIR,
+                    root / H1_PLUGIN_REL,
+                    temp_root,
+                    H1_PLUGIN_FILES,
+                    "h1_intake_proposal.copy",
+                    "staged_h1_intake_proposal_plugin",
                 )
             )
 

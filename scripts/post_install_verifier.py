@@ -47,6 +47,12 @@ PRODUCT_PLUGIN_FILES = (
     "tools.py",
 )
 PRODUCT_PLUGIN_REL = Path("plugins/product_confirmation")
+H1_PLUGIN_FILES = (
+    "__init__.py",
+    "plugin.yaml",
+    "tools.py",
+)
+H1_PLUGIN_REL = Path("plugins/h1_intake_proposal")
 FAILURE_STATUSES = {"error", "failed", "missing-file"}
 
 
@@ -813,8 +819,14 @@ def build_report(target: Path, *, require_compat: bool = True) -> dict[str, Any]
                 PRODUCT_PLUGIN_FILES,
                 "product",
             )
-            results.extend(plugin_results + product_results)
-            if not _has_failure(plugin_results + product_results):
+            h1_results = _check_plugin_files(
+                root,
+                H1_PLUGIN_REL,
+                H1_PLUGIN_FILES,
+                "h1_intake_proposal",
+            )
+            results.extend(plugin_results + product_results + h1_results)
+            if not _has_failure(plugin_results + product_results + h1_results):
                 results.extend(
                     [
                         _run_check("plugin.manifest", str(PLUGIN_REL / "plugin.yaml"), lambda: _assert_plugin_manifest(root)),
