@@ -62,6 +62,7 @@ def load_send_function():
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
+    mark_calls = []
     namespace = {
         "SendResult": SendResult,
         "logger": FakeLogger(),
@@ -69,9 +70,15 @@ def load_send_function():
         "uuid": SimpleNamespace(
             uuid4=lambda: SimpleNamespace(hex="1234567890abcdef")
         ),
+        # V2 delivery flag point (I1: webhook fallback also flags delivery).
+        "mark_h1_turn_delivered": lambda *args, **kwargs: mark_calls.append(
+            (args, kwargs)
+        ),
     }
     exec(compile(module, str(ADAPTER_PATH), "exec"), namespace)
-    return namespace["send"]
+    module_send = namespace["send"]
+    module_send._mark_calls = mark_calls
+    return module_send
 
 
 class FakeResponse:

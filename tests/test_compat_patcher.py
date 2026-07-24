@@ -29,6 +29,19 @@ def load_module(path: Path, name: str):
     return module
 
 
+def _revert_step(root: Path, step) -> None:
+    """Revert one step's patched form back to its pre-patch anchor so the
+    patcher can re-apply it.  Needed because the 2026-07-24 baseline
+    refresh made the shipped gateway files already fully patched."""
+    path = root / step.path
+    text = path.read_text(encoding="utf-8")
+    for old, new in step.replacements():
+        if new in text:
+            path.write_text(text.replace(new, old, 1), encoding="utf-8")
+            return
+    raise AssertionError(f"{step.name}: no patched variant found in {step.path}")
+
+
 class CompatPatcherTest(unittest.TestCase):
     def setUp(self):
         self.patcher = load_patcher()
@@ -43,6 +56,16 @@ class CompatPatcherTest(unittest.TestCase):
     def test_apply_is_idempotent_and_verifiable(self):
         root = self.make_target()
 
+        # The 2026-07-24 baseline refresh ships the gateway files already
+        # fully patched: the patcher is an idempotent no-op on them.
+        check_report = self.patcher.build_report(root, "check")
+        self.assertTrue(check_report["ok"], check_report)
+        self.assertEqual(0, check_report["changed_count"], check_report)
+
+        # Revert every step to its pre-patch anchor: the patcher must then
+        # re-apply exactly the three files, and no-op on the second pass.
+        for step in self.patcher.STEPS:
+            _revert_step(root, step)
         check_report = self.patcher.build_report(root, "check")
         self.assertTrue(check_report["ok"], check_report)
         self.assertEqual(3, check_report["changed_count"], check_report)
@@ -97,8 +120,14 @@ class CompatPatcherTest(unittest.TestCase):
         root = self.make_target()
         run_py = root / "gateway/run.py"
         original = run_py.read_text(encoding="utf-8")
+        # The refreshed baseline is already patched: damaging the marker
+        # line itself makes the step unresolvable (no marker match, and the
+        # pre-patch anchor is gone from a patched tree) — it must stop
+        # without writing anything.
         run_py.write_text(
-            original.replace("            reply_snippet = event.reply_to_text[:500]\n", ""),
+            original.replace(
+                "            if event.reply_to_text == _REPLY_ORIGINAL_UNAVAILABLE:\n", ""
+            ),
             encoding="utf-8",
         )
         damaged = run_py.read_text(encoding="utf-8")
@@ -144,6 +173,12 @@ class CompatPatcherTest(unittest.TestCase):
 
     def test_write_failure_rolls_back_prior_files(self):
         root = self.make_target()
+        # Give the patcher real work first: revert the run.py and session.py
+        # steps to their pre-patch anchors (the refreshed baseline ships
+        # them already patched), so an apply must write both files.
+        for step in self.patcher.STEPS:
+            if step.path in {"gateway/run.py", "gateway/session.py"}:
+                _revert_step(root, step)
         before = {
             path: (root / path).read_text(encoding="utf-8")
             for path in (

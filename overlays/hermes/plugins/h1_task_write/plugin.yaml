@@ -1,0 +1,11 @@
+name: h1_task_write
+version: 0.1.0
+description: "H1 V2 thin write gate — h1_declare_proposal plus the four write tools (create_task / bind_task / switch_task / unbind_task). The agent declares a structured proposal (one fact record, proposal_id returned); each write tool then takes ONLY proposal_id + confirm_msg_id and code checks structural facts: proposal exists, delivered, unexpired, unconsumed (three-state consumption), the confirm id is the real inbound msgId, and the user is the declaring one. Business arguments are always taken from the declared record (所建即所见, C1). Standalone: opt in via `plugins.enabled`."
+author: openclaw-harmes
+kind: standalone
+provides_tools:
+  - h1_declare_proposal
+  - create_task
+  - bind_task
+  - switch_task
+  - unbind_task

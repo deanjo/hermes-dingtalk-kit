@@ -1,7 +1,0 @@
-name: h1_intake_proposal
-version: 0.1.0
-description: "H1 intake proposal seam — one narrow tool (h1_intake_propose) for the H1 agent to propose task intake (create a task / bind an existing task / create a project). Code validates and slots the proposal only; the confirmation pending installs after the turn's non-receipt final reply is provably delivered (C1), and nothing reaches Kanban without the user's next-message confirmation. Identity comes from the platform event, never from model arguments. Standalone: opt in via `plugins.enabled`."
-author: openclaw-harmes
-kind: standalone
-provides_tools:
-  - h1_intake_propose

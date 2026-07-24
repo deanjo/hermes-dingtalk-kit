@@ -41,8 +41,8 @@ class PostInstallVerifierTest(unittest.TestCase):
             root / "plugins/product_confirmation",
         )
         shutil.copytree(
-            OVERLAY / "plugins/h1_intake_proposal",
-            root / "plugins/h1_intake_proposal",
+            OVERLAY / "plugins/h1_task_write",
+            root / "plugins/h1_task_write",
         )
         return root
 
@@ -61,10 +61,10 @@ class PostInstallVerifierTest(unittest.TestCase):
         self.assertIn("product.manifest", check_names)
         self.assertIn("product.entry", check_names)
         self.assertIn("product.public_hook_contract", check_names)
-        self.assertIn("h1_intake_proposal.file.__init__.py", check_names)
-        self.assertIn("h1_intake_proposal.file.plugin.yaml", check_names)
-        self.assertIn("h1_intake_proposal.file.tools.py", check_names)
-        self.assertIn("h1_intake_proposal.line_count.tools.py", check_names)
+        self.assertIn("h1_task_write.file.__init__.py", check_names)
+        self.assertIn("h1_task_write.file.plugin.yaml", check_names)
+        self.assertIn("h1_task_write.file.tools.py", check_names)
+        self.assertIn("h1_task_write.line_count.tools.py", check_names)
         self.assertIn("gateway.session_key_slash", check_names)
         self.assertIn("gateway.session_context_bridge", check_names)
         runtime = next(item for item in report["checks"] if item["name"] == "plugin.runtime_discovery")

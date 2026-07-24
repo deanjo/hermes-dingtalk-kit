@@ -118,8 +118,8 @@ try:
         _log_forward_diag,
         build_reply_kwargs,
     )
-    from .task_binding import resolve_gateway_profile, resolve_task_binding, run_natural_intake_gate
-    from .task_binding import validate_natural_intake_classifier_config, capture_h1_run_outcome, gate_bound_reply_kwargs, record_h1_final_reply
+    from .task_binding import resolve_gateway_profile, resolve_task_binding
+    from .task_binding import restore_h1_binding, set_h1_dispatch_scope, mark_h1_turn_delivered, h1_turn_meta_lines, is_h1_failure_receipt
 except ImportError:
     import sys
     from pathlib import Path
@@ -138,8 +138,8 @@ except ImportError:
         _log_forward_diag,
         build_reply_kwargs,
     )
-    from task_binding import resolve_gateway_profile, resolve_task_binding, run_natural_intake_gate  # type: ignore
-    from task_binding import validate_natural_intake_classifier_config, capture_h1_run_outcome, gate_bound_reply_kwargs, record_h1_final_reply  # type: ignore
+    from task_binding import resolve_gateway_profile, resolve_task_binding  # type: ignore
+    from task_binding import restore_h1_binding, set_h1_dispatch_scope, mark_h1_turn_delivered, h1_turn_meta_lines, is_h1_failure_receipt  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -272,15 +272,11 @@ class DingTalkAdapter(BasePlatformAdapter):
         # doesn't drop them mid-flight, and we can cancel them on disconnect.
         self._bg_tasks: Set[asyncio.Task] = set()
         self._gateway_profile: Optional[str] = resolve_gateway_profile()  # owning multiplex profile
-        # R9 #3 (D6) + R2 C1/C2: chat_id -> {msg_id: (op, phase, digest, expires_at)}; see task_binding.
-        self._intake_prompt_msgs: Dict[str, Dict[str, tuple]] = {}
 
     # -- Connection lifecycle -----------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to DingTalk via Stream Mode."""
-        # R2 C3: malformed classifier config => CRITICAL startup log (never aborts).
-        validate_natural_intake_classifier_config(self.config.extra or {}, self.name)
         if not DINGTALK_STREAM_AVAILABLE:
             logger.warning(
                 "[%s] dingtalk-stream not installed. Run: pip install 'dingtalk-stream>=0.20'",
@@ -474,12 +470,9 @@ class DingTalkAdapter(BasePlatformAdapter):
                 )
 
     def _fire_done_reaction(self, chat_id: str) -> None:
-        """Swap 🤔Thinking → 🥳Done on the original user message.
-
-        Idempotent per chat_id — safe to call from segment-break flushes
-        and final-done flushes without double-firing.
-        """
-        if chat_id in self._done_emoji_fired:
+        """Swap 🤔Thinking → 🥳Done (idempotent per chat).  B4: never fire
+        Done on a turn whose final reply is a stamped failure receipt."""
+        if chat_id in self._done_emoji_fired or is_h1_failure_receipt():
             return
         self._done_emoji_fired.add(chat_id)
         msg = self._message_contexts.get(chat_id)
@@ -622,7 +615,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.debug("[%s] Empty message, skipping", self.name)
             return
 
-        task_binding, intake_bound = None, False
+        task_binding = None
         if (text or "").lstrip().startswith("#任务"):
             parsed_task_message = await resolve_task_binding(
                 self, text or "", chat_id=chat_id, message_id=msg_id,
@@ -642,15 +635,23 @@ class DingTalkAdapter(BasePlatformAdapter):
         )
         if task_binding:  # build_source() rejects the Kanban kwargs — stamp directly.
             source.board_slug, source.task_id = task_binding.board_slug, task_binding.task_id
-        # Natural task intake seam — R9 #3 quote registry, R9 #6 media binding
-        # restore, R9 #9 sender fail-closed (task_binding.run_natural_intake_gate).
-        gate = await run_natural_intake_gate(
-            self, source, text, msg_id, chat_id, message,
-            media_urls=media_urls, has_stable_sender=has_stable_sender, task_binding=task_binding,
-        )
-        if gate.handled:
-            return
-        source, text, intake_bound = gate.source, gate.text, gate.control_consumed
+        # V2 thin gate (D3): slash / #任务 already short-circuited above;
+        # the classifier bridge and intake gate are gone.  With the feature
+        # flag off the message passes through byte-compatibly (same as V1).
+        if (self.config.extra or {}).get("natural_task_intake") is True:
+            # Anonymous senders skipped (log only); dispatch scope set for
+            # every gated message; restore + meta apply to natural content.
+            if not has_stable_sender:
+                logger.warning("[%s] Message skipped: no stable sender identity", self.name)
+                return
+            set_h1_dispatch_scope(source=source, text=text, message_id=msg_id)
+            if task_binding is None and not (text or "").lstrip().startswith("/"):
+                source = await restore_h1_binding(self, source)
+                meta_lines = h1_turn_meta_lines(
+                    self, chat_id=chat_id, sender_user=sender_id or sender_staff_id, msg_id=msg_id
+                )
+                if meta_lines:
+                    text = f"{text}\n\n" + "\n".join(meta_lines) if text else "\n".join(meta_lines)
         if is_group and not (text or "").lstrip().startswith("/"):
             mention_meta = mention_meta_line(message, self.config.extra or {})
             if mention_meta:
@@ -665,9 +666,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
         # T27: surface reply-to context for text quotes so the gateway can
-        # inject a disambiguation pointer (file quotes keep the document
-        # path; failures degrade to "no reply context", never a breakage).
-        reply_kwargs = gate_bound_reply_kwargs(gate) if intake_bound else build_reply_kwargs(message)
+        # inject a disambiguation pointer (failures degrade to no context).
+        reply_kwargs = build_reply_kwargs(message)
         # A reply ID without the quoted text is not enough to identify the task.
         # Stop before MessageEvent reaches the model: guessing here can make Hermes
         # answer a different topic from the one the user actually quoted.
@@ -755,9 +755,6 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     # -- Outbound messaging -------------------------------------------------
 
-    async def on_processing_complete(self, event, outcome) -> None:
-        capture_h1_run_outcome(self, event, outcome)  # H1 C1 outcome capture
-
     async def send(
         self,
         chat_id: str,
@@ -837,7 +834,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                 if is_final_reply:
                     # Final reply: card closed, swap Thinking → Done.
                     self._fire_done_reaction(chat_id)
-                    record_h1_final_reply(self, result.message_id)  # H1 C1 delivery evidence
+                    mark_h1_turn_delivered(self, chat_id=chat_id, message_id=result.message_id)
                 else:
                     # Intermediate (tool progress / commentary / streaming
                     # first chunk): keep the card open and track it so the
@@ -887,12 +884,15 @@ class DingTalkAdapter(BasePlatformAdapter):
                         raw_response={"delivery_outcome": "rejected"},
                     )
                 # Webhook path: fire Done only for final replies, same as
-                # the card path.
+                # the card path; flags delivery too (I1: the kit knows the
+                # send succeeded — no quote authentication in V2).
+                _webhook_out_id = uuid.uuid4().hex[:12]
                 if is_final_reply:
                     self._fire_done_reaction(chat_id)
+                    mark_h1_turn_delivered(self, chat_id=chat_id, message_id=_webhook_out_id)
                 return SendResult(
                     success=True,
-                    message_id=uuid.uuid4().hex[:12],
+                    message_id=_webhook_out_id,
                     raw_response={"delivery_outcome": "delivered"},
                 )
             body = resp.text
@@ -1163,7 +1163,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                     self.name, message_id,
                 )
                 self._fire_done_reaction(chat_id)
-                record_h1_final_reply(self, message_id)  # H1 C1 delivery evidence
+                mark_h1_turn_delivered(self, chat_id=chat_id, message_id=message_id)
             else:
                 # Non-final edit reopens the card into streaming state —
                 # track it so the next send() can auto-close it as a

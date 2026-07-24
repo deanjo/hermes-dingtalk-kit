@@ -58,16 +58,16 @@ class InstallDingTalkKitTest(unittest.TestCase):
                 "target.resolve",
                 "dingtalk.source",
                 "product_confirmation.source",
-                "h1_intake_proposal.source",
+                "h1_task_write.source",
                 "dingtalk.copy",
                 "product_confirmation.copy",
-                "h1_intake_proposal.copy",
+                "h1_task_write.copy",
                 "compat.apply",
                 "post_install.verify",
             ],
             [item["name"] for item in report["operations"]],
         )
-        self.assertEqual(3, report["compat"]["changed_count"], report)
+        self.assertEqual(0, report["compat"]["changed_count"], report)
         self.assertEqual(EXPECTED_VERIFIER_CHECKS, report["verifier"]["check_count"], report)
         self.assertEqual(0, report["verifier"]["failure_count"], report)
         self.assertTrue((root / "plugins/platforms/dingtalk/adapter.py").is_file())
@@ -77,11 +77,11 @@ class InstallDingTalkKitTest(unittest.TestCase):
         self.assertTrue((root / "plugins/product_confirmation/__init__.py").is_file())
         self.assertTrue((root / "plugins/product_confirmation/store.py").is_file())
         self.assertTrue((root / "plugins/product_confirmation/tools.py").is_file())
-        self.assertTrue((root / "plugins/h1_intake_proposal/__init__.py").is_file())
-        self.assertTrue((root / "plugins/h1_intake_proposal/plugin.yaml").is_file())
-        self.assertTrue((root / "plugins/h1_intake_proposal/tools.py").is_file())
+        self.assertTrue((root / "plugins/h1_task_write/__init__.py").is_file())
+        self.assertTrue((root / "plugins/h1_task_write/plugin.yaml").is_file())
+        self.assertTrue((root / "plugins/h1_task_write/tools.py").is_file())
         self.assertEqual(
-            ["plugins/platforms/dingtalk", "plugins/product_confirmation", "plugins/h1_intake_proposal"],
+            ["plugins/platforms/dingtalk", "plugins/product_confirmation", "plugins/h1_task_write"],
             report["owned_plugin_paths"],
         )
 
@@ -96,7 +96,7 @@ class InstallDingTalkKitTest(unittest.TestCase):
 
         self.assertTrue(second["ok"], second)
         self.assertEqual(0, second["compat"]["changed_count"], second)
-        for operation_name in ("dingtalk.copy", "product_confirmation.copy", "h1_intake_proposal.copy"):
+        for operation_name in ("dingtalk.copy", "product_confirmation.copy", "h1_task_write.copy"):
             plugin_copy = next(
                 item for item in second["operations"] if item["name"] == operation_name
             )

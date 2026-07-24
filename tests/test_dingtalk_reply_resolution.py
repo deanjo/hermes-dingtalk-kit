@@ -48,20 +48,6 @@ def load_reply_context():
     return module
 
 
-def load_task_binding():
-    """Load the real task_binding.py so the intake gate is the real one.
-
-    These reply-resolution tests run with ``natural_task_intake`` off, so the
-    gate short-circuits before any Core import — no gateway fake is needed.
-    """
-    name = "dingtalk_task_binding_resolution_uut"
-    spec = importlib.util.spec_from_file_location(name, BINDING_PATH)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 def load_on_message(reply_context):
     tree = ast.parse(ADAPTER_PATH.read_text(encoding="utf-8"), filename=str(ADAPTER_PATH))
     method = None
@@ -123,7 +109,6 @@ def load_on_message(reply_context):
         "is_user_allowed": lambda *args, **kwargs: True,
         "logger": FakeLogger(),
         "mention_meta_line": lambda *args, **kwargs: "",
-        "run_natural_intake_gate": load_task_binding().run_natural_intake_gate,
         "should_process_message": lambda *args, **kwargs: True,
         "timezone": timezone,
         "uuid": SimpleNamespace(uuid4=lambda: SimpleNamespace(hex="generated-message-id")),

@@ -52,7 +52,7 @@ H1_PLUGIN_FILES = (
     "plugin.yaml",
     "tools.py",
 )
-H1_PLUGIN_REL = Path("plugins/h1_intake_proposal")
+H1_PLUGIN_REL = Path("plugins/h1_task_write")
 FAILURE_STATUSES = {"error", "failed", "missing-file"}
 
 
@@ -823,7 +823,7 @@ def build_report(target: Path, *, require_compat: bool = True) -> dict[str, Any]
                 root,
                 H1_PLUGIN_REL,
                 H1_PLUGIN_FILES,
-                "h1_intake_proposal",
+                "h1_task_write",
             )
             results.extend(plugin_results + product_results + h1_results)
             if not _has_failure(plugin_results + product_results + h1_results):

@@ -43,8 +43,8 @@ PRODUCT_PLUGIN_FILES = (
     "store.py",
     "tools.py",
 )
-SOURCE_H1_PLUGIN_DIR = ROOT / "overlays/hermes/plugins/h1_intake_proposal"
-H1_PLUGIN_REL = Path("plugins/h1_intake_proposal")
+SOURCE_H1_PLUGIN_DIR = ROOT / "overlays/hermes/plugins/h1_task_write"
+H1_PLUGIN_REL = Path("plugins/h1_task_write")
 H1_PLUGIN_FILES = (
     "__init__.py",
     "plugin.yaml",
@@ -354,7 +354,7 @@ def build_report(target: Path, *, plugins_only: bool = False) -> dict[str, Any]:
         "product_confirmation": _source_manifest(
             SOURCE_PRODUCT_PLUGIN_DIR, PRODUCT_PLUGIN_FILES
         ),
-        "h1_intake_proposal": _source_manifest(
+        "h1_task_write": _source_manifest(
             SOURCE_H1_PLUGIN_DIR, H1_PLUGIN_FILES
         ),
     }
@@ -419,7 +419,7 @@ def build_report(target: Path, *, plugins_only: bool = False) -> dict[str, Any]:
         _validate_source_plugin(
             SOURCE_H1_PLUGIN_DIR,
             H1_PLUGIN_FILES,
-            "h1_intake_proposal.source",
+            "h1_task_write.source",
         ),
     ]
     operations.extend(source_checks)
@@ -448,7 +448,7 @@ def build_report(target: Path, *, plugins_only: bool = False) -> dict[str, Any]:
                 _take_tree_snapshot(
                     root / H1_PLUGIN_REL,
                     temp_root,
-                    "previous_h1_intake_proposal_plugin",
+                    "previous_h1_task_write_plugin",
                 ),
             ]
             operations.append(
@@ -477,8 +477,8 @@ def build_report(target: Path, *, plugins_only: bool = False) -> dict[str, Any]:
                     root / H1_PLUGIN_REL,
                     temp_root,
                     H1_PLUGIN_FILES,
-                    "h1_intake_proposal.copy",
-                    "staged_h1_intake_proposal_plugin",
+                    "h1_task_write.copy",
+                    "staged_h1_task_write_plugin",
                 )
             )
 
