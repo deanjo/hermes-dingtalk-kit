@@ -26,6 +26,7 @@ from typing import Optional
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER_PATH = ROOT / "overlays/hermes/plugins/platforms/dingtalk/adapter.py"
 BINDING_PATH = ROOT / "overlays/hermes/plugins/platforms/dingtalk/task_binding.py"
+MENTIONS_PATH = ROOT / "overlays/hermes/plugins/platforms/dingtalk/mentions.py"
 REPLY_CONTEXT_PATH = ROOT / "overlays/hermes/plugins/platforms/dingtalk/reply_context.py"
 SESSION_PATH = ROOT / "overlays/hermes/gateway/session.py"
 
@@ -85,6 +86,18 @@ def load_task_binding_module():
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def load_stamp_group_text():
+    """The real group-text stamp helper the adapter imports from mentions.py."""
+    import importlib.util
+
+    name = "dingtalk_mentions_for_gate_uut"
+    spec = importlib.util.spec_from_file_location(name, MENTIONS_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.stamp_group_text
 
 
 def load_on_message(*, with_media=False):
@@ -157,6 +170,7 @@ def load_on_message(*, with_media=False):
         "restore_h1_binding": task_binding_module.restore_h1_binding,
         "set_h1_dispatch_scope": task_binding_module.set_h1_dispatch_scope,
         "should_process_message": lambda *args, **kwargs: True,
+        "stamp_group_text": load_stamp_group_text(),
         "timezone": timezone,
         "uuid": SimpleNamespace(uuid4=lambda: SimpleNamespace(hex="generated-message-id")),
     }
@@ -363,7 +377,9 @@ class DingTalkThinGateTest(unittest.TestCase):
         self.assertEqual([], calls)
         self.assertEqual([], adapter.sent)
         self.assertEqual(1, len(adapter.events))
-        self.assertEqual("普通聊天", adapter.events[0].text)
+        # Group messages carry the sender-name stamp (F1 ingestion fix);
+        # "byte-compatible" now means no V2 gate additions beyond that stamp.
+        self.assertEqual("Sender: 普通聊天", adapter.events[0].text)
         self.assertIsNone(adapter.events[0].source.board_slug)
 
     def test_missing_sender_skipped_log_only_no_receipt(self):
@@ -415,7 +431,8 @@ class DingTalkThinGateTest(unittest.TestCase):
         event = adapter.events[0]
         self.assertEqual("agong", event.source.board_slug)
         self.assertEqual("t_deadbeef", event.source.task_id)
-        self.assertEqual("联系人为什么没显示", event.text)
+        # Bound remainder still gets the group sender-name stamp (F1).
+        self.assertEqual("Sender: 联系人为什么没显示", event.text)
         self.assertNotIn("消息编号", event.text)
 
     # -- per-message binding restore (D3/M3) ---------------------------------

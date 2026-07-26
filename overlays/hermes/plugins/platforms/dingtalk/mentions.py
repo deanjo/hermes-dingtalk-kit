@@ -160,6 +160,25 @@ def mention_meta_line(message: "ChatbotMessage", extra: dict) -> str:
     )
 
 
+def stamp_group_text(text: str, sender_nick: str, mention_meta: str) -> str:
+    """Group-message ingestion stamp (F1 sender attribution).
+
+    Prefixes the sender's display name (``"冯艳: …"``) so the persisted
+    transcript carries sender identity and session_search (FTS5 trigram,
+    with a LIKE fallback for <3-char CJK tokens) can find people by name;
+    then appends the @-mention meta line. Empty ``text`` collapses to the
+    bare name; empty ``sender_nick`` / ``mention_meta`` are no-ops. Callers
+    skip slash commands so the gateway still sees the leading "/". Core's
+    shared-session ``[user_name]`` prefix detects the "Name: " shape and
+    skips its own prefix, so the name is never doubled.
+    """
+    if sender_nick:
+        text = f"{sender_nick}: {text}" if text else sender_nick
+    if mention_meta:
+        text = f"{text}\n\n{mention_meta}" if text else mention_meta
+    return text
+
+
 def should_process_message(
     *,
     extra: dict,

@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "overlays/hermes/plugins/platforms/dingtalk"
 ADAPTER_PATH = PLUGIN_ROOT / "adapter.py"
 BINDING_PATH = PLUGIN_ROOT / "task_binding.py"
+MENTIONS_PATH = PLUGIN_ROOT / "mentions.py"
 REPLY_CONTEXT_PATH = PLUGIN_ROOT / "reply_context.py"
 
 
@@ -46,6 +47,16 @@ def load_reply_context():
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def load_stamp_group_text():
+    """The real group-text stamp helper the adapter imports from mentions.py."""
+    name = "dingtalk_mentions_for_resolution_uut"
+    spec = importlib.util.spec_from_file_location(name, MENTIONS_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.stamp_group_text
 
 
 def load_on_message(reply_context):
@@ -110,6 +121,7 @@ def load_on_message(reply_context):
         "logger": FakeLogger(),
         "mention_meta_line": lambda *args, **kwargs: "",
         "should_process_message": lambda *args, **kwargs: True,
+        "stamp_group_text": load_stamp_group_text(),
         "timezone": timezone,
         "uuid": SimpleNamespace(uuid4=lambda: SimpleNamespace(hex="generated-message-id")),
     }

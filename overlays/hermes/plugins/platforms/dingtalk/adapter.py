@@ -108,7 +108,7 @@ try:
     from .incoming import make_incoming_handler
     from .markdown import normalize_markdown
     from .media import extract_media
-    from .mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message
+    from .mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message, stamp_group_text
     from .plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup
     from .reply_context import (
         _REPLY_ORIGINAL_UNAVAILABLE,
@@ -128,7 +128,7 @@ except ImportError:
     from incoming import make_incoming_handler  # type: ignore
     from markdown import normalize_markdown  # type: ignore
     from media import extract_media  # type: ignore
-    from mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message  # type: ignore
+    from mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message, stamp_group_text  # type: ignore
     from plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup  # type: ignore
     from reply_context import (  # type: ignore
         _REPLY_ORIGINAL_UNAVAILABLE,
@@ -653,9 +653,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                 if meta_lines:
                     text = f"{text}\n\n" + "\n".join(meta_lines) if text else "\n".join(meta_lines)
         if is_group and not (text or "").lstrip().startswith("/"):
-            mention_meta = mention_meta_line(message, self.config.extra or {})
-            if mention_meta:
-                text = f"{text}\n\n{mention_meta}" if text else mention_meta
+            text = stamp_group_text(text, sender_nick, mention_meta_line(message, self.config.extra or {}))
         create_at = getattr(message, "create_at", None)
         try:
             timestamp = (

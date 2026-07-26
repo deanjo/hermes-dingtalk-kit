@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "overlays/hermes/plugins/platforms/dingtalk"
 ADAPTER_PATH = PLUGIN_ROOT / "adapter.py"
 BINDING_PATH = PLUGIN_ROOT / "task_binding.py"
+MENTIONS_PATH = PLUGIN_ROOT / "mentions.py"
 
 
 class FakeLogger:
@@ -56,6 +57,16 @@ def load_binding_module():
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def load_stamp_group_text():
+    """The real group-text stamp helper the adapter imports from mentions.py."""
+    name = "dingtalk_mentions_for_binding_uut"
+    spec = importlib.util.spec_from_file_location(name, MENTIONS_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.stamp_group_text
 
 
 def load_on_message(binding, *, exists):
@@ -116,6 +127,7 @@ def load_on_message(binding, *, exists):
         "mention_meta_line": lambda *args, **kwargs: "",
         "resolve_task_binding": binding.resolve_task_binding,
         "should_process_message": lambda *args, **kwargs: True,
+        "stamp_group_text": load_stamp_group_text(),
         "timezone": timezone,
         "uuid": SimpleNamespace(uuid4=lambda: SimpleNamespace(hex="generated-message-id")),
     }
@@ -267,7 +279,8 @@ class TaskBindingAdapterTest(unittest.TestCase):
         )
         self.assertEqual([], adapter.sent)
         self.assertEqual(1, len(adapter.events))
-        self.assertEqual("联系人为什么没显示", adapter.events[0].text)
+        # Bound remainder still gets the group sender-name stamp (F1).
+        self.assertEqual("Sender: 联系人为什么没显示", adapter.events[0].text)
         self.assertEqual("agong", adapter.events[0].source.board_slug)
         self.assertEqual("t_deadbeef", adapter.events[0].source.task_id)
 
@@ -290,7 +303,8 @@ class TaskBindingAdapterTest(unittest.TestCase):
         self.assertEqual([], adapter.sent)
         self.assertEqual(1, len(adapter.events))
         self.assertIsNone(adapter.events[0].source.board_slug)
-        self.assertEqual("普通聊天", adapter.events[0].text)
+        # Group messages carry the sender-name stamp (F1 ingestion fix).
+        self.assertEqual("Sender: 普通聊天", adapter.events[0].text)
 
     def test_binding_lookup_runs_off_the_event_loop(self):
         """A locked Kanban SQLite lookup must not stall the event loop.
