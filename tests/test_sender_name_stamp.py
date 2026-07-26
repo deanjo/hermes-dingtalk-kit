@@ -244,7 +244,7 @@ class FakeAdapter:
         return SimpleNamespace(success=True)
 
 
-def make_message(text, *, conversation_type="2", sender_nick="冯艳"):
+def make_message(text, *, conversation_type="2", sender_nick="冯艳", **extra_attrs):
     return SimpleNamespace(
         message_id="incoming-1",
         conversation_id="conversation-1",
@@ -258,6 +258,7 @@ def make_message(text, *, conversation_type="2", sender_nick="冯艳"):
         message_type="text",
         text=SimpleNamespace(content=text, extensions={}),
         _hermes_raw_data={},
+        **extra_attrs,
     )
 
 
@@ -326,6 +327,39 @@ class SenderNameStampTest(unittest.TestCase):
         adapter = self.run_message("在吗", sender_nick="")
         self.assertEqual(1, len(adapter.events))
         self.assertEqual("sender-1: 在吗", adapter.events[0].text)
+
+
+class ConversationTitleChatNameTest(unittest.TestCase):
+    """Group callback ``conversationTitle`` -> ``source.chat_name`` contract.
+
+    session_search browse locates group sessions by the sessions table
+    ``display_name``, which Core's SessionStore stamps from
+    ``source.chat_name``.  The group name only reaches Core because the
+    adapter maps the DingTalk callback's ``conversationTitle`` (exposed by
+    the dingtalk-stream SDK as ``conversation_title``) into
+    ``build_source(chat_name=...)``.  Pin that mapping so a refactor cannot
+    silently regress display_name back to NULL (user-report-20260726).
+    """
+
+    def test_group_conversation_title_becomes_chat_name(self):
+        adapter = FakeAdapter()
+        asyncio.run(
+            load_on_message()(
+                adapter,
+                make_message("报价单发了吗", conversation_title="A供问题日常沟通群"),
+            )
+        )
+        self.assertEqual(1, len(adapter.events))
+        source = adapter.events[0].source
+        self.assertEqual("A供问题日常沟通群", source.chat_name)
+        self.assertEqual("group", source.chat_type)
+
+    def test_missing_conversation_title_yields_none_chat_name(self):
+        """DMs and title-less callbacks must pass None, not a fabricated name."""
+        adapter = FakeAdapter()
+        asyncio.run(load_on_message()(adapter, make_message("在吗")))
+        self.assertEqual(1, len(adapter.events))
+        self.assertIsNone(adapter.events[0].source.chat_name)
 
 
 if __name__ == "__main__":
