@@ -15,6 +15,7 @@ import asyncio
 import copy
 import re
 import sys
+import time
 import types
 import unittest
 from datetime import datetime, timezone
@@ -313,6 +314,26 @@ def _fake_honest_failure(flag):
     return restore
 
 
+def _h1_proposal_record(proposal_id, *, chat_id="conversation-1", user="sender-1"):
+    """A declare-shaped fact record (mirror of h1_task_write ``_handle_declare``)."""
+    return {
+        "proposal_id": proposal_id,
+        "kind": "create_task",
+        "target": {
+            "board_slug": "agong",
+            "board_name": "AGong",
+            "task_title": "同步报错排查",
+            "body": "帮我排查下这个报错",
+        },
+        "triggering_user": user,
+        "chat_id": chat_id,
+        "ts": time.time(),
+        "delivered": False,
+        "state": "declared",
+        "retries": 0,
+    }
+
+
 class DingTalkThinGateTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -555,8 +576,12 @@ class DingTalkThinGateTest(unittest.TestCase):
         self.assertEqual(1, len(adapter.events))
         self.assertNotIn("你上一条回复已送达", adapter.events[0].text)
 
-    def test_failure_receipt_never_recorded(self):
-        """R3 打标沿用：标记为失败回执的投递不置位、不记回执。"""
+    def _declare_then_failure_receipt(self):
+        """真覆盖前提：先 declare 占住槽位，再让本轮回复被打成失败回执。
+
+        （旧用例从不 declare，失败回执早退导致 ``_facts()`` 根本没被调用，
+        断言的是一个从未写入过的空 dict —— 恒真，等于没测。）
+        """
         tb = load_task_binding_module()
         tb._h1_dispatch_scope.set(None)
         adapter = FakeAdapter()
@@ -564,30 +589,36 @@ class DingTalkThinGateTest(unittest.TestCase):
             chat_id="conversation-1", user_id="sender-1", message_id="m-1"
         )
         tb.set_h1_dispatch_scope(source=source, text="t", message_id="m-1")
+        self.assertIsNone(tb.declare_h1_proposal(adapter, _h1_proposal_record("h1p-1")))
 
-        honest = types.ModuleType("gateway.honest_failure")
-        honest.is_failure_receipt = lambda: True
-        gateway = types.ModuleType("gateway")
-        gateway.__path__ = []
-        old_gateway = sys.modules.get("gateway")
-        old_honest = sys.modules.get("gateway.honest_failure")
-        sys.modules["gateway"] = gateway
-        sys.modules["gateway.honest_failure"] = honest
+        restore = _fake_honest_failure(True)
         try:
             tb.mark_h1_turn_delivered(adapter, chat_id="conversation-1", message_id="out-err")
         finally:
-            if old_gateway is None:
-                sys.modules.pop("gateway", None)
-            else:
-                sys.modules["gateway"] = old_gateway
-            if old_honest is None:
-                sys.modules.pop("gateway.honest_failure", None)
-            else:
-                sys.modules["gateway.honest_failure"] = old_honest
+            restore()
+            tb._h1_dispatch_scope.set(None)
+        return tb, adapter
 
-        facts = getattr(adapter, "_h1_facts", {"replies": {}, "pending_delivery": {}})
+    def test_failure_receipt_never_recorded(self):
+        """R3 打标沿用：标记为失败回执的投递不置位、不记回执。"""
+        _tb, adapter = self._declare_then_failure_receipt()
+
+        facts = adapter._h1_facts
         self.assertEqual({}, facts["replies"])
-        self.assertEqual({}, facts["pending_delivery"])
+        self.assertFalse(facts["proposals"]["h1p-1"]["delivered"])
+
+    def test_failure_receipt_releases_the_in_flight_slot(self):
+        """失败回执不算投递，但“这一轮提案已不在途”必须落地，否则槽位泄漏到 TTL。"""
+        _tb, adapter = self._declare_then_failure_receipt()
+
+        self.assertEqual({}, adapter._h1_facts["pending_delivery"])
+
+    def test_failure_receipt_does_not_block_the_next_proposal(self):
+        """泄漏的后果：模型此后 900s 内 declare 全被拒，只能按 SOUL 去提醒用户
+        一个界面上根本不存在的“待确认提案”。"""
+        tb, adapter = self._declare_then_failure_receipt()
+
+        self.assertIsNone(tb.declare_h1_proposal(adapter, _h1_proposal_record("h1p-2")))
 
     # -- reply context (D2) ---------------------------------------------------
 

@@ -203,7 +203,10 @@ class H1TaskWriteTestBase(unittest.TestCase):
         hermes_cli.kanban_db = kb
 
         honest = types.ModuleType("gateway.honest_failure")
-        honest.is_failure_receipt = lambda: False
+        # 可切换的替身：默认成功回执，失败回执用例把 self.failure_receipt 置 True。
+        # （旧写法恒为 False，本文件里 R3 失败回执分支一次都没被执行过。）
+        self.failure_receipt = False
+        honest.is_failure_receipt = lambda: self.failure_receipt
 
         sys.modules["gateway"] = gateway
         sys.modules["gateway.task_intake"] = ti
@@ -245,14 +248,24 @@ class H1TaskWriteTestBase(unittest.TestCase):
             handler({"proposal_id": proposal_id, "confirm_msg_id": confirm_msg_id})
         )
 
-    def _deliver(self, proposal_id=None):
-        """Simulate the turn's final reply delivered (delivery record point)."""
+    def _deliver(self, proposal_id=None, *, failure=False, message_id="out-1"):
+        """Simulate the turn's final reply delivered (delivery record point).
+
+        ``failure=True`` stamps the turn as an R3 failure receipt (guardrail
+        halt / provider error) — the same delivery point still runs.
+        """
         source = _source()
         self.tb.set_h1_dispatch_scope(
             source=source, text="要我建个任务跟踪到底吗？", message_id="m-in-1"
         )
-        self.tb.mark_h1_turn_delivered(self.adapter, chat_id="cid-1", message_id="out-1")
-        self.tb._h1_dispatch_scope.set(None)
+        self.failure_receipt = failure
+        try:
+            self.tb.mark_h1_turn_delivered(
+                self.adapter, chat_id="cid-1", message_id=message_id
+            )
+        finally:
+            self.failure_receipt = False
+            self.tb._h1_dispatch_scope.set(None)
 
 
 class TestDeclare(H1TaskWriteTestBase):
@@ -514,6 +527,70 @@ class TestWriteGate(H1TaskWriteTestBase):
         self._deliver(proposal_id)
         self._capture(message_id="synthetic:zzz")
         self.assertEqual("request_id_unstable", self._write("create_task", proposal_id)["reason"])
+
+
+class TestFailureReceiptReleasesSlot(H1TaskWriteTestBase):
+    """R3 失败回执：不记投递、不写回执 —— 但必须释放 in-flight 槽位。
+
+    这两件事是独立的：`delivered` / `replies` 说的是“这条回复算不算 agent
+    的最终回复”，`pending_delivery` 说的只是“这一轮的提案还在不在途”。旧实现
+    在失败回执上直接早退，跳过了唯一的槽位释放点，槽位泄漏到 TTL(900s) 到期：
+    期间用户确认拿 not_delivered，模型再也 declare 不出新提案（proposal_in_flight），
+    于是模型会按 SOUL 去提醒用户“你还有一个待确认的提案”——而用户界面上根本没有。
+    """
+
+    def _declared(self):
+        self._capture()
+        result = self._declare()
+        assert result["ok"], result
+        return result["proposal_id"]
+
+    def test_failure_receipt_releases_slot_without_recording_delivery(self):
+        proposal_id = self._declared()
+        self._deliver(failure=True)
+
+        facts = self.adapter._h1_facts
+        self.assertEqual({}, facts["pending_delivery"])  # 槽位已释放
+        self.assertFalse(facts["proposals"][proposal_id]["delivered"])  # R3：不置位
+        self.assertEqual({}, facts["replies"])  # R3：不记回执
+
+    def test_failure_receipt_does_not_lock_out_the_next_proposal(self):
+        """用户可感知的后果：下一轮模型还能正常声明新提案。"""
+        first = self._declared()
+        self._deliver(failure=True)
+
+        self._capture()
+        second = self._declare()
+        self.assertTrue(second["ok"], second)
+        self.assertNotEqual(first, second["proposal_id"])
+
+    def test_failure_receipt_keeps_proposal_unconfirmable(self):
+        """诚实失败：这一轮没送到用户，确认路径仍必须拒绝，且零建卡。"""
+        proposal_id = self._declared()
+        self._deliver(failure=True)
+
+        self.assertEqual("not_delivered", self._write("create_task", proposal_id)["reason"])
+        self.assertEqual([], self.create_calls)
+
+    def test_failure_receipt_without_outbound_id_still_releases_slot(self):
+        """槽位键只由 (chat_id, triggering_user) 决定，不依赖出站 message_id。"""
+        proposal_id = self._declared()
+        self._deliver(failure=True, message_id=None)
+
+        facts = self.adapter._h1_facts
+        self.assertEqual({}, facts["pending_delivery"])
+        self.assertFalse(facts["proposals"][proposal_id]["delivered"])
+        self.assertEqual({}, facts["replies"])
+
+    def test_successful_delivery_still_records_and_releases(self):
+        """正常路径不回归：置位 + 写回执 + 释放槽位。"""
+        proposal_id = self._declared()
+        self._deliver()
+
+        facts = self.adapter._h1_facts
+        self.assertEqual({}, facts["pending_delivery"])
+        self.assertTrue(facts["proposals"][proposal_id]["delivered"])
+        self.assertEqual("out-1", facts["replies"][("cid-1", "sender-1")]["msgId"])
 
 
 if __name__ == "__main__":

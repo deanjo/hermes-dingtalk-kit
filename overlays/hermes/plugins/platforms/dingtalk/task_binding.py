@@ -297,13 +297,17 @@ def mark_h1_turn_delivered(adapter, *, chat_id, message_id) -> None:
     outcome; the synthetic webhook id is fine because V2 does no quote
     authentication), flag this turn's declared proposal ``delivered`` and
     record the reply receipt keyed by (chat_id, triggering_user).
-    A stamped failure receipt (R3) is never recorded.
+    A stamped failure receipt (R3) is never recorded — but it still releases
+    this turn's ``pending_delivery`` slot: "the proposal is no longer in
+    flight" is a concurrency fact, separate from "this reply counts as the
+    agent's final answer".
     """
     try:
         from gateway.honest_failure import is_failure_receipt
     except Exception:  # noqa: BLE001 - old Core without the helper: fail closed
         is_failure_receipt = lambda: True
-    if is_failure_receipt() or not message_id:
+    failed = is_failure_receipt()
+    if not failed and not message_id:
         return
     scope = _h1_dispatch_scope.get()
     if not scope or scope.get("source") is None:
@@ -323,7 +327,14 @@ def mark_h1_turn_delivered(adapter, *, chat_id, message_id) -> None:
         for key in [k for k, r in facts["replies"].items() if r["ts"] + _H1_FACT_TTL_SECONDS <= now]:
             facts["replies"].pop(key, None)
         slot_key = (str(chat_id or _scope_chat_id(scope["source"])), triggering_user)
+        # Release unconditionally — the slot only says "this turn's proposal
+        # is still in flight".  Holding it through a failure receipt leaked it
+        # until the TTL: the user's 确认 kept failing (not_delivered) and every
+        # later declare was refused (proposal_in_flight), so the model would
+        # announce a pending proposal the user had never been shown.
         slot = facts["pending_delivery"].pop(slot_key, None)
+        if failed:
+            return  # R3: neither delivered=True nor a reply receipt
         if slot is not None:
             record = facts["proposals"].get(slot["proposal_id"])
             if record is not None:
