@@ -94,6 +94,7 @@ except Exception:
     open_api_models = None
     tea_util_models = None
 
+from .delivery_gate import blocked_send_result  # H1 治理第 5 项 · 出站闸门
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
@@ -111,7 +112,6 @@ try:
     from .mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message, stamp_group_text
     from .plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup
     from .reply_context import (
-        _REPLY_ORIGINAL_UNAVAILABLE,
         _forwarded_chat_text_from_raw,
         _get_replied_file_content,
         _is_placeholder_text,
@@ -131,7 +131,6 @@ except ImportError:
     from mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message, stamp_group_text  # type: ignore
     from plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup  # type: ignore
     from reply_context import (  # type: ignore
-        _REPLY_ORIGINAL_UNAVAILABLE,
         _forwarded_chat_text_from_raw,
         _get_replied_file_content,
         _is_placeholder_text,
@@ -143,14 +142,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
 MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
-_REPLY_CONTEXT_CLARIFICATION = (
-    "我没有拿到你引用的原文。请补一句你指的是哪条内容，或把原文贴出来；"
-    "在确认前我不会开始排查。"
-)
 _TASK_BINDING_CLARIFICATION = "我没有找到有效的任务绑定。请用“#任务 board/task 你的问题”重试，例如：#任务 agong/t_deadbeef 联系人为什么没显示。"
 
 def check_dingtalk_requirements() -> bool:
@@ -663,21 +659,9 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
-        # T27: surface reply-to context for text quotes so the gateway can
-        # inject a disambiguation pointer (failures degrade to no context).
+        # Surface reply facts without making a history decision here. Missing
+        # quoted text remains a sentinel for the history-aware Gateway policy.
         reply_kwargs = build_reply_kwargs(message)
-        # A reply ID without the quoted text is not enough to identify the task.
-        # Stop before MessageEvent reaches the model: guessing here can make Hermes
-        # answer a different topic from the one the user actually quoted.
-        if reply_kwargs.get("reply_to_text") == _REPLY_ORIGINAL_UNAVAILABLE:
-            result = await self.send(
-                chat_id,
-                _REPLY_CONTEXT_CLARIFICATION,
-                reply_to=msg_id,
-            )
-            if not result.success:
-                logger.warning("[%s] Failed to deliver reply-context clarification", self.name)
-            return
 
         event = MessageEvent(
             text=text,
@@ -762,12 +746,12 @@ class DingTalkAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a markdown reply via DingTalk session webhook."""
         metadata = metadata or {}
-        logger.debug(
-            "[%s] send() has_chat_id=%s card_enabled=%s",
-            self.name,
-            bool(chat_id),
-            bool(self._card_template_id and self._card_sdk),
-        )
+
+        # H1 治理第 5 项 · 出站闸门：框架产物不进业务群（判据见 delivery_gate）。
+        _blocked = blocked_send_result(metadata, reply_to, self.name, SendResult, logger)
+        if _blocked is not None: return _blocked
+        logger.debug("[%s] send() has_chat_id=%s card_enabled=%s", self.name,
+                     bool(chat_id), bool(self._card_template_id and self._card_sdk))
 
         # Check metadata first (for direct webhook sends)
         session_webhook = metadata.get("session_webhook")

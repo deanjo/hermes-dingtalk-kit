@@ -117,7 +117,12 @@ async def resolve_task_binding(
         )
     ):
         return parsed
-    await adapter.send(chat_id, clarification, reply_to=message_id)
+    await adapter.send(
+        chat_id,
+        clarification,
+        reply_to=message_id,
+        metadata={"delivery_class": "business_error"},
+    )
     return None
 
 

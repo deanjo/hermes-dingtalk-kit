@@ -287,6 +287,18 @@ def build_reply_kwargs(message: "ChatbotMessage") -> Dict[str, Any]:
         if not msg_id or msg_type == "file":
             return {}
         original = _extract_replied_text_original(replied)
+        # H1-20260729 埋点：`repliedMsg` 是钉钉未文档化的透传字段，官方文档无定义，
+        # 项目内从无生产实测数据——"钉钉通常不给原文"一直只是一句无出处的注释。
+        # 只记字段名与值的类型/长度，绝不记内容（隐私）。用于判断：不同 msgType
+        # 下钉钉到底给了什么、有没有可用于精确定位原消息的元数据（如时间戳）。
+        logger.info(
+            "[reply-probe] repliedMsg keys=%s shapes=%s msgType=%s original_len=%d",
+            _safe_keys(replied),
+            {k: f"{type(v).__name__}/{len(v) if isinstance(v, (str, dict, list)) else 0}"
+             for k, v in replied.items()},
+            msg_type,
+            len(original),
+        )
         return {
             "reply_to_message_id": msg_id,
             "reply_to_text": original if original else _REPLY_ORIGINAL_UNAVAILABLE,

@@ -66,6 +66,10 @@ def load_send_function():
     namespace = {
         "SendResult": SendResult,
         "logger": FakeLogger(),
+        # H1 治理第 5 项：send 入口先过出站闸门（overlays/.../delivery_gate.py）。
+        # 本沙箱只测投递契约，注入放行版即可；闸门自身的判定由
+        # tests/test_dingtalk_outbound_gate.py 覆盖。
+        "blocked_send_result": lambda *args, **kwargs: None,
         "httpx": SimpleNamespace(TimeoutException=TimeoutError),
         "uuid": SimpleNamespace(
             uuid4=lambda: SimpleNamespace(hex="1234567890abcdef")

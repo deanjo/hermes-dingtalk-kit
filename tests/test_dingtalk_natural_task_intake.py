@@ -4,7 +4,7 @@ V2 (H1_V2_BARE_AGENT_DESIGN): the intent-classifier bridge and intake gate
 were removed.  This file pins what the thin gate does now: feature-flag
 pass-through, anonymous-sender skip, per-message read-only binding restore
 (M3 degrade-unbound), structural meta injection (inbound number + delivery
-receipt), reply-context passthrough, the T1 sentinel clarification, and
+receipt), reply-context forwarding to the Gateway, and
 the real import chain (no sys.modules doubles).
 """
 
@@ -152,8 +152,6 @@ def load_on_message(*, with_media=False):
         "MessageEvent": FakeMessageEvent,
         "MessageType": MessageType,
         "_DINGTALK_WEBHOOK_RE": re.compile(r"^https://api\.dingtalk\.com/"),
-        "_REPLY_CONTEXT_CLARIFICATION": "reply clarification",
-        "_REPLY_ORIGINAL_UNAVAILABLE": "reply unavailable",
         "_SESSION_WEBHOOKS_MAX": 500,
         "_TASK_BINDING_CLARIFICATION": "binding clarification",
         "_forwarded_chat_text_from_raw": lambda *args, **kwargs: "",
@@ -622,7 +620,7 @@ class DingTalkThinGateTest(unittest.TestCase):
 
     # -- reply context (D2) ---------------------------------------------------
 
-    def test_quote_reply_without_original_still_clarifies(self):
+    def test_quote_reply_without_original_reaches_gateway(self):
         def drive(adapter):
             message = make_message("对")
             message._test_reply_kwargs = {
@@ -634,10 +632,10 @@ class DingTalkThinGateTest(unittest.TestCase):
 
         adapter, _calls = self.run_message("对", drive=drive)
 
-        self.assertEqual([], adapter.events)
-        self.assertEqual(1, len(adapter.sent))
-        self.assertEqual("reply clarification", adapter.sent[0]["content"])
-        self.assertEqual("incoming-1", adapter.sent[0]["reply_to"])
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertEqual("quoted-1", adapter.events[0].reply_to_message_id)
+        self.assertEqual("reply unavailable", adapter.events[0].reply_to_text)
 
     def test_quote_reply_with_original_keeps_reply_context(self):
         def drive(adapter):

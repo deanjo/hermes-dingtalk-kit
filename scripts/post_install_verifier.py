@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import copy
 import importlib.util
 import json
 import os
@@ -29,6 +30,7 @@ RUNTIME_PROBE_ENV_ALLOWLIST = (
 PLUGIN_FILES = (
     "__init__.py",
     "adapter.py",
+    "delivery_gate.py",
     "incoming.py",
     "markdown.py",
     "media.py",
@@ -104,6 +106,14 @@ def _run_check(name: str, path: str, func: Callable[[], str]) -> CheckResult:
     except Exception as exc:  # noqa: BLE001 - verifier boundary
         return _fail(name, path, "error", f"{type(exc).__name__}: {exc}")
     return _ok(name, path, message)
+
+
+def _run_group(name: str, path: str, func: Callable[[], list[CheckResult]]) -> list[CheckResult]:
+    """``_run_check`` for a group producer, so one blow-up never silences the rest."""
+    try:
+        return func()
+    except Exception as exc:  # noqa: BLE001 - verifier boundary
+        return [_fail(name, path, "error", f"{type(exc).__name__}: {exc}")]
 
 
 def _read_tree(path: Path) -> ast.Module:
@@ -327,39 +337,10 @@ def _assert_reply_context(root: Path) -> str:
     return "repliedMsg maps to reply_to_message_id/reply_to_text"
 
 
-def _assert_reply_context_fail_closed(root: Path) -> str:
-    """Ensure unresolved text replies stop before model dispatch."""
-    def is_reply_lookup(node: ast.AST) -> bool:
-        return (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "reply_kwargs"
-            and node.func.attr == "get"
-            and len(node.args) == 1
-            and isinstance(node.args[0], ast.Constant)
-            and node.args[0].value == "reply_to_text"
-        )
-
-    def is_unavailable_sentinel(node: ast.AST) -> bool:
-        return isinstance(node, ast.Name) and node.id == "_REPLY_ORIGINAL_UNAVAILABLE"
-
+def _assert_reply_context_forwarded(root: Path) -> str:
+    """Ensure the adapter forwards reply facts without making history decisions."""
     adapter = root / PLUGIN_REL / "adapter.py"
     tree = _read_tree(adapter)
-    clarification = None
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "_REPLY_CONTEXT_CLARIFICATION"
-            for target in node.targets
-        ):
-            try:
-                clarification = ast.literal_eval(node.value)
-            except (ValueError, TypeError):
-                clarification = None
-            break
-    if not isinstance(clarification, str) or not clarification.strip():
-        raise AssertionError("reply-context clarification text is missing")
-
     method = None
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == "DingTalkAdapter":
@@ -374,101 +355,511 @@ def _assert_reply_context_fail_closed(root: Path) -> str:
             break
     if method is None:
         raise AssertionError("DingTalkAdapter._on_message not found")
+    if any(
+        isinstance(node, ast.Name)
+        and node.id in {"_REPLY_CONTEXT_CLARIFICATION", "_REPLY_ORIGINAL_UNAVAILABLE"}
+        for node in ast.walk(method)
+    ):
+        raise AssertionError("adapter still owns unresolved-reply policy")
 
-    guard_index = None
-    dispatch_index = None
+    kwargs_indices: list[int] = []
+    event_indices: list[int] = []
+    dispatch_indices: list[int] = []
     for index, statement in enumerate(method.body):
-        if isinstance(statement, ast.If):
-            test = statement.test
-            has_exact_guard = (
-                isinstance(test, ast.Compare)
-                and len(test.ops) == 1
-                and isinstance(test.ops[0], ast.Eq)
-                and len(test.comparators) == 1
-                and (
-                    (
-                        is_reply_lookup(test.left)
-                        and is_unavailable_sentinel(test.comparators[0])
-                    )
-                    or (
-                        is_unavailable_sentinel(test.left)
-                        and is_reply_lookup(test.comparators[0])
-                    )
-                )
-            )
-            if has_exact_guard:
-                guard_index = index
-                all_sends = [
-                    node.value
-                    for node in ast.walk(statement)
-                    if isinstance(node, ast.Await)
-                    and isinstance(node.value, ast.Call)
-                    and isinstance(node.value.func, ast.Attribute)
-                    and isinstance(node.value.func.value, ast.Name)
-                    and node.value.func.value.id == "self"
-                    and node.value.func.attr == "send"
-                ]
-                direct_sends = []
-                for body_index, body_statement in enumerate(statement.body):
-                    await_node = None
-                    if isinstance(body_statement, ast.Assign):
-                        await_node = body_statement.value
-                    elif isinstance(body_statement, ast.Expr):
-                        await_node = body_statement.value
-                    if (
-                        isinstance(await_node, ast.Await)
-                        and isinstance(await_node.value, ast.Call)
-                        and isinstance(await_node.value.func, ast.Attribute)
-                        and isinstance(await_node.value.func.value, ast.Name)
-                        and await_node.value.func.value.id == "self"
-                        and await_node.value.func.attr == "send"
-                    ):
-                        direct_sends.append((body_index, await_node.value))
-                if len(all_sends) != 1 or len(direct_sends) != 1:
-                    raise AssertionError("unresolved-reply guard must await exactly one send")
-                send_index, send_call = direct_sends[0]
-                if not (
-                    len(send_call.args) == 2
-                    and isinstance(send_call.args[0], ast.Name)
-                    and send_call.args[0].id == "chat_id"
-                    and isinstance(send_call.args[1], ast.Name)
-                    and send_call.args[1].id == "_REPLY_CONTEXT_CLARIFICATION"
-                ):
-                    raise AssertionError("unresolved-reply guard sends the wrong chat or content")
-                if not any(
-                    keyword.arg == "reply_to"
-                    and isinstance(keyword.value, ast.Name)
-                    and keyword.value.id == "msg_id"
-                    for keyword in send_call.keywords
-                ):
-                    raise AssertionError("unresolved-reply guard does not reply to the incoming message")
-                all_returns = [
-                    node for node in ast.walk(statement) if isinstance(node, ast.Return)
-                ]
-                direct_returns = [
-                    body_index
-                    for body_index, body_statement in enumerate(statement.body)
-                    if isinstance(body_statement, ast.Return)
-                ]
-                if len(all_returns) != 1 or len(direct_returns) != 1:
-                    raise AssertionError("unresolved-reply guard does not return before dispatch")
-                if send_index >= direct_returns[0]:
-                    raise AssertionError("unresolved-reply guard returns before clarification send")
-        if any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "self"
-            and node.func.attr == "handle_message"
-            for node in ast.walk(statement)
+        if (
+            isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "reply_kwargs" for target in statement.targets)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id == "build_reply_kwargs"
         ):
-            dispatch_index = index
+            if not (
+                len(statement.value.args) == 1
+                and isinstance(statement.value.args[0], ast.Name)
+                and statement.value.args[0].id == "message"
+            ):
+                raise AssertionError("build_reply_kwargs does not receive the inbound message")
+            kwargs_indices.append(index)
+        if (
+            isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "event" for target in statement.targets)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id == "MessageEvent"
+        ):
+            if not any(
+                keyword.arg is None
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == "reply_kwargs"
+                for keyword in statement.value.keywords
+            ):
+                raise AssertionError("MessageEvent does not expand reply_kwargs")
+            event_indices.append(index)
+        if (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Await)
+            and isinstance(statement.value.value, ast.Call)
+            and isinstance(statement.value.value.func, ast.Attribute)
+            and isinstance(statement.value.value.func.value, ast.Name)
+            and statement.value.value.func.value.id == "self"
+            and statement.value.value.func.attr == "handle_message"
+        ):
+            if not (
+                len(statement.value.value.args) == 1
+                and isinstance(statement.value.value.args[0], ast.Name)
+                and statement.value.value.args[0].id == "event"
+            ):
+                raise AssertionError("handle_message does not receive the reply-aware event")
+            dispatch_indices.append(index)
 
-    if guard_index is None:
-        raise AssertionError("unresolved-reply guard not found")
-    if dispatch_index is None or guard_index >= dispatch_index:
-        raise AssertionError("unresolved-reply guard must run before handle_message")
-    return "unresolved text replies clarify once and stop before model dispatch"
+    if not (
+        len(kwargs_indices) == len(event_indices) == len(dispatch_indices) == 1
+    ):
+        raise AssertionError(
+            "expected exactly one reply kwargs, MessageEvent, and handle_message dispatch"
+        )
+    kwargs_index, event_index, dispatch_index = (
+        kwargs_indices[0],
+        event_indices[0],
+        dispatch_indices[0],
+    )
+    if not kwargs_index < event_index < dispatch_index:
+        raise AssertionError("reply context is not forwarded in dispatch order")
+    if event_index != kwargs_index + 1:
+        raise AssertionError("adapter policy branch remains between reply parsing and MessageEvent")
+    return "adapter forwards reply kwargs exactly once to MessageEvent"
+
+
+def _assert_gateway_reply_context_layering(root: Path) -> str:
+    """Execute the installed V2 branch and verify both caller stop gates."""
+    path = root / "gateway/run.py"
+    text = path.read_text(encoding="utf-8")
+    tree = ast.parse(text, filename=str(path))
+    compat = _load_compat_patcher()
+    live_branch = compat._NATIVE_SHAPES.find_live_reply_context_v2(tree)
+    if live_branch is None:
+        raise AssertionError(
+            "reply-context sentinel branch is not unique on the direct Gateway reply path"
+        )
+    method, reply_outer_if, _sentinel_if = live_branch
+    reply_outer_index = method.body.index(reply_outer_if)
+
+    args = ast.arguments(
+        posonlyargs=[],
+        args=[
+            ast.arg(arg="self"),
+            ast.arg(arg="event"),
+            ast.arg(arg="source"),
+            ast.arg(arg="history"),
+            ast.arg(arg="message_text"),
+            ast.arg(arg="session_key"),
+        ],
+        kwonlyargs=[],
+        kw_defaults=[],
+        defaults=[ast.Constant(value=None)],
+        vararg=None,
+        kwarg=None,
+    )
+    probe_node = ast.AsyncFunctionDef(
+        name="_probe_reply_context",
+        args=args,
+        # Execute the installed method from entry through the reply branch.
+        # Extracting only the branch would hide prefix returns or state writes
+        # and turn unreachable code into a false-green probe.
+        body=[
+            copy.deepcopy(statement)
+            for statement in method.body[: reply_outer_index + 1]
+        ]
+        + [ast.Return(value=ast.Name(id="message_text", ctx=ast.Load()))],
+        decorator_list=[],
+    )
+    module = ast.Module(body=[probe_node], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    class ProbeLogger:
+        def __init__(self) -> None:
+            self.warnings: list[str] = []
+
+        def warning(self, message: str, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            self.warnings.append(message)
+
+    logger = ProbeLogger()
+    namespace = {
+        "_REPLY_ORIGINAL_UNAVAILABLE": "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00",
+        "Platform": types.SimpleNamespace(DISCORD=object()),
+        "is_shared_multi_user_session": lambda *args, **kwargs: False,
+        "logger": logger,
+    }
+    exec(compile(module, str(path), "exec"), namespace)
+    probe = namespace["_probe_reply_context"]
+
+    class ProbeAdapter:
+        def __init__(self, success: bool = True, raises: bool = False) -> None:
+            self.success = success
+            self.raises = raises
+            self.sends: list[dict[str, Any]] = []
+
+        async def send(
+            self,
+            chat_id: str,
+            content: str,
+            reply_to: str | None = None,
+            metadata: dict[str, Any] | None = None,
+        ) -> Any:
+            self.sends.append(
+                {
+                    "chat_id": chat_id,
+                    "content": content,
+                    "reply_to": reply_to,
+                    "metadata": metadata,
+                }
+            )
+            if self.raises:
+                raise RuntimeError("simulated clarification delivery failure")
+            return types.SimpleNamespace(success=self.success)
+
+    class ProbeRunner:
+        def __init__(self, adapter: ProbeAdapter | None) -> None:
+            self.adapter = adapter
+            self.config = types.SimpleNamespace(
+                group_sessions_per_user=True,
+                thread_sessions_per_user=False,
+            )
+
+        @staticmethod
+        def _session_key_for_source(source: Any) -> str:
+            del source
+            return "reply-context-probe"
+
+        @staticmethod
+        def _consume_pending_native_image_paths(session_key: str) -> None:
+            del session_key
+
+        def _adapter_for_source(self, source: Any) -> ProbeAdapter | None:
+            del source
+            return self.adapter
+
+        @staticmethod
+        def _thread_metadata_for_source(source: Any) -> dict[str, str]:
+            del source
+            return {"thread": "probe"}
+
+    sentinel = namespace["_REPLY_ORIGINAL_UNAVAILABLE"]
+    event = types.SimpleNamespace(
+        text="继续深入",
+        media_urls=[],
+        media_types=[],
+        message_type=None,
+        channel_context=None,
+        reply_to_text=sentinel,
+        reply_to_message_id="quoted-1",
+    )
+    source = types.SimpleNamespace(
+        chat_id="chat-1",
+        message_id="incoming-1",
+        user_name=None,
+    )
+    no_history_adapter = ProbeAdapter()
+    no_history_result = asyncio.run(
+        probe(ProbeRunner(no_history_adapter), event, source, [], "继续深入")
+    )
+    if no_history_result is not None or len(no_history_adapter.sends) != 1:
+        raise AssertionError("no-history branch did not clarify once and return None")
+    sent = no_history_adapter.sends[0]
+    if sent["reply_to"] != "incoming-1" or "没有可回顾的历史" not in sent["content"]:
+        raise AssertionError("no-history clarification lost reply anchor or required content")
+
+    blank_assistant_adapter = ProbeAdapter()
+    blank_assistant_result = asyncio.run(
+        probe(
+            ProbeRunner(blank_assistant_adapter),
+            event,
+            source,
+            [{"role": "assistant", "content": "  "}],
+            "继续",
+        )
+    )
+    if blank_assistant_result is not None or len(blank_assistant_adapter.sends) != 1:
+        raise AssertionError("blank assistant history was incorrectly treated as usable")
+
+    failed_adapter = ProbeAdapter(success=False)
+    failed_result = asyncio.run(
+        probe(ProbeRunner(failed_adapter), event, source, [{"role": "user", "content": "x"}], "继续")
+    )
+    if failed_result is not None or not logger.warnings:
+        raise AssertionError("clarification failure did not stay closed with WARNING")
+
+    warning_count = len(logger.warnings)
+    raising_adapter = ProbeAdapter(raises=True)
+    raising_result = asyncio.run(
+        probe(ProbeRunner(raising_adapter), event, source, [], "继续")
+    )
+    if raising_result is not None or len(logger.warnings) != warning_count + 1:
+        raise AssertionError("clarification exception did not stay closed with WARNING")
+
+    warning_count = len(logger.warnings)
+    missing_adapter_result = asyncio.run(
+        probe(ProbeRunner(None), event, source, [], "继续")
+    )
+    if missing_adapter_result is not None or len(logger.warnings) != warning_count + 1:
+        raise AssertionError("missing adapter did not stay closed with WARNING")
+
+    dispatch_counts = {"model": 0, "business_tool": 0}
+    for prepared in (
+        no_history_result,
+        blank_assistant_result,
+        failed_result,
+        raising_result,
+        missing_adapter_result,
+    ):
+        if prepared is not None:
+            dispatch_counts["model"] += 1
+            dispatch_counts["business_tool"] += 1
+    if dispatch_counts != {"model": 0, "business_tool": 0}:
+        raise AssertionError(f"no-history dispatch was not zero: {dispatch_counts!r}")
+
+    history_adapter = ProbeAdapter()
+    history_result = asyncio.run(
+        probe(
+            ProbeRunner(history_adapter),
+            event,
+            source,
+            [{"role": "assistant", "content": "供应商联系人没有显示的分析"}],
+            "继续深入",
+        )
+    )
+    required = (
+        "只能根据上文历史中真实存在的内容",
+        "不得默认选择最近讨论的话题",
+        "只有当引用目标唯一明确时才能继续处理",
+        "只提出一个具体澄清问题",
+        "定位前不得调用业务工具",
+        "不得给出新的外部事实结论",
+        "继续深入",
+    )
+    if not isinstance(history_result, str) or not all(item in history_result for item in required):
+        raise AssertionError("assistant-history branch did not inject the complete V2 contract")
+    if history_adapter.sends or sentinel in history_result or "session_search" in history_result:
+        raise AssertionError("assistant-history branch leaked sentinel/legacy tool or sent clarification")
+
+    expected_callers = {
+        "_handle_message_with_agent": {
+            "target": "message_text",
+            "values": {
+                "event": "event",
+                "source": "source",
+                "history": "history",
+                "session_key": "session_key",
+            },
+            "return_name": None,
+        },
+        "_run_agent_inner": {
+            "target": "next_message",
+            "values": {
+                "event": "pending_event",
+                "source": "next_source",
+                "history": "updated_history",
+                "session_key": "next_session_key",
+            },
+            "return_name": "result",
+        },
+    }
+    gateway_classes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GatewayRunner"
+    ]
+    if len(gateway_classes) != 1:
+        raise AssertionError("GatewayRunner is not unique")
+    caller_methods = {
+        node.name: node
+        for node in gateway_classes[0].body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name in expected_callers
+    }
+    if set(caller_methods) != set(expected_callers):
+        raise AssertionError("Gateway reply callers are missing or duplicated")
+    pending_event_test = ast.parse(
+        "pending_event is not None",
+        mode="eval",
+    ).body
+
+    def has_expected_call_parent(
+        parent: ast.AST,
+        field: str,
+        expected: dict[str, Any],
+    ) -> bool:
+        if expected["target"] == "message_text":
+            return (
+                parent is caller_methods["_handle_message_with_agent"]
+                and field == "body"
+            )
+        return (
+            isinstance(parent, ast.If)
+            and field == "body"
+            and ast.dump(parent.test, include_attributes=False)
+            == ast.dump(pending_event_test, include_attributes=False)
+        )
+
+    def is_safe_prepare_call(
+        call: ast.AST,
+        assigned_name: str,
+        expected: dict[str, Any],
+    ) -> bool:
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "self"
+            and call.func.attr == "_prepare_inbound_message_text"
+            and not call.args
+            and assigned_name == expected["target"]
+        ):
+            return False
+        keyword_names = [keyword.arg for keyword in call.keywords]
+        allowed_names = (
+            {"event", "source", "history"},
+            {"event", "source", "history", "session_key"},
+        )
+        return (
+            len(set(keyword_names)) == len(keyword_names)
+            and set(keyword_names) in allowed_names
+            and all(
+                keyword.arg is not None
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == expected["values"][keyword.arg]
+                for keyword in call.keywords
+            )
+        )
+
+    def inspect_statement_lists(
+        node: ast.AST,
+        expected: dict[str, Any],
+        counts: dict[str, int],
+        live: bool = True,
+    ) -> None:
+        def static_truth(expression: ast.AST) -> bool | None:
+            if isinstance(expression, ast.Constant):
+                return bool(expression.value)
+            if isinstance(expression, ast.UnaryOp) and isinstance(expression.op, ast.Not):
+                value = static_truth(expression.operand)
+                return None if value is None else not value
+            return None
+
+        def block_always_exits(statements: list[ast.stmt]) -> bool:
+            return any(statement_always_exits(statement) for statement in statements)
+
+        def statement_always_exits(statement: ast.stmt) -> bool:
+            if isinstance(statement, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+                return True
+            if isinstance(statement, ast.Assert):
+                return static_truth(statement.test) is False
+            if isinstance(statement, ast.If):
+                truth = static_truth(statement.test)
+                if truth is True:
+                    return block_always_exits(statement.body)
+                if truth is False:
+                    return block_always_exits(statement.orelse)
+                return (
+                    bool(statement.body)
+                    and bool(statement.orelse)
+                    and block_always_exits(statement.body)
+                    and block_always_exits(statement.orelse)
+                )
+            return False
+
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                branch_live = live
+                if isinstance(node, (ast.If, ast.While)):
+                    truth = static_truth(node.test)
+                    if field == "body" and truth is False:
+                        branch_live = False
+                    elif field == "orelse" and truth is True:
+                        branch_live = False
+                terminated = False
+                for index, statement in enumerate(value):
+                    if not isinstance(statement, ast.stmt):
+                        continue
+                    statement_live = branch_live and not terminated
+                    assigned_name = None
+                    call = None
+                    if (
+                        isinstance(statement, ast.Assign)
+                        and len(statement.targets) == 1
+                        and isinstance(statement.targets[0], ast.Name)
+                        and isinstance(statement.value, ast.Await)
+                    ):
+                        assigned_name = statement.targets[0].id
+                        call = statement.value.value
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "_prepare_inbound_message_text"
+                    ):
+                        counts["candidates"] += 1
+                    if (
+                        assigned_name
+                        and is_safe_prepare_call(call, assigned_name, expected)
+                        and has_expected_call_parent(node, field, expected)
+                        and statement_live
+                    ):
+                        counts["safe"] += 1
+                        following = value[index + 1] if index + 1 < len(value) else None
+                        expected_return_name = expected["return_name"]
+                        if (
+                            isinstance(following, ast.If)
+                            and isinstance(following.test, ast.Compare)
+                            and isinstance(following.test.left, ast.Name)
+                            and following.test.left.id == assigned_name
+                            and len(following.test.ops) == 1
+                            and isinstance(following.test.ops[0], ast.Is)
+                            and len(following.test.comparators) == 1
+                            and isinstance(following.test.comparators[0], ast.Constant)
+                            and following.test.comparators[0].value is None
+                            and bool(following.body)
+                            and isinstance(following.body[0], ast.Return)
+                            and (
+                                (
+                                    expected_return_name is None
+                                    and following.body[0].value is None
+                                )
+                                or (
+                                    isinstance(following.body[0].value, ast.Name)
+                                    and following.body[0].value.id
+                                    == expected_return_name
+                                )
+                            )
+                        ):
+                            counts["guarded"] += 1
+                    if not isinstance(
+                        statement,
+                        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                    ):
+                        inspect_statement_lists(
+                            statement,
+                            expected,
+                            counts,
+                            statement_live,
+                        )
+                    if statement_live and statement_always_exits(statement):
+                        terminated = True
+            elif isinstance(value, ast.AST):
+                inspect_statement_lists(value, expected, counts, live)
+
+    caller_counts: dict[str, dict[str, int]] = {}
+    for method_name, expected in expected_callers.items():
+        counts = {"candidates": 0, "safe": 0, "guarded": 0}
+        inspect_statement_lists(caller_methods[method_name], expected, counts)
+        caller_counts[method_name] = counts
+    if any(
+        counts != {"candidates": 1, "safe": 1, "guarded": 1}
+        for counts in caller_counts.values()
+    ):
+        raise AssertionError(
+            f"prepare callers are not all fail-closed: {caller_counts!r}"
+        )
+    return "installed Gateway V2 handles history/no-history, zero-dispatch failures, and both callers stop on None"
 
 
 def _load_function_from_ast(path: Path, function_name: str) -> Any:
@@ -788,10 +1179,6 @@ def _compat_results(root: Path) -> list[CheckResult]:
     return results
 
 
-def _has_failure(results: list[CheckResult]) -> bool:
-    return any(result.status in FAILURE_STATUSES for result in results)
-
-
 def build_report(target: Path, *, require_compat: bool = True) -> dict[str, Any]:
     results: list[CheckResult] = []
     try:
@@ -809,45 +1196,47 @@ def build_report(target: Path, *, require_compat: bool = True) -> dict[str, Any]
         )
     else:
         results.append(_ok("target.resolve", str(root), "Hermes root located"))
-        compat_results = _compat_results(root) if require_compat else []
-        results.extend(compat_results)
-        if not _has_failure(compat_results):
-            plugin_results = _check_plugin_files(root)
-            product_results = _check_plugin_files(
-                root,
-                PRODUCT_PLUGIN_REL,
-                PRODUCT_PLUGIN_FILES,
-                "product",
+        # Every check below runs unconditionally: an earlier failure must never
+        # make a later check disappear from the report (silent-pass hazard).
+        if require_compat:
+            results.extend(_run_group("compat.verify", ".", lambda: _compat_results(root)))
+        results.extend(_run_group("plugin.files", str(PLUGIN_REL), lambda: _check_plugin_files(root)))
+        results.extend(
+            _run_group(
+                "product.files",
+                str(PRODUCT_PLUGIN_REL),
+                lambda: _check_plugin_files(root, PRODUCT_PLUGIN_REL, PRODUCT_PLUGIN_FILES, "product"),
             )
-            h1_results = _check_plugin_files(
-                root,
-                H1_PLUGIN_REL,
-                H1_PLUGIN_FILES,
-                "h1_task_write",
+        )
+        results.extend(
+            _run_group(
+                "h1_task_write.files",
+                str(H1_PLUGIN_REL),
+                lambda: _check_plugin_files(root, H1_PLUGIN_REL, H1_PLUGIN_FILES, "h1_task_write"),
             )
-            results.extend(plugin_results + product_results + h1_results)
-            if not _has_failure(plugin_results + product_results + h1_results):
-                results.extend(
-                    [
-                        _run_check("plugin.manifest", str(PLUGIN_REL / "plugin.yaml"), lambda: _assert_plugin_manifest(root)),
-                        _run_check("plugin.entry", str(PLUGIN_REL / "adapter.py"), lambda: _assert_plugin_entry(root)),
-                        _build_source_signature_probe(root),
-                        _runtime_discovery_probe(root),
-                        _run_check("plugin.raw_process_ack", str(PLUGIN_REL / "incoming.py"), lambda: _assert_raw_process_ack(root)),
-                        _run_check("plugin.reply_context_kwargs", str(PLUGIN_REL / "reply_context.py"), lambda: _assert_reply_context(root)),
-                        _run_check("plugin.reply_context_fail_closed", str(PLUGIN_REL / "adapter.py"), lambda: _assert_reply_context_fail_closed(root)),
-                        _run_check("product.manifest", str(PRODUCT_PLUGIN_REL / "plugin.yaml"), lambda: _assert_product_manifest(root)),
-                        _run_check("product.entry", str(PRODUCT_PLUGIN_REL / "__init__.py"), lambda: _assert_product_plugin(root)),
-                        _product_hook_contract_probe(root),
-                    ]
-                )
-                if require_compat:
-                    results.extend(
-                        [
-                            _run_check("gateway.session_key_slash", "gateway/session.py", lambda: _assert_session_key_slash(root)),
-                            _run_check("gateway.session_context_bridge", "gateway/session_context.py", lambda: _assert_session_context_bridge(root)),
-                        ]
-                    )
+        )
+        results.extend(
+            [
+                _run_check("plugin.manifest", str(PLUGIN_REL / "plugin.yaml"), lambda: _assert_plugin_manifest(root)),
+                _run_check("plugin.entry", str(PLUGIN_REL / "adapter.py"), lambda: _assert_plugin_entry(root)),
+                _build_source_signature_probe(root),
+                _runtime_discovery_probe(root),
+                _run_check("plugin.raw_process_ack", str(PLUGIN_REL / "incoming.py"), lambda: _assert_raw_process_ack(root)),
+                _run_check("plugin.reply_context_kwargs", str(PLUGIN_REL / "reply_context.py"), lambda: _assert_reply_context(root)),
+                _run_check("plugin.reply_context_forwarded", str(PLUGIN_REL / "adapter.py"), lambda: _assert_reply_context_forwarded(root)),
+                _run_check("product.manifest", str(PRODUCT_PLUGIN_REL / "plugin.yaml"), lambda: _assert_product_manifest(root)),
+                _run_check("product.entry", str(PRODUCT_PLUGIN_REL / "__init__.py"), lambda: _assert_product_plugin(root)),
+                _product_hook_contract_probe(root),
+            ]
+        )
+        if require_compat:
+            results.extend(
+                [
+                    _run_check("gateway.reply_context_layering", "gateway/run.py", lambda: _assert_gateway_reply_context_layering(root)),
+                    _run_check("gateway.session_key_slash", "gateway/session.py", lambda: _assert_session_key_slash(root)),
+                    _run_check("gateway.session_context_bridge", "gateway/session_context.py", lambda: _assert_session_context_bridge(root)),
+                ]
+            )
 
     failures = [result for result in results if result.status in FAILURE_STATUSES]
     return {

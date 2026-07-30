@@ -449,7 +449,12 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
         self.assertEqual(1, len(self.adapter.calls))
         call = self.adapter.calls[0]
         self.assertEqual("conv-1", call["chat_id"])
-        self.assertEqual({"at_user_ids": [OWNER]}, call["metadata"])
+        # H1 治理第 5 项：业务确认必须显式标 delivery_class，否则出站闸门
+        # 收紧为 fail-closed 后会误杀，打断场景 2 的需求确认流程。
+        self.assertEqual(
+            {"at_user_ids": [OWNER], "delivery_class": "business_confirm"},
+            call["metadata"],
+        )
         for fragment in (
             "T-1",
             "v1",

@@ -24,9 +24,6 @@ from typing import Iterable, Literal
 Mode = Literal["check", "apply", "verify"]
 
 
-REPLY_SENTINEL = '_REPLY_ORIGINAL_UNAVAILABLE = "\\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\\x00"'
-
-
 @dataclass(frozen=True)
 class Step:
     name: str
@@ -34,11 +31,29 @@ class Step:
     marker: str | tuple[str, ...]
     old: str | tuple[str, ...]
     new: str | tuple[str, ...]
+    #: Alternative marker set matching an equivalent shape fork core ships
+    #: natively. When it matches, the patch is redundant and the step is
+    #: ``present`` — semantics decide, not syntax (H1 governance item 6).
+    native_marker: str | tuple[str, ...] | None = None
 
     def markers(self) -> tuple[str, ...]:
         if isinstance(self.marker, str):
             return (self.marker,)
         return self.marker
+
+    def native_markers(self) -> tuple[str, ...]:
+        if self.native_marker is None:
+            return ()
+        if isinstance(self.native_marker, str):
+            return (self.native_marker,)
+        return self.native_marker
+
+    def already_satisfied(self, text: str) -> bool:
+        """True when the patch's intent is already in the source."""
+        if _all_present(text, self.markers()):
+            return True
+        native = self.native_markers()
+        return bool(native) and _all_present(text, native)
 
     def replacements(self) -> tuple[tuple[str, str], ...]:
         old_values = (self.old,) if isinstance(self.old, str) else self.old
@@ -70,6 +85,35 @@ def _all_present(text: str, markers: Iterable[str]) -> bool:
     return all(marker in text for marker in markers)
 
 
+def _load_sibling_module(name: str):
+    """Import a module sitting next to this file, regardless of sys.path."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parent / f"{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+REPLY_SENTINEL = '_REPLY_ORIGINAL_UNAVAILABLE = "\\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\\x00"'
+
+
+# 平级模块：本文件可能以脚本方式直接运行（scripts/ 不在 sys.path），
+# 也可能被测试以模块方式导入，故按文件路径加载而非裸 import。
+_NATIVE_SHAPES = _load_sibling_module("compat_native_shapes")
+CANONICAL_SESSION_KEY_CHECKER = _NATIVE_SHAPES.CANONICAL_SESSION_KEY_CHECKER
+_REPLY_CTX_LEGACY_OLD = _NATIVE_SHAPES._REPLY_CTX_LEGACY_OLD
+_REPLY_CTX_LEGACY_V1 = _NATIVE_SHAPES._REPLY_CTX_LEGACY_V1
+_REPLY_CTX_LEGACY_V2 = _NATIVE_SHAPES._REPLY_CTX_LEGACY_V2
+_REPLY_CTX_NATIVE_OLD = _NATIVE_SHAPES._REPLY_CTX_NATIVE_OLD
+_REPLY_CTX_NATIVE_V1 = _NATIVE_SHAPES._REPLY_CTX_NATIVE_V1
+_REPLY_CTX_NATIVE_V2 = _NATIVE_SHAPES._REPLY_CTX_NATIVE_V2
+_SESSION_KEY_CHECKER_NATIVE_OLD = _NATIVE_SHAPES._SESSION_KEY_CHECKER_NATIVE_OLD
+_HOME_GATE_DINGTALK_BRANCH = _NATIVE_SHAPES._HOME_GATE_DINGTALK_BRANCH
+
+
 RUN_STEPS = [
     Step(
         name="run.reply_sentinel_constant",
@@ -96,7 +140,8 @@ RUN_STEPS = [
     Step(
         name="run.dingtalk_home_prompt_gate",
         path="gateway/run.py",
-        marker="def _should_prompt_for_home_channel(source: Any) -> bool:",
+        # U38: marker 须认函数体，不能只认签名——只认签名会把「同名但不拦钉钉群」的弱实现误判 present。
+        marker=("def _should_prompt_for_home_channel(source: Any) -> bool:", _HOME_GATE_DINGTALK_BRANCH),
         old=(
             "def _home_target_env_var(platform_name: str) -> str:\n"
             "    \"\"\"Return the configured home-target env var for a platform.\n"
@@ -146,52 +191,25 @@ RUN_STEPS = [
     Step(
         name="run.reply_context_sentinel_branch",
         path="gateway/run.py",
-        marker="event.reply_to_text == _REPLY_ORIGINAL_UNAVAILABLE",
+        # V2 marker 同时认有历史受限处理和无历史代码级失败关闭。只认 sentinel
+        # 或 V1 的“请先回顾上文”会让已部署旧补丁被误判 present，永远升不到 V2。
+        marker=(
+            "event.reply_to_text == _REPLY_ORIGINAL_UNAVAILABLE",
+            "reply_to=source.message_id,",
+            "只有当引用目标唯一明确时才能继续处理",
+            "reply-context unavailable and no usable assistant history",
+        ),
         old=(
-            "        if getattr(event, \"reply_to_text\", None) and event.reply_to_message_id:\n"
-            "            # Always inject the reply-to pointer — even when the quoted text\n"
-            "            # already appears in history. The prefix isn't deduplication, it's\n"
-            "            # disambiguation: it tells the agent *which* prior message the user\n"
-            "            # is referencing. History can contain the same or similar text\n"
-            "            # multiple times, and without an explicit pointer the agent has to\n"
-            "            # guess (or answer for both subjects). Token overhead is minimal.\n"
-            "            reply_snippet = event.reply_to_text[:500]\n"
-            "            if getattr(event, \"reply_to_is_own_message\", False):\n"
-            "                message_text = (\n"
-            "                    f'[Replying to your previous message: \"{reply_snippet}\"]\\n\\n'\n"
-            "                    f\"{message_text}\"\n"
-            "                )\n"
-            "            else:\n"
-            "                message_text = f'[Replying to: \"{reply_snippet}\"]\\n\\n{message_text}'\n"
+            _REPLY_CTX_LEGACY_OLD,
+            _REPLY_CTX_NATIVE_OLD,
+            _REPLY_CTX_LEGACY_V1,
+            _REPLY_CTX_NATIVE_V1,
         ),
         new=(
-            "        if getattr(event, \"reply_to_text\", None) and event.reply_to_message_id:\n"
-            "            # Always inject the reply-to pointer — even when the quoted text\n"
-            "            # already appears in history. The prefix isn't deduplication, it's\n"
-            "            # disambiguation: it tells the agent *which* prior message the user\n"
-            "            # is referencing. History can contain the same or similar text\n"
-            "            # multiple times, and without an explicit pointer the agent has to\n"
-            "            # guess (or answer for both subjects). Token overhead is minimal.\n"
-            "            if event.reply_to_text == _REPLY_ORIGINAL_UNAVAILABLE:\n"
-            "                # T27: user quoted an earlier message but the platform (DingTalk) did\n"
-            "                # not deliver the original text. We can't render a quote snippet, so\n"
-            "                # instruct the agent to resolve the reference from conversation history\n"
-            "                # rather than assuming it points at the most-recent topic.\n"
-            "                message_text = (\n"
-            "                    \"【系统提示】用户正在引用本会话中更早的一条消息向你提问，但本次未取到被引用消息的原文。\"\n"
-            "                    \"请先回顾上文对话历史，找到用户引用的那条具体消息，据此判断用户此处“这个/这个问题/它”\"\n"
-            "                    \"等指代的真正对象，再作答；不要想当然地认为指的是最近讨论的话题。\\n\\n\"\n"
-            "                    f\"{message_text}\"\n"
-            "                )\n"
-            "            else:\n"
-            "                reply_snippet = event.reply_to_text[:500]\n"
-            "                if getattr(event, \"reply_to_is_own_message\", False):\n"
-            "                    message_text = (\n"
-            "                        f'[Replying to your previous message: \"{reply_snippet}\"]\\n\\n'\n"
-            "                        f\"{message_text}\"\n"
-            "                    )\n"
-            "                else:\n"
-            "                    message_text = f'[Replying to: \"{reply_snippet}\"]\\n\\n{message_text}'\n"
+            _REPLY_CTX_LEGACY_V2,
+            _REPLY_CTX_NATIVE_V2,
+            _REPLY_CTX_LEGACY_V2,
+            _REPLY_CTX_NATIVE_V2,
         ),
     ),
     Step(
@@ -291,7 +309,13 @@ SESSION_STEPS = [
     Step(
         name="session.session_key_validator",
         path="gateway/session.py",
-        marker="def _is_session_key_unsafe(value: object) -> bool:",
+        # marker 必须认实现而不只是函数名：只认名字会把 core 的弱实现误判为
+        # present，补丁永远打不上（与 run.reply_context_sentinel_branch 同型）。
+        marker=(
+            "def _is_session_key_unsafe(value: object) -> bool:",
+            'if ".." in s or "\\\\" in s:',  # U38: 反斜杠须任意位置拒，只拦开头是 core 的弱实现
+            's.startswith(("/", "~"))',
+        ),
         old=(
             "def _is_path_unsafe(value: object) -> bool:\n"
             "    \"\"\"Return True if ``value`` could traverse outside the sessions dir.\"\"\"\n"
@@ -307,7 +331,8 @@ SESSION_STEPS = [
             "    return len(s) >= 2 and s[0].isalpha() and s[1] == \":\"\n"
             "\n"
             "\n"
-            "@dataclass\n"
+            "@dataclass\n",
+            _SESSION_KEY_CHECKER_NATIVE_OLD,
         ),
         new=(
             "def _is_path_unsafe(value: object) -> bool:\n"
@@ -344,7 +369,8 @@ SESSION_STEPS = [
             "    return len(s) >= 2 and s[0].isalpha() and s[1] == \":\" and s[2:3] in (\"/\", \"\\\\\")\n"
             "\n"
             "\n"
-            "@dataclass\n"
+            "@dataclass\n",
+            CANONICAL_SESSION_KEY_CHECKER + "\n",
         ),
     ),
     Step(
@@ -353,6 +379,13 @@ SESSION_STEPS = [
         marker=(
             '("session_key", session_key, _is_session_key_unsafe)',
             '("session_id", session_id, _is_path_unsafe)',
+        ),
+        # fork core 已原生实现同一语义（session_id 严校验 / session_key 宽校验），
+        # 只是形状从三元组 for-loop 变成两个独立 if（H1 治理第 6 项亲核 core
+        # gateway/session.py 的两个 if 块）。认行为不认形状：命中即判 present。
+        native_marker=(
+            "_is_session_key_unsafe(session_key)",
+            "_is_path_unsafe(session_id)",
         ),
         old=(
             "        # Validate path-sensitive fields to prevent directory traversal (CWE-22)\n"
@@ -505,18 +538,6 @@ SESSION_CONTEXT_STEPS = [
 
 STEPS = [*RUN_STEPS, *SESSION_STEPS, *SESSION_CONTEXT_STEPS]
 VERIFY_PATHS = ("gateway/run.py", "gateway/session.py", "gateway/session_context.py")
-CANONICAL_SESSION_KEY_CHECKER = (
-    "def _is_session_key_unsafe(value: object) -> bool:\n"
-    "    \"\"\"Return True if a session key looks like a path-escape attempt.\"\"\"\n"
-    "    if not value:\n"
-    "        return False\n"
-    "    s = str(value)\n"
-    "    if \"..\" in s or \"\\\\\" in s:\n"
-    "        return True\n"
-    "    if s.startswith((\"/\", \"~\")):\n"
-    "        return True\n"
-    "    return len(s) >= 2 and s[0].isalpha() and s[1] == \":\" and s[2:3] in (\"/\", \"\\\\\")"
-)
 
 
 def _parse_python(path: Path) -> tuple[ast.Module | None, str]:
@@ -681,19 +702,6 @@ def _function_mentions_name(tree: ast.Module, function_name: str, name: str) -> 
     if not func:
         return False
     return any(isinstance(node, ast.Name) and node.id == name for node in ast.walk(func))
-
-
-def _has_reply_sentinel_compare(tree: ast.Module) -> bool:
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare):
-            continue
-        if _name(node.left) != "event.reply_to_text":
-            continue
-        if not any(isinstance(op, ast.Eq) for op in node.ops):
-            continue
-        if any(_name(comp) == "_REPLY_ORIGINAL_UNAVAILABLE" for comp in node.comparators):
-            return True
-    return False
 
 
 def _has_string_constant(tree: ast.Module, needle: str) -> bool:
@@ -985,7 +993,49 @@ def _loop_target_matches(node: ast.AST) -> bool:
     return [_name(item) for item in node.elts] == ["_field", "_val", "_checker"]
 
 
+def _has_session_path_validation_ifs(tree: ast.Module) -> bool:
+    """Accept the two-independent-``if`` shape fork core ships natively.
+
+    Semantics required (identical to the loop form): ``session_id`` goes
+    through the strict path guard, ``session_key`` through the relaxed one,
+    and each raises on failure. Only the syntax differs, so the verifier must
+    not reject it — see H1 governance item 6.
+    """
+    wanted = {("session_id", "_is_path_unsafe"), ("session_key", "_is_session_key_unsafe")}
+    # 两个 if 必须落在**真正从数据构造会话的那个函数**里才算数：仅要求"同一函数"
+    # 仍会被一段从未被调用的同形 decoy 函数蒙混过关（独立验收实测绕过成功）。
+    # 判据加上"该函数体内有 session_key / session_id 的赋值"——校验必须长在
+    # 取值的地方，而不是飘在某个死代码里（H1 治理第 6 项 P1 二次加固）。
+    for scope in ast.walk(tree):
+        if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        assigned = {
+            _name(target)
+            for node in ast.walk(scope)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+        }
+        if not {"session_key", "session_id"} <= assigned:
+            continue
+        found = set()
+        for node in ast.walk(scope):
+            if not isinstance(node, ast.If) or not isinstance(node.test, ast.Call):
+                continue
+            checker = _name(node.test.func)
+            args = node.test.args
+            if checker is None or len(args) != 1:
+                continue
+            target = _name(args[0])
+            if (target, checker) in wanted and _directly_raises_value_error(node):
+                found.add((target, checker))
+        if found == wanted:
+            return True
+    return False
+
+
 def _has_session_path_validation_loop(tree: ast.Module) -> bool:
+    if _has_session_path_validation_ifs(tree):
+        return True
     for node in ast.walk(tree):
         if not isinstance(node, ast.For):
             continue
@@ -1028,8 +1078,7 @@ VERIFY_CHECKS = {
         ),
         (
             "run.reply_context_sentinel_branch",
-            lambda tree, text: _has_reply_sentinel_compare(tree)
-            and _has_string_constant(tree, "请先回顾上文"),
+            lambda tree, text: _NATIVE_SHAPES.has_reply_context_v2(tree, text),
         ),
         (
             "run.home_prompt_condition",
@@ -1218,7 +1267,7 @@ def apply_steps(root: Path, *, dry_run: bool = False) -> tuple[bool, list[StepRe
             continue
 
         text = texts.setdefault(step.path, path.read_text(encoding="utf-8"))
-        if _all_present(text, step.markers()):
+        if step.already_satisfied(text):
             results.append(StepResult(name=step.name, path=step.path, status="present"))
             continue
         replacement = next(

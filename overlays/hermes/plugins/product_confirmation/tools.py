@@ -289,7 +289,14 @@ def _deliver_to_current_chat(content: str, at_staff_id: str) -> Dict[str, Any]:
     try:
         future = asyncio.run_coroutine_threadsafe(
             adapter.send(
-                chat_id, content, metadata={"at_user_ids": [at_staff_id]}
+                chat_id,
+                content,
+                metadata={
+                    "at_user_ids": [at_staff_id],
+                    # H1 治理第 5 项：这是合法业务投递，出站闸门必须放行
+                    # （误杀即打断场景 2 的需求确认流程）。
+                    "delivery_class": "business_confirm",
+                },
             ),
             loop,
         )

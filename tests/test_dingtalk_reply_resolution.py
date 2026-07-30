@@ -1,4 +1,4 @@
-"""Behavior contract for DingTalk reply-context fail-closed handling."""
+"""Behavior contract for DingTalk reply-context forwarding."""
 
 from __future__ import annotations
 
@@ -62,13 +62,7 @@ def load_stamp_group_text():
 def load_on_message(reply_context):
     tree = ast.parse(ADAPTER_PATH.read_text(encoding="utf-8"), filename=str(ADAPTER_PATH))
     method = None
-    clarification = None
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "_REPLY_CONTEXT_CLARIFICATION"
-            for target in node.targets
-        ):
-            clarification = ast.literal_eval(node.value)
         if isinstance(node, ast.ClassDef) and node.name == "DingTalkAdapter":
             method = next(
                 (
@@ -81,8 +75,6 @@ def load_on_message(reply_context):
             break
     if method is None:
         raise RuntimeError("DingTalkAdapter._on_message not found")
-    if not isinstance(clarification, str) or not clarification:
-        raise RuntimeError("_REPLY_CONTEXT_CLARIFICATION not found")
 
     module = ast.Module(
         body=[
@@ -109,8 +101,6 @@ def load_on_message(reply_context):
         "MessageType": MessageType,
         "_DINGTALK_WEBHOOK_RE": re.compile(r"^https://api\.dingtalk\.com/"),
         "_SESSION_WEBHOOKS_MAX": 500,
-        "_REPLY_CONTEXT_CLARIFICATION": clarification,
-        "_REPLY_ORIGINAL_UNAVAILABLE": reply_context._REPLY_ORIGINAL_UNAVAILABLE,
         "_forwarded_chat_text_from_raw": lambda *args, **kwargs: "",
         "_is_placeholder_text": lambda value: False,
         "_log_forward_diag": lambda *args, **kwargs: None,
@@ -200,25 +190,18 @@ class DingTalkReplyResolutionTest(unittest.TestCase):
         asyncio.run(self.on_message(adapter, message))
         return adapter
 
-    def test_missing_original_clarifies_and_never_starts_model(self):
+    def test_missing_original_reaches_gateway_with_sentinel(self):
         adapter = self.run_message(
             make_message(replied={"msgId": "quoted-1", "msgType": "text"})
         )
 
-        self.assertEqual([], adapter.events)
-        self.assertEqual(1, len(adapter.sent))
-        self.assertEqual("conversation-1", adapter.sent[0]["chat_id"])
-        self.assertEqual("incoming-1", adapter.sent[0]["reply_to"])
-        self.assertIn("没有拿到你引用的原文", adapter.sent[0]["content"])
-
-    def test_clarification_delivery_failure_still_never_starts_model(self):
-        adapter = self.run_message(
-            make_message(replied={"msgId": "quoted-1", "msgType": "text"}),
-            send_success=False,
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assertEqual("quoted-1", adapter.events[0].reply_to_message_id)
+        self.assertEqual(
+            self.reply_context._REPLY_ORIGINAL_UNAVAILABLE,
+            adapter.events[0].reply_to_text,
         )
-
-        self.assertEqual([], adapter.events)
-        self.assertEqual(1, len(adapter.sent))
 
     def test_callback_original_reaches_model_without_clarification(self):
         adapter = self.run_message(

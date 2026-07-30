@@ -8,12 +8,17 @@ import tempfile
 import unittest
 from unittest import mock
 
+# 插件枚举的唯一数据源，见 tests/test_packaging_manifests.py 的表头注释。
+from test_packaging_manifests import PLUGIN_MANIFESTS
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / ".baseline/hermes"
 SCRIPT = ROOT / "scripts/install_dingtalk_kit.py"
 DOCKERFILE = ROOT / "docker/Dockerfile"
-EXPECTED_VERIFIER_CHECKS = 59
+# 61 -> 62：T1 增加安装后 Gateway 分层行为探针
+# gateway.reply_context_layering，不能再只验证 adapter 的固定拒绝。
+EXPECTED_VERIFIER_CHECKS = 62
 
 
 def load_installer():
@@ -67,7 +72,7 @@ class InstallDingTalkKitTest(unittest.TestCase):
             ],
             [item["name"] for item in report["operations"]],
         )
-        self.assertEqual(0, report["compat"]["changed_count"], report)
+        self.assertEqual(1, report["compat"]["changed_count"], report)
         self.assertEqual(EXPECTED_VERIFIER_CHECKS, report["verifier"]["check_count"], report)
         self.assertEqual(0, report["verifier"]["failure_count"], report)
         self.assertTrue((root / "plugins/platforms/dingtalk/adapter.py").is_file())
@@ -332,9 +337,29 @@ class InstallDingTalkKitTest(unittest.TestCase):
 
         self.assertIn("install_dingtalk_kit.py --target /opt/hermes", text)
         self.assertIn("rm -rf /opt/hermes/plugins/platforms/dingtalk", text)
-        self.assertIn("--plugins-only", text)
-        self.assertIn("overlays/hermes/plugins/platforms/dingtalk", text)
-        self.assertIn("overlays/hermes/plugins/product_confirmation", text)
+        # H1 治理第 6 项：两个 ADAPT_REQUIRED 锚点已解除，镜像构建走默认的
+        # legacy-compat 模式（补丁真打、verifier 不静音）。--plugins-only 保留
+        # 为应急出口（core 升级导致锚点漂移时可临时跳过），但不再是常态。
+        self.assertNotIn("--plugins-only", text)
+        # 三个插件目录都必须被 COPY 进镜像：源码没进镜像时，镜像内的 installer
+        # 会报 `<plugin>.source missing-source`。数据源是 test_packaging_manifests
+        # 的 PLUGIN_MANIFESTS，新增插件只需在那里加一行。
+        # H1 治理第 6 项独立验收实测：此前只断言了 dingtalk 与 product_confirmation
+        # 两行，删掉 Dockerfile 里 h1_task_write 那行 COPY 全量测试仍然全绿。
+        copy_sources = set()
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("COPY "):
+                continue
+            tokens = [t for t in line.split()[1:] if not t.startswith("--")]
+            copy_sources.update(tokens[:-1])  # 最后一个 token 是镜像内目标路径
+        for rel_dir, _, _ in PLUGIN_MANIFESTS:
+            with self.subTest(plugin=rel_dir):
+                self.assertIn(
+                    rel_dir,
+                    copy_sources,
+                    f"docker/Dockerfile 没有 COPY {rel_dir}，镜像内 installer 会报 missing-source",
+                )
         self.assertNotIn(
             "adapter.py /opt/hermes/plugins/platforms/dingtalk/adapter.py",
             text,

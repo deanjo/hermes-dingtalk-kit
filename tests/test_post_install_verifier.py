@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 
@@ -13,6 +14,30 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/post_install_verifier.py"
 OVERLAY = ROOT / "overlays/hermes"
+
+# check_count of a fully healthy overlay run, measured before the
+# no-short-circuit change (2026-07-29). Removing the early-exit gates must not
+# swallow any check, so a healthy run stays at or above this number.
+HEALTHY_OVERLAY_CHECK_COUNT = 59
+
+# Behaviour/security probes that live behind the former early-exit gates. They
+# must be emitted even when an earlier group already failed, otherwise a real
+# regression hides as a missing check instead of a failure.
+BEHAVIOR_CHECK_NAMES = (
+    "plugin.manifest",
+    "plugin.entry",
+    "plugin.build_source_signature",
+    "plugin.runtime_discovery",
+    "plugin.raw_process_ack",
+    "plugin.reply_context_kwargs",
+    "plugin.reply_context_forwarded",
+    "product.manifest",
+    "product.entry",
+    "product.public_hook_contract",
+    "gateway.reply_context_layering",
+    "gateway.session_key_slash",
+    "gateway.session_context_bridge",
+)
 
 
 def load_verifier():
@@ -57,7 +82,7 @@ class PostInstallVerifierTest(unittest.TestCase):
         self.assertIn("plugin.runtime_discovery", check_names)
         self.assertIn("plugin.raw_process_ack", check_names)
         self.assertIn("plugin.reply_context_kwargs", check_names)
-        self.assertIn("plugin.reply_context_fail_closed", check_names)
+        self.assertIn("plugin.reply_context_forwarded", check_names)
         self.assertIn("product.manifest", check_names)
         self.assertIn("product.entry", check_names)
         self.assertIn("product.public_hook_contract", check_names)
@@ -67,6 +92,7 @@ class PostInstallVerifierTest(unittest.TestCase):
         self.assertIn("h1_task_write.line_count.tools.py", check_names)
         self.assertIn("gateway.session_key_slash", check_names)
         self.assertIn("gateway.session_context_bridge", check_names)
+        self.assertIn("gateway.reply_context_layering", check_names)
         runtime = next(item for item in report["checks"] if item["name"] == "plugin.runtime_discovery")
         self.assertEqual("skipped", runtime["status"])
         self.assertEqual("Hermes runtime modules not present in target root", runtime["message"])
@@ -202,13 +228,13 @@ class BasePlatformAdapter:
         self.assertNotIn("_REPLY_ORIGINAL_UNAVAILABLE =", serialized)
         self.assertNotIn("class DingTalkAdapter", serialized)
         check_names = {item["name"] for item in report["checks"]}
-        self.assertNotIn("plugin.manifest", check_names)
-        self.assertNotIn("plugin.entry", check_names)
-        self.assertNotIn("plugin.reply_context_kwargs", check_names)
-        self.assertNotIn("plugin.reply_context_fail_closed", check_names)
-        self.assertNotIn("gateway.session_key_slash", check_names)
+        self.assertIn("plugin.manifest", check_names)
+        self.assertIn("plugin.entry", check_names)
+        self.assertIn("plugin.reply_context_kwargs", check_names)
+        self.assertIn("plugin.reply_context_forwarded", check_names)
+        self.assertIn("gateway.session_key_slash", check_names)
 
-    def test_missing_plugin_manifest_fails_before_behavior_probes(self):
+    def test_missing_plugin_manifest_still_emits_behavior_probes(self):
         root = self.make_target()
         (root / "plugins/platforms/dingtalk/plugin.yaml").unlink()
 
@@ -221,10 +247,10 @@ class BasePlatformAdapter:
             failures,
         )
         check_names = {item["name"] for item in report["checks"]}
-        self.assertNotIn("plugin.manifest", check_names)
-        self.assertNotIn("plugin.entry", check_names)
-        self.assertNotIn("plugin.runtime_discovery", check_names)
-        self.assertNotIn("plugin.raw_process_ack", check_names)
+        self.assertIn("plugin.manifest", check_names)
+        self.assertIn("plugin.entry", check_names)
+        self.assertIn("plugin.runtime_discovery", check_names)
+        self.assertIn("plugin.raw_process_ack", check_names)
 
     def test_runtime_probe_env_does_not_inherit_secrets(self):
         root = self.make_target()
@@ -272,25 +298,42 @@ class BasePlatformAdapter:
             failures,
         )
         check_names = {item["name"] for item in report["checks"]}
-        self.assertNotIn("plugin.raw_process_ack", check_names)
-        self.assertNotIn("plugin.reply_context_kwargs", check_names)
-        self.assertNotIn("gateway.session_key_slash", check_names)
+        self.assertIn("plugin.raw_process_ack", check_names)
+        self.assertIn("plugin.reply_context_kwargs", check_names)
+        self.assertIn("gateway.session_key_slash", check_names)
 
-    def test_reply_context_guard_without_return_fails(self):
+    def test_reply_context_forwarding_without_kwargs_expansion_fails(self):
         root = self.make_target()
         adapter = root / "plugins/platforms/dingtalk/adapter.py"
         text = adapter.read_text(encoding="utf-8")
-        marker = (
-            '                logger.warning("[%s] Failed to deliver reply-context clarification", self.name)\n'
-            "            return\n\n"
-            "        event = MessageEvent("
+        self.assertIn("            **reply_kwargs,\n", text)
+        adapter.write_text(
+            text.replace("            **reply_kwargs,\n", "", 1),
+            encoding="utf-8",
         )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "plugin.reply_context_forwarded"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("does not expand reply_kwargs", failure["message"])
+
+    def test_reply_context_policy_reintroduced_in_adapter_fails(self):
+        root = self.make_target()
+        adapter = root / "plugins/platforms/dingtalk/adapter.py"
+        text = adapter.read_text(encoding="utf-8")
+        marker = "        reply_kwargs = build_reply_kwargs(message)\n"
         self.assertIn(marker, text)
         adapter.write_text(
             text.replace(
                 marker,
-                '                logger.warning("[%s] Failed to deliver reply-context clarification", self.name)\n\n'
-                "        event = MessageEvent(",
+                marker
+                + '        if reply_kwargs.get("reply_to_text") == _REPLY_ORIGINAL_UNAVAILABLE:\n'
+                + "            return\n",
                 1,
             ),
             encoding="utf-8",
@@ -301,19 +344,25 @@ class BasePlatformAdapter:
         failure = next(
             item
             for item in report["checks"]
-            if item["name"] == "plugin.reply_context_fail_closed"
+            if item["name"] == "plugin.reply_context_forwarded"
         )
         self.assertEqual("failed", failure["status"])
-        self.assertIn("does not return before dispatch", failure["message"])
+        self.assertIn("still owns unresolved-reply policy", failure["message"])
 
-    def test_reply_context_guard_with_inverted_comparison_fails(self):
+    def test_literal_reply_context_guard_in_adapter_fails(self):
         root = self.make_target()
         adapter = root / "plugins/platforms/dingtalk/adapter.py"
         text = adapter.read_text(encoding="utf-8")
-        marker = 'reply_kwargs.get("reply_to_text") == _REPLY_ORIGINAL_UNAVAILABLE'
+        marker = "        reply_kwargs = build_reply_kwargs(message)\n"
         self.assertIn(marker, text)
         adapter.write_text(
-            text.replace(marker, marker.replace(" == ", " != "), 1),
+            text.replace(
+                marker,
+                marker
+                + '        if reply_kwargs.get("reply_to_text") == "\\\\x00unavailable\\\\x00":\n'
+                + "            return\n",
+                1,
+            ),
             encoding="utf-8",
         )
 
@@ -322,19 +371,19 @@ class BasePlatformAdapter:
         failure = next(
             item
             for item in report["checks"]
-            if item["name"] == "plugin.reply_context_fail_closed"
+            if item["name"] == "plugin.reply_context_forwarded"
         )
         self.assertEqual("failed", failure["status"])
-        self.assertIn("guard not found", failure["message"])
+        self.assertIn("policy branch remains", failure["message"])
 
-    def test_reply_context_guard_with_extra_false_clause_fails(self):
+    def test_gateway_reply_context_without_return_none_fails(self):
         root = self.make_target()
-        adapter = root / "plugins/platforms/dingtalk/adapter.py"
-        text = adapter.read_text(encoding="utf-8")
-        marker = 'reply_kwargs.get("reply_to_text") == _REPLY_ORIGINAL_UNAVAILABLE'
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        marker = "                    return None\n                message_text = (\n"
         self.assertIn(marker, text)
-        adapter.write_text(
-            text.replace(marker, marker + " and False", 1),
+        run_py.write_text(
+            text.replace(marker, "                message_text = (\n", 1),
             encoding="utf-8",
         )
 
@@ -343,25 +392,25 @@ class BasePlatformAdapter:
         failure = next(
             item
             for item in report["checks"]
-            if item["name"] == "plugin.reply_context_fail_closed"
+            if item["name"] == "gateway.reply_context_layering"
         )
         self.assertEqual("failed", failure["status"])
-        self.assertIn("guard not found", failure["message"])
+        self.assertIn("did not clarify once and return None", failure["message"])
 
-    def test_reply_context_guard_with_duplicate_send_fails(self):
+    def test_gateway_reply_context_caller_tool_before_stop_fails(self):
         root = self.make_target()
-        adapter = root / "plugins/platforms/dingtalk/adapter.py"
-        text = adapter.read_text(encoding="utf-8")
-        marker = (
-            "            result = await self.send(\n"
-            "                chat_id,\n"
-            "                _REPLY_CONTEXT_CLARIFICATION,\n"
-            "                reply_to=msg_id,\n"
-            "            )\n"
-        )
-        self.assertIn(marker, text)
-        adapter.write_text(
-            text.replace(marker, marker + marker.replace("result = ", ""), 1),
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        marker = "        if message_text is None:\n            return\n"
+        self.assertEqual(1, text.count(marker))
+        run_py.write_text(
+            text.replace(
+                marker,
+                "        if message_text is None:\n"
+                "            await self._dispatch_business_tool_before_stop()\n"
+                "            return\n",
+                1,
+            ),
             encoding="utf-8",
         )
 
@@ -370,89 +419,586 @@ class BasePlatformAdapter:
         failure = next(
             item
             for item in report["checks"]
-            if item["name"] == "plugin.reply_context_fail_closed"
+            if item["name"] == "gateway.reply_context_layering"
         )
         self.assertEqual("failed", failure["status"])
-        self.assertIn("exactly one send", failure["message"])
+        self.assertIn("prepare callers are not all fail-closed", failure["message"])
 
-    def test_reply_context_guard_with_wrong_chat_fails(self):
+    def test_gateway_reply_context_caller_return_expression_call_fails(self):
+        mutations = (
+            (
+                "        if message_text is None:\n            return\n",
+                "        if message_text is None:\n"
+                "            return await self._dispatch_business_tool_before_stop()\n",
+            ),
+            (
+                "                    if next_message is None:\n"
+                "                        return result\n",
+                "                    if next_message is None:\n"
+                "                        return await self._dispatch_business_tool_before_stop()\n",
+            ),
+        )
+        for marker, replacement in mutations:
+            with self.subTest(marker=marker):
+                root = self.make_target()
+                run_py = root / "gateway/run.py"
+                text = run_py.read_text(encoding="utf-8")
+                self.assertEqual(1, text.count(marker))
+                run_py.write_text(
+                    text.replace(marker, replacement, 1),
+                    encoding="utf-8",
+                )
+
+                report = self.verifier.build_report(root)
+
+                failure = next(
+                    item
+                    for item in report["checks"]
+                    if item["name"] == "gateway.reply_context_layering"
+                )
+                self.assertEqual("failed", failure["status"])
+                self.assertIn("prepare callers are not all fail-closed", failure["message"])
+
+    def test_gateway_reply_context_caller_prepare_call_side_effects_fail(self):
+        mutations = (
+            (
+                "message_text = await self._prepare_inbound_message_text(",
+                "message_text = await decoy._prepare_inbound_message_text(",
+            ),
+            (
+                "next_message = await self._prepare_inbound_message_text(",
+                "next_message = await decoy._prepare_inbound_message_text(",
+            ),
+            (
+                "message_text = await self._prepare_inbound_message_text(\n"
+                "            event=event,\n",
+                "message_text = await self._prepare_inbound_message_text(\n"
+                "            event=await self._dispatch_business_tool_before_stop(),\n",
+            ),
+            (
+                "next_message = await self._prepare_inbound_message_text(\n"
+                "                        event=pending_event,\n",
+                "next_message = await self._prepare_inbound_message_text(\n"
+                "                        event=self._dispatch_business_tool_before_stop(),\n",
+            ),
+        )
+        for marker, replacement in mutations:
+            with self.subTest(marker=marker):
+                root = self.make_target()
+                run_py = root / "gateway/run.py"
+                text = run_py.read_text(encoding="utf-8")
+                self.assertEqual(1, text.count(marker))
+                run_py.write_text(
+                    text.replace(marker, replacement, 1),
+                    encoding="utf-8",
+                )
+
+                report = self.verifier.build_report(root)
+
+                failure = next(
+                    item
+                    for item in report["checks"]
+                    if item["name"] == "gateway.reply_context_layering"
+                )
+                self.assertEqual("failed", failure["status"])
+                self.assertIn("prepare callers are not all fail-closed", failure["message"])
+
+    def test_gateway_reply_context_caller_semantic_binding_mutations_fail(self):
+        mutations = (
+            (
+                (
+                    "            event=event,\n"
+                    "            source=source,\n"
+                    "            history=history,\n",
+                    "            event=history,\n"
+                    "            source=source,\n"
+                    "            history=event,\n",
+                ),
+            ),
+            (
+                (
+                    "                        event=pending_event,\n"
+                    "                        source=next_source,\n"
+                    "                        history=updated_history,\n",
+                    "                        event=updated_history,\n"
+                    "                        source=next_source,\n"
+                    "                        history=pending_event,\n",
+                ),
+            ),
+            (
+                (
+                    "message_text = await self._prepare_inbound_message_text(",
+                    "prepared_decoy = await self._prepare_inbound_message_text(",
+                ),
+                (
+                    "        if message_text is None:\n",
+                    "        if prepared_decoy is None:\n",
+                ),
+            ),
+            (
+                (
+                    "next_message = await self._prepare_inbound_message_text(",
+                    "prepared_decoy = await self._prepare_inbound_message_text(",
+                ),
+                (
+                    "                    if next_message is None:\n",
+                    "                    if prepared_decoy is None:\n",
+                ),
+            ),
+        )
+        for replacements in mutations:
+            with self.subTest(replacements=replacements):
+                root = self.make_target()
+                run_py = root / "gateway/run.py"
+                text = run_py.read_text(encoding="utf-8")
+                for marker, replacement in replacements:
+                    self.assertEqual(1, text.count(marker))
+                    text = text.replace(marker, replacement, 1)
+                run_py.write_text(text, encoding="utf-8")
+
+                report = self.verifier.build_report(root)
+
+                failure = next(
+                    item
+                    for item in report["checks"]
+                    if item["name"] == "gateway.reply_context_layering"
+                )
+                self.assertEqual("failed", failure["status"])
+                self.assertIn("prepare callers are not all fail-closed", failure["message"])
+
+    def test_gateway_reply_context_caller_unreachable_mutations_fail(self):
+        cases = (
+            (
+                "first_dead",
+                "        message_text = await self._prepare_inbound_message_text(",
+                "\n\n        # Capture the platform event time",
+            ),
+            (
+                "second_dead",
+                "                    next_message = await self._prepare_inbound_message_text(",
+                "                    next_message_id = self._reply_anchor_for_event",
+            ),
+            (
+                "first_return",
+                "        message_text = await self._prepare_inbound_message_text(",
+                None,
+            ),
+            (
+                "second_return",
+                "                    next_message = await self._prepare_inbound_message_text(",
+                None,
+            ),
+        )
+        for name, start_marker, end_marker in cases:
+            with self.subTest(name=name):
+                root = self.make_target()
+                run_py = root / "gateway/run.py"
+                text = run_py.read_text(encoding="utf-8")
+                self.assertEqual(1, text.count(start_marker))
+                if name.endswith("_dead"):
+                    start = text.index(start_marker)
+                    end = text.index(end_marker, start)
+                    block = text[start:end]
+                    indent = start_marker[: len(start_marker) - len(start_marker.lstrip())]
+                    replacement = indent + "if False:\n" + textwrap.indent(block, "    ")
+                    text = text[:start] + replacement + text[end:]
+                else:
+                    early_return = (
+                        "        return\n"
+                        if name == "first_return"
+                        else "                    return result\n"
+                    )
+                    text = text.replace(
+                        start_marker,
+                        early_return + start_marker,
+                        1,
+                    )
+                run_py.write_text(text, encoding="utf-8")
+
+                report = self.verifier.build_report(root)
+
+                failure = next(
+                    item
+                    for item in report["checks"]
+                    if item["name"] == "gateway.reply_context_layering"
+                )
+                self.assertEqual("failed", failure["status"])
+                self.assertIn("prepare callers are not all fail-closed", failure["message"])
+
+    def test_gateway_reply_context_caller_parent_path_mutations_fail(self):
+        cases = (
+            (
+                "first_wrapper",
+                "        message_text = await self._prepare_inbound_message_text(",
+                "\n\n        # Capture the platform event time",
+                "event is None",
+            ),
+            (
+                "second_wrapper",
+                "                    next_message = await self._prepare_inbound_message_text(",
+                "                    next_message_id = self._reply_anchor_for_event",
+                "pending_event is None",
+            ),
+            (
+                "first_assert",
+                "        message_text = await self._prepare_inbound_message_text(",
+                None,
+                None,
+            ),
+            (
+                "second_assert",
+                "                    next_message = await self._prepare_inbound_message_text(",
+                None,
+                None,
+            ),
+        )
+        for name, start_marker, end_marker, condition in cases:
+            with self.subTest(name=name):
+                root = self.make_target()
+                run_py = root / "gateway/run.py"
+                text = run_py.read_text(encoding="utf-8")
+                self.assertEqual(1, text.count(start_marker))
+                indent = start_marker[: len(start_marker) - len(start_marker.lstrip())]
+                if name.endswith("_wrapper"):
+                    start = text.index(start_marker)
+                    end = text.index(end_marker, start)
+                    block = text[start:end]
+                    replacement = (
+                        indent
+                        + f"if {condition}:\n"
+                        + textwrap.indent(block, "    ")
+                    )
+                    text = text[:start] + replacement + text[end:]
+                else:
+                    text = text.replace(
+                        start_marker,
+                        indent + "assert False\n" + start_marker,
+                        1,
+                    )
+                run_py.write_text(text, encoding="utf-8")
+
+                report = self.verifier.build_report(root)
+
+                failure = next(
+                    item
+                    for item in report["checks"]
+                    if item["name"] == "gateway.reply_context_layering"
+                )
+                self.assertEqual("failed", failure["status"])
+                self.assertIn("prepare callers are not all fail-closed", failure["message"])
+
+    def test_gateway_reply_context_core_session_key_call_shape_passes(self):
         root = self.make_target()
-        adapter = root / "plugins/platforms/dingtalk/adapter.py"
-        text = adapter.read_text(encoding="utf-8")
-        marker = (
-            "            result = await self.send(\n"
-            "                chat_id,\n"
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        first = (
+            "        message_text = await self._prepare_inbound_message_text(\n"
+            "            event=event,\n"
+            "            source=source,\n"
+            "            history=history,\n"
+            "        )\n"
         )
-        self.assertIn(marker, text)
-        adapter.write_text(
-            text.replace(marker, marker.replace("chat_id", '"wrong-chat"'), 1),
-            encoding="utf-8",
+        second = (
+            "                    next_message = await self._prepare_inbound_message_text(\n"
+            "                        event=pending_event,\n"
+            "                        source=next_source,\n"
+            "                        history=updated_history,\n"
+            "                    )\n"
         )
-
-        report = self.verifier.build_report(root)
-
-        failure = next(
-            item
-            for item in report["checks"]
-            if item["name"] == "plugin.reply_context_fail_closed"
-        )
-        self.assertEqual("failed", failure["status"])
-        self.assertIn("wrong chat or content", failure["message"])
-
-    def test_empty_reply_context_clarification_fails(self):
-        root = self.make_target()
-        adapter = root / "plugins/platforms/dingtalk/adapter.py"
-        text = adapter.read_text(encoding="utf-8")
-        start = text.index("_REPLY_CONTEXT_CLARIFICATION = (")
-        end = text.index("\n)\n", start) + 3
-        adapter.write_text(
-            text[:start] + '_REPLY_CONTEXT_CLARIFICATION = ""\n' + text[end:],
-            encoding="utf-8",
-        )
-
-        report = self.verifier.build_report(root)
-
-        failure = next(
-            item
-            for item in report["checks"]
-            if item["name"] == "plugin.reply_context_fail_closed"
-        )
-        self.assertEqual("failed", failure["status"])
-        self.assertIn("clarification text is missing", failure["message"])
-
-    def test_reply_context_guard_that_returns_before_send_fails(self):
-        root = self.make_target()
-        adapter = root / "plugins/platforms/dingtalk/adapter.py"
-        text = adapter.read_text(encoding="utf-8")
-        send_marker = "            result = await self.send(\n"
-        return_marker = (
-            '                logger.warning("[%s] Failed to deliver reply-context clarification", self.name)\n'
-            "            return\n\n"
-            "        event = MessageEvent("
-        )
-        self.assertIn(send_marker, text)
-        self.assertIn(return_marker, text)
-        mutated = text.replace(
-            send_marker,
-            "            return\n" + send_marker,
+        self.assertEqual(1, text.count(first))
+        self.assertEqual(1, text.count(second))
+        text = text.replace(
+            first,
+            first.replace(
+                "            history=history,\n",
+                "            history=history,\n"
+                "            session_key=session_key,\n",
+            ),
             1,
-        ).replace(
-            return_marker,
-            '                logger.warning("[%s] Failed to deliver reply-context clarification", self.name)\n\n'
-            "        event = MessageEvent(",
+        )
+        text = text.replace(
+            second,
+            second.replace(
+                "                        history=updated_history,\n",
+                "                        history=updated_history,\n"
+                "                        session_key=next_session_key,\n",
+            ),
             1,
         )
-        adapter.write_text(mutated, encoding="utf-8")
+        run_py.write_text(text, encoding="utf-8")
+
+        report = self.verifier.build_report(root)
+
+        check = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "gateway.reply_context_layering"
+        )
+        self.assertEqual("ok", check["status"], report)
+
+    def test_gateway_reply_context_duplicate_decoy_branch_fails(self):
+        root = self.make_target()
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        marker = "            if event.reply_to_text == _REPLY_ORIGINAL_UNAVAILABLE:\n"
+        self.assertEqual(1, text.count(marker))
+        run_py.write_text(
+            text.replace(
+                marker,
+                marker + "                pass\n" + marker,
+                1,
+            ),
+            encoding="utf-8",
+        )
 
         report = self.verifier.build_report(root)
 
         failure = next(
             item
             for item in report["checks"]
-            if item["name"] == "plugin.reply_context_fail_closed"
+            if item["name"] == "gateway.reply_context_layering"
         )
         self.assertEqual("failed", failure["status"])
-        self.assertIn("returns before clarification send", failure["message"])
+        self.assertIn("not unique on the direct Gateway reply path", failure["message"])
+
+    def test_gateway_reply_context_single_branch_under_dead_wrapper_fails(self):
+        root = self.make_target()
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        start_marker = (
+            "            if event.reply_to_text == _REPLY_ORIGINAL_UNAVAILABLE:\n"
+        )
+        end_marker = '\n        if "@" in message_text:'
+        start = text.index(start_marker)
+        end = text.index(end_marker, start)
+        live_branch = text[start:end]
+        run_py.write_text(
+            text[:start]
+            + "            if False:\n"
+            + textwrap.indent(live_branch, "    ")
+            + text[end:],
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        self.assertFalse(report["ok"], report)
+        compat_failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "compat.run.reply_context_sentinel_branch"
+        )
+        self.assertEqual("missing-structure", compat_failure["status"])
+        layer_failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "gateway.reply_context_layering"
+        )
+        self.assertEqual("failed", layer_failure["status"])
+        self.assertIn(
+            "not unique on the direct Gateway reply path",
+            layer_failure["message"],
+        )
+
+    def test_gateway_reply_context_preceding_method_return_fails(self):
+        root = self.make_target()
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        marker = (
+            '        if getattr(event, "reply_to_text", None) '
+            "and event.reply_to_message_id:\n"
+        )
+        self.assertEqual(1, text.count(marker))
+        run_py.write_text(
+            text.replace(marker, "        return message_text\n" + marker, 1),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        self.assertFalse(report["ok"], report)
+        compat_failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "compat.run.reply_context_sentinel_branch"
+        )
+        self.assertEqual("missing-structure", compat_failure["status"])
+        layer_failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "gateway.reply_context_layering"
+        )
+        self.assertEqual("failed", layer_failure["status"])
+        self.assertIn(
+            "not unique on the direct Gateway reply path",
+            layer_failure["message"],
+        )
+
+    def test_gateway_reply_context_prefix_reply_state_mutation_fails(self):
+        root = self.make_target()
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        marker = (
+            '        if getattr(event, "reply_to_text", None) '
+            "and event.reply_to_message_id:\n"
+        )
+        self.assertEqual(1, text.count(marker))
+        run_py.write_text(
+            text.replace(marker, "        event.reply_to_text = None\n" + marker, 1),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        self.assertFalse(report["ok"], report)
+        compat_failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "compat.run.reply_context_sentinel_branch"
+        )
+        self.assertEqual("missing-structure", compat_failure["status"])
+        layer_failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "gateway.reply_context_layering"
+        )
+        self.assertEqual("failed", layer_failure["status"])
+        self.assertIn(
+            "not unique on the direct Gateway reply path",
+            layer_failure["message"],
+        )
+
+    def test_gateway_reply_context_with_weakened_prompt_fails(self):
+        root = self.make_target()
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        marker = "只有当引用目标唯一明确时才能继续处理"
+        self.assertIn(marker, text)
+        run_py.write_text(
+            text.replace(marker, "优先参考最近的话题继续处理", 1),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "gateway.reply_context_layering"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("complete V2 contract", failure["message"])
+
+    def test_gateway_reply_context_silent_send_failure_fails(self):
+        root = self.make_target()
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        marker = '                            if not getattr(_reply_result, "success", False):\n'
+        self.assertIn(marker, text)
+        run_py.write_text(
+            text.replace(marker, "                            if False:\n", 1),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "gateway.reply_context_layering"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("did not stay closed with WARNING", failure["message"])
+
+    def test_gateway_reply_context_silent_send_exception_fails(self):
+        root = self.make_target()
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        marker = (
+            "                        except Exception:\n"
+            "                            logger.warning(\n"
+        )
+        self.assertIn(marker, text)
+        run_py.write_text(
+            text.replace(
+                marker,
+                "                        except Exception:\n"
+                "                            logger.warning = lambda *args, **kwargs: None\n"
+                "                            logger.warning(\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "gateway.reply_context_layering"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("exception did not stay closed with WARNING", failure["message"])
+
+    def break_compat_section(self, root: Path) -> None:
+        run_py = root / "gateway/run.py"
+        text = run_py.read_text(encoding="utf-8")
+        run_py.write_text(
+            text.replace("            session_id=context.session_id,\n", ""),
+            encoding="utf-8",
+        )
+
+    def test_compat_failure_does_not_suppress_later_checks(self):
+        root = self.make_target()
+        self.break_compat_section(root)
+
+        report = self.verifier.build_report(root)
+
+        self.assertFalse(report["ok"], report)
+        check_names = {item["name"] for item in report["checks"]}
+        self.assertTrue(
+            any(item["name"] == "compat.run.session_env_fields" for item in report["checks"]),
+            report,
+        )
+        for name in BEHAVIOR_CHECK_NAMES:
+            self.assertIn(name, check_names)
+        self.assertIn("plugin.file.adapter.py", check_names)
+        self.assertIn("product.file.plugin.yaml", check_names)
+        self.assertIn("h1_task_write.file.tools.py", check_names)
+
+    def test_missing_plugin_file_does_not_suppress_behavior_checks(self):
+        root = self.make_target()
+        (root / "plugins/platforms/dingtalk/reply_context.py").unlink()
+
+        report = self.verifier.build_report(root)
+
+        self.assertFalse(report["ok"], report)
+        checks = {item["name"]: item for item in report["checks"]}
+        self.assertEqual("missing-file", checks["plugin.file.reply_context.py"]["status"])
+        for name in BEHAVIOR_CHECK_NAMES:
+            self.assertIn(name, checks)
+        # The probe that depends on the deleted file must surface as an explicit
+        # error result, not vanish from the report.
+        self.assertEqual("error", checks["plugin.reply_context_kwargs"]["status"])
+        self.assertIn("FileNotFoundError", checks["plugin.reply_context_kwargs"]["message"])
+
+    def test_healthy_overlay_keeps_full_check_count(self):
+        report = self.verifier.build_report(OVERLAY)
+
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(0, report["failure_count"], report)
+        self.assertGreaterEqual(report["check_count"], HEALTHY_OVERLAY_CHECK_COUNT, report)
+        self.assertEqual(report["check_count"], len(report["checks"]), report)
+
+    def test_group_producer_exception_becomes_an_explicit_failure(self):
+        def boom() -> list:
+            raise RuntimeError("group blew up")
+
+        results = self.verifier._run_group("plugin.files", "plugins", boom)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("error", results[0].status)
+        self.assertIn("RuntimeError: group blew up", results[0].message)
 
 
 if __name__ == "__main__":

@@ -27,10 +27,12 @@ class PatchMarkersTest(unittest.TestCase):
         self.assertIn("register_callback_handler", text)
         self.assertIn("def _normalize_markdown", text)
 
-    def test_gateway_run_has_reply_sentinel_and_session_id(self):
+    def test_gateway_run_has_reply_v2_and_session_id(self):
         text = (ROOT / "overlays/hermes/gateway/run.py").read_text()
         self.assertIn("_REPLY_ORIGINAL_UNAVAILABLE", text)
-        self.assertIn("请先回顾上文", text)
+        self.assertIn("if not _has_reply_assistant_history", text)
+        self.assertIn("reply_to=source.message_id", text)
+        self.assertIn("只有当引用目标唯一明确时才能继续处理", text)
         self.assertIn("session_id=context.session_id", text)
 
     def test_session_has_dingtalk_slash_safe_key_validator(self):

@@ -8,6 +8,7 @@ MAX_SOURCE_LINES = 1500
 PUBLIC_PYTHON_SOURCES = [
     *sorted(DINGTALK_PLUGIN_ROOT.glob("**/*.py")),
     ROOT / "scripts/compat_patcher.py",
+    ROOT / "scripts/compat_native_shapes.py",
     ROOT / "scripts/post_install_verifier.py",
     ROOT / "scripts/install_dingtalk_kit.py",
 ]

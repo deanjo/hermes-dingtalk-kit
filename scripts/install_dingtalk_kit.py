@@ -25,6 +25,7 @@ PLUGIN_REL = Path("plugins/platforms/dingtalk")
 PLUGIN_FILES = (
     "__init__.py",
     "adapter.py",
+    "delivery_gate.py",
     "incoming.py",
     "markdown.py",
     "media.py",

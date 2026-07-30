@@ -205,11 +205,20 @@ def _non_conversational_metadata(
     *,
     platform: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    """Mark Discord lifecycle/status sends without changing other platforms."""
-    if _gateway_platform_value(platform) != "discord":
+    """Mark lifecycle/status sends so platform adapters can gate them.
+
+    Discord uses ``non_conversational`` for its own routing. DingTalk's
+    outbound gate (H1 governance item 5) keys on the same marker plus an
+    explicit ``delivery_class`` — lifecycle notices (restart, home-channel
+    hints, shutdown) must not reach business groups.
+    """
+    plat = _gateway_platform_value(platform)
+    if plat not in ("discord", "dingtalk"):
         return metadata
     merged = dict(metadata or {})
     merged["non_conversational"] = True
+    if plat == "dingtalk":
+        merged.setdefault("delivery_class", "lifecycle_notice")
     return merged
 
 
@@ -9179,14 +9188,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
             if event.reply_to_text == _REPLY_ORIGINAL_UNAVAILABLE:
-                # T27: user quoted an earlier message but the platform (DingTalk) did
-                # not deliver the original text. We can't render a quote snippet, so
-                # instruct the agent to resolve the reference from conversation history
-                # rather than assuming it points at the most-recent topic.
+                _has_reply_assistant_history = any(
+                    isinstance(item, dict)
+                    and item.get("role") == "assistant"
+                    and bool(str(item.get("content") or "").strip())
+                    for item in history
+                )
+                if not _has_reply_assistant_history:
+                    _reply_adapter = self._adapter_for_source(source)
+                    if _reply_adapter:
+                        try:
+                            _reply_result = await _reply_adapter.send(
+                                source.chat_id,
+                                "我没有拿到你引用的原文，而且当前会话里没有可回顾的历史。"
+                                "请补一句你指的是哪条内容，或把原文贴出来；在确认前我不会开始排查。",
+                                reply_to=source.message_id,
+                                metadata=self._thread_metadata_for_source(source),
+                            )
+                            if not getattr(_reply_result, "success", False):
+                                logger.warning(
+                                    "reply-context unavailable and no usable assistant history: clarification delivery failed"
+                                )
+                        except Exception:
+                            logger.warning(
+                                "reply-context unavailable and no usable assistant history: clarification delivery raised",
+                                exc_info=True,
+                            )
+                    else:
+                        logger.warning(
+                            "reply-context unavailable and no usable assistant history: adapter missing"
+                        )
+                    return None
                 message_text = (
-                    "【系统提示】用户正在引用本会话中更早的一条消息向你提问，但本次未取到被引用消息的原文。"
-                    "请先回顾上文对话历史，找到用户引用的那条具体消息，据此判断用户此处“这个/这个问题/它”"
-                    "等指代的真正对象，再作答；不要想当然地认为指的是最近讨论的话题。\n\n"
+                    "【系统提示】用户正在引用本会话中更早的一条消息向你提问，但平台没有提供被引用原文。"
+                    "只能根据上文历史中真实存在的内容定位引用目标，不得默认选择最近讨论的话题。"
+                    "只有当引用目标唯一明确时才能继续处理；否则只提出一个具体澄清问题。"
+                    "定位前不得调用业务工具，也不得给出新的外部事实结论；不要猜。\n\n"
                     f"{message_text}"
                 )
             else:
@@ -15331,6 +15368,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
+        if _gateway_platform_value(source.platform) == "dingtalk":
+            # 工具进度不是生命周期通知：它承载"我正在做什么"，是时延契约里
+            # 「实质反馈」的候选来源，本轮不拦，只标名以便观察（H1 治理第 5 项）。
+            _progress_metadata = dict(_progress_metadata or {})
+            _progress_metadata["delivery_class"] = "developer_status"
+            _progress_metadata.pop("non_conversational", None)
         _progress_reply_to = (
             event_message_id
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
@@ -16399,11 +16442,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"for the session, `{_p}approve always` to approve permanently, or `{_p}deny` to cancel."
                 )
                 try:
+                    # H1 治理第 5 项：审批卡是框架控制流产物，不进业务群。
+                    _approval_metadata = dict(_status_thread_metadata or {})
+                    _approval_metadata["delivery_class"] = "approval_control"
                     _approval_send_fut = safe_schedule_threadsafe(
                         _status_adapter.send(
                             _status_chat_id,
                             msg,
-                            metadata=_status_thread_metadata,
+                            metadata=_approval_metadata,
                         ),
                         _loop_for_step,
                         logger=logger,
@@ -17035,10 +17081,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             logger.debug("Heartbeat edit failed: %s", _ee)
                             _notify_res = None
                     if not (_notify_res and getattr(_notify_res, "success", False)):
+                        # H1 治理第 5 项：心跳按时延契约不算「实质反馈」，
+                        # 钉钉侧不投递（实质反馈由工具进度/最终回复承担）。
+                        _heartbeat_metadata = _non_conversational_metadata(
+                            _status_thread_metadata, platform=source.platform
+                        )
+                        if _gateway_platform_value(source.platform) == "dingtalk":
+                            _heartbeat_metadata = dict(_heartbeat_metadata or {})
+                            _heartbeat_metadata["delivery_class"] = "heartbeat"
                         _notify_res = await _notify_adapter.send(
                             source.chat_id,
                             _heartbeat_text,
-                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
+                            metadata=_heartbeat_metadata,
                         )
                         if getattr(_notify_res, "success", False) and getattr(
                             _notify_res, "message_id", None

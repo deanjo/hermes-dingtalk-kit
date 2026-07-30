@@ -2,7 +2,7 @@
 
 Hermes DingTalk Kit 是独立维护的 Hermes DingTalk adapter（适配器）与 Product Confirmation（产品确认）源码项目，用来把平台修改先固化为可审阅 Git 提交，再通过安装器进入 Hermes。
 
-当前状态：`PUBLIC / SOURCE_COMPLETE / RELEASE_READY_PRODUCT_ONLY`。Product 与 mention 增量已在 Hermes `569b912d7d0931c7256e9f5fb326609e9deda377` 上用 `--plugins-only` 验证；既有 gateway compat（兼容补丁）仍有两个旧锚点不匹配，结论为 `ADAPT_REQUIRED`，不得在该基线上运行默认安装模式。
+当前状态：`PUBLIC / SOURCE_COMPLETE / RELEASE_READY`。**legacy compat 的两个 `ADAPT_REQUIRED` 锚点已于 2026-07-29 解除**（`run.reply_sentinel_constant` 在当前 core 上自愈；`session.path_sensitive_validation` 通过 `Step.native_marker` 识别 core 的等价实现形态解决），12 个补丁在 core `0f01b5577` 上 apply/verify 全绿且幂等，默认 legacy-compat 模式已可发布。详见 H1 治理第 6 项任务卡 `T6_RELEASE_CHAIN_FIX_20260729.md`。
 
 ## 包含内容
 
@@ -66,7 +66,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/compat_patcher.py --target /opt/her
 
 ## Local Install Chain
 
-`scripts/install_dingtalk_kit.py` 把当前 DingTalk Kit 安装到一个 Hermes root：按声明清单复制 `plugins/platforms/dingtalk/`、`plugins/product_confirmation/` 和 `plugins/h1_intake_proposal/`，再运行 post-install verifier。每个新插件目录先在目标目录旁边、同一文件系统内完成 staging（预备副本），再用“旧目录改名 → 新目录改名”切换；第二步失败会立即把旧目录改回。默认模式保留已有 compat patcher；任一步失败都会恢复安装前的 gateway 三文件和三个旧插件目录。
+`scripts/install_dingtalk_kit.py` 把当前 DingTalk Kit 安装到一个 Hermes root：按声明清单复制 `plugins/platforms/dingtalk/`、`plugins/product_confirmation/` 和 `plugins/h1_task_write/`，再运行 post-install verifier。每个新插件目录先在目标目录旁边、同一文件系统内完成 staging（预备副本），再用“旧目录改名 → 新目录改名”切换；第二步失败会立即把旧目录改回。默认模式保留已有 compat patcher；任一步失败都会恢复安装前的 gateway 三文件和三个旧插件目录。
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/install_dingtalk_kit.py --target /opt/hermes
@@ -74,11 +74,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/install_dingtalk_kit.py --target /o
 PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/install_dingtalk_kit.py --target /opt/hermes --plugins-only --json
 ```
 
-在完整 Hermes `569b912d7d0931c7256e9f5fb326609e9deda377` 临时 root 上，`--plugins-only` 首次安装与再次安装都为 `failure_count=0`、verifier `36/36`，第二次两个插件目录均为 `already matches source`，且 `core_manifest.changed_paths=[]`。默认 legacy-compat 模式会因 `run.reply_sentinel_constant` 与 `session.path_sensitive_validation` 两个旧锚点不匹配而失败，并自动恢复 gateway 三文件和两个旧插件目录；这证明回滚有效，也表示该模式在适配前不可发布。脚本不读取 `.env`，不做真实 DingTalk 网络收发；生产切换属于另行授权的 H1 发布任务。
+**默认 legacy-compat 模式即为发布模式**：在 core `0f01b5577` 上实测 `installation_mode=legacy-compat`、`failure_count=0`，compat 12 步 apply 全绿（present 2 / changed 10），再次 apply 为 `changed_count=0`（幂等）。`--plugins-only` 保留为**应急出口**——core 升级导致锚点漂移时可临时跳过补丁，但它同时会静音 verifier 的 compat 段（历史上造成过假绿），**用它发布前必须先补跑 `compat_patcher --verify`**。脚本不读取 `.env`，不做真实 DingTalk 网络收发；生产切换属于另行授权的 H1 发布任务。
 
 ## Post-Install Verifier
 
-`scripts/post_install_verifier.py` 对安装后的 Hermes root 做只读验收，确认 gateway compat 结构、DingTalk 插件 manifest、Hermes runtime 可发现 `dingtalk` adapter、`raw_process` ACK、引用原文缺失时澄清并在模型前停止、Product 的 5 个工具与公开 hook，以及 `session_key` slash 和 `session_context` bridge 都存在。
+`scripts/post_install_verifier.py` 对安装后的 Hermes root 做只读验收，确认 gateway compat 结构、DingTalk 插件 manifest、Hermes runtime 可发现 `dingtalk` adapter、`raw_process` ACK，以及引用缺原文时的分层合同：adapter 透传 sentinel；Gateway 有非空 assistant 历史才注入严格定位提示，无可用历史则固定澄清并在模型前停止。它还验证 Product 的 5 个工具与公开 hook、`session_key` slash 和 `session_context` bridge。
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/post_install_verifier.py --target /opt/hermes
@@ -86,7 +86,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/post_install_verifier.py --target /
 PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/post_install_verifier.py --target /opt/hermes --plugins-only --json
 ```
 
-本地 overlay 默认模式当前输出 `check_count=51 failure_count=0`，其中 runtime discovery 和 Product public-hook contract 在不含完整 `hermes_cli/` 的 overlay root 上为 `skipped`；完整 Hermes canary root 必须输出 `plugin.runtime_discovery ... runtime_dingtalk_entry=dingtalk plugin=dingtalk-platform`，并且 `product.public_hook_contract` 为 `ok`。这个 verifier 不做真实 DingTalk 网络收发；需要真实消息验收时另开带凭证和脱敏边界的任务。
+本地 overlay 默认模式当前输出 `check_count=62 failure_count=0`（含 compat 段 13 条 = 12 个 Step 各 1 条 + 组级 `compat.verify` 汇总 1 条；去静音前该段为 0 条），其中 **3 条**在只有 overlay、没有完整 Hermes 运行时的 root 上为 `skipped`：`plugin.build_source_signature`（缺 `gateway/platforms/base.py`）、`plugin.runtime_discovery`（缺 Hermes runtime 模块）、`product.public_hook_contract`（缺公开 hook 运行时）；完整 Hermes canary root 必须输出 `plugin.runtime_discovery ... runtime_dingtalk_entry=dingtalk plugin=dingtalk-platform`、`gateway.reply_context_layering ... ok`，并且 `product.public_hook_contract` 为 `ok`。这个 verifier 不做真实 DingTalk 网络收发；需要真实消息验收时另开带凭证和脱敏边界的任务。
 
 ## 发布状态
 
@@ -94,8 +94,8 @@ Product/mention 源码发布满足：
 
 1. `scripts/verify_no_secrets.sh` 通过。
 2. `python3 -m unittest discover -s tests` 通过。
-3. `--plugins-only` installer 与 post-install verifier 门禁已满足，Product/mention 增量核心 diff 为零。
-4. legacy compat 已单列为 `ADAPT_REQUIRED`；适配完成前不得把默认安装模式写成可发布。
+3. 默认（legacy-compat）installer 与 post-install verifier 门禁已满足，Product/mention 增量核心 diff 为零。
+4. legacy compat 两个 `ADAPT_REQUIRED` 锚点已解除，compat 12 步 apply/verify 全绿且幂等，verifier compat 段已去静音（13 条 check 真实产出）。
 
 已提交到 Hermes 官方的拆分 PR。它们是回馈 upstream 的候选，不是安装前提：
 
