@@ -7,6 +7,9 @@ Implements the contract in
       -> WAITING_PRODUCT_CONFIRMATION
           -> PRODUCT_NEEDS_REVISION -> PRODUCT_DRAFT
           -> PRODUCT_APPROVED -> TECH_DESIGN
+              -> WAITING_TECH_DESIGN_CONFIRMATION
+                  -> TECH_DESIGN_NEEDS_REVISION -> TECH_DESIGN
+                  -> TECH_DESIGN_APPROVED
 
 Design constraints (all enforced here, not in prompts/SOUL):
 
@@ -45,6 +48,9 @@ WAITING_PRODUCT_CONFIRMATION = "WAITING_PRODUCT_CONFIRMATION"
 PRODUCT_NEEDS_REVISION = "PRODUCT_NEEDS_REVISION"
 PRODUCT_APPROVED = "PRODUCT_APPROVED"
 TECH_DESIGN = "TECH_DESIGN"
+WAITING_TECH_DESIGN_CONFIRMATION = "WAITING_TECH_DESIGN_CONFIRMATION"
+TECH_DESIGN_NEEDS_REVISION = "TECH_DESIGN_NEEDS_REVISION"
+TECH_DESIGN_APPROVED = "TECH_DESIGN_APPROVED"
 
 # Persistent request-outbox states.  They are deliberately separate from the
 # product workflow states above: CLAIMED means one caller owns the right to
@@ -59,6 +65,9 @@ ALL_STATES = (
     PRODUCT_NEEDS_REVISION,
     PRODUCT_APPROVED,
     TECH_DESIGN,
+    WAITING_TECH_DESIGN_CONFIRMATION,
+    TECH_DESIGN_NEEDS_REVISION,
+    TECH_DESIGN_APPROVED,
 )
 
 # -- decisions ---------------------------------------------------------------
@@ -81,6 +90,7 @@ _DECISION_TO_STATE = {
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS confirmations (
     task_id             TEXT PRIMARY KEY,
+    logical_task_id     TEXT NOT NULL DEFAULT '',
     source_conversation TEXT NOT NULL DEFAULT '',
     product_owner       TEXT NOT NULL DEFAULT '',
     proposal_version    TEXT NOT NULL,
@@ -92,6 +102,15 @@ CREATE TABLE IF NOT EXISTS confirmations (
     confirmed_at        TEXT,
     decision            TEXT,
     decision_evidence   TEXT,
+    tech_design_version TEXT,
+    tech_design_digest  TEXT,
+    tech_design_gate_json TEXT,
+    tech_requested_at   TEXT,
+    tech_request_evidence TEXT,
+    tech_confirm_code_hash TEXT,
+    tech_confirmed_at   TEXT,
+    tech_decision       TEXT,
+    tech_decision_evidence TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
@@ -113,6 +132,15 @@ CREATE TABLE IF NOT EXISTS decision_log (
     accepted         INTEGER NOT NULL,
     reason           TEXT NOT NULL,
     created_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tech_design_versions (
+    task_id             TEXT NOT NULL,
+    tech_design_version TEXT NOT NULL,
+    tech_design_digest  TEXT NOT NULL,
+    tech_design_gate_json TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    PRIMARY KEY (task_id, tech_design_version)
 );
 
 CREATE TABLE IF NOT EXISTS confirmation_requests (
@@ -190,10 +218,33 @@ class ProductConfirmationStore:
         # existing table, so columns added after the first release must be
         # backfilled here or a pre-existing DB file fails every write.
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(confirmations)")}
-        if "confirm_code_hash" not in cols:
-            self._conn.execute(
-                "ALTER TABLE confirmations ADD COLUMN confirm_code_hash TEXT"
-            )
+        additive_columns = {
+            "logical_task_id": "TEXT NOT NULL DEFAULT ''",
+            "confirm_code_hash": "TEXT",
+            "tech_design_version": "TEXT",
+            "tech_design_digest": "TEXT",
+            "tech_design_gate_json": "TEXT",
+            "tech_requested_at": "TEXT",
+            "tech_request_evidence": "TEXT",
+            "tech_confirm_code_hash": "TEXT",
+            "tech_confirmed_at": "TEXT",
+            "tech_decision": "TEXT",
+            "tech_decision_evidence": "TEXT",
+        }
+        for column, declaration in additive_columns.items():
+            if column not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE confirmations ADD COLUMN {column} {declaration}"
+                )
+        self._conn.execute(
+            "UPDATE confirmations SET logical_task_id = task_id"
+            " WHERE logical_task_id IS NULL OR logical_task_id = ''"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS"
+            " idx_confirmations_conversation_logical"
+            " ON confirmations(source_conversation, logical_task_id)"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -206,6 +257,10 @@ class ProductConfirmationStore:
             "SELECT * FROM confirmations WHERE task_id = ?", (task_id,)
         )
         return cur.fetchone()
+
+    @staticmethod
+    def _tech_request_version(tech_design_version: str) -> str:
+        return f"tech:{tech_design_version}"
 
     @staticmethod
     def _to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -238,6 +293,7 @@ class ProductConfirmationStore:
         proposal_digest: str,
         source_conversation: str = "",
         product_owner: str = "",
+        logical_task_id: str = "",
     ) -> Dict[str, Any]:
         """Create a new task in PRODUCT_DRAFT, or re-draft after NEEDS_REVISION.
 
@@ -248,6 +304,7 @@ class ProductConfirmationStore:
         """
         if not task_id or not proposal_version:
             return {"ok": False, "error": "task_id and proposal_version are required"}
+        logical_task_id = logical_task_id or task_id
         now = _now()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -286,10 +343,11 @@ class ProductConfirmationStore:
                         }
                 if row is None:
                     self._conn.execute(
-                        "INSERT INTO confirmations (task_id, source_conversation,"
+                        "INSERT INTO confirmations (task_id, logical_task_id,"
+                        " source_conversation,"
                         " product_owner, proposal_version, proposal_digest, status,"
-                        " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (task_id, source_conversation, product_owner,
+                        " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (task_id, logical_task_id, source_conversation, product_owner,
                          proposal_version, proposal_digest, PRODUCT_DRAFT, now, now),
                     )
                 elif row["status"] in (PRODUCT_DRAFT, PRODUCT_NEEDS_REVISION):
@@ -721,7 +779,12 @@ class ProductConfirmationStore:
                 # Terminal / post-decision states: idempotent on identical
                 # decision, conflict otherwise.
                 effective = row["decision"]
-                if status == TECH_DESIGN:
+                if status in (
+                    TECH_DESIGN,
+                    WAITING_TECH_DESIGN_CONFIRMATION,
+                    TECH_DESIGN_NEEDS_REVISION,
+                    TECH_DESIGN_APPROVED,
+                ):
                     effective = effective or DECISION_APPROVED
                 if effective == canonical:
                     self._log_decision(task_id, proposal_version, actor_id,
@@ -767,8 +830,8 @@ class ProductConfirmationStore:
         """PRODUCT_APPROVED -> TECH_DESIGN (guarded).
 
         This is the only path into TECH_DESIGN, which structurally forbids
-        entering tech design (and thus coding) from PRODUCT_DRAFT or
-        WAITING_PRODUCT_CONFIRMATION.
+        skipping product confirmation. TECH_DESIGN itself is non-coding and
+        must pass the separate technical-design confirmation gate.
         """
         now = _now()
         with self._lock:
@@ -791,26 +854,531 @@ class ProductConfirmationStore:
                 }
         return {"ok": True, "task_id": task_id, "status": TECH_DESIGN}
 
+    def create_tech_design_draft(
+        self,
+        task_id: str,
+        tech_design_version: str,
+        tech_design_digest: str,
+        tech_design_gate_json: str,
+    ) -> Dict[str, Any]:
+        """Register one immutable technical-design version.
+
+        This transition deliberately stops at ``TECH_DESIGN``.  It records a
+        reviewable design artifact and its structured, non-coding gate; a
+        separate delivered request and owner decision are still required.
+        """
+        if not task_id or not tech_design_version or not tech_design_digest:
+            return {
+                "ok": False,
+                "error": "task_id, tech_design_version and tech_design_digest"
+                         " are required",
+            }
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._row(task_id)
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "UNKNOWN_TASK",
+                            "error": f"unknown task {task_id!r}"}
+                if row["status"] not in (TECH_DESIGN, TECH_DESIGN_NEEDS_REVISION):
+                    self._conn.execute("ROLLBACK")
+                    return {
+                        "ok": False,
+                        "status": row["status"],
+                        "error": "a technical-design draft requires TECH_DESIGN"
+                                 " or TECH_DESIGN_NEEDS_REVISION",
+                    }
+                duplicate = self._conn.execute(
+                    "SELECT 1 FROM tech_design_versions WHERE task_id = ?"
+                    " AND tech_design_version = ?",
+                    (task_id, tech_design_version),
+                ).fetchone()
+                if duplicate:
+                    self._conn.execute("ROLLBACK")
+                    return {
+                        "ok": False,
+                        "reason": "IMMUTABLE_VERSION",
+                        "error": f"technical-design version"
+                                 f" {tech_design_version!r} is already registered;"
+                                 " bump the version instead",
+                    }
+                if row["status"] == TECH_DESIGN and row["tech_design_version"]:
+                    in_flight = self._conn.execute(
+                        "SELECT 1 FROM confirmation_requests WHERE task_id = ?"
+                        " AND proposal_version = ? AND state = ?",
+                        (
+                            task_id,
+                            self._tech_request_version(
+                                row["tech_design_version"]
+                            ),
+                            REQUEST_CLAIMED,
+                        ),
+                    ).fetchone()
+                    if in_flight:
+                        self._conn.execute("ROLLBACK")
+                        return {
+                            "ok": False,
+                            "reason": "REQUEST_IN_PROGRESS",
+                            "status": TECH_DESIGN,
+                            "error": "a technical-design confirmation send is"
+                                     " already in progress",
+                        }
+                cur = self._conn.execute(
+                    "UPDATE confirmations SET status = ?,"
+                    " tech_design_version = ?, tech_design_digest = ?,"
+                    " tech_design_gate_json = ?, tech_requested_at = NULL,"
+                    " tech_request_evidence = NULL,"
+                    " tech_confirm_code_hash = NULL,"
+                    " tech_confirmed_at = NULL, tech_decision = NULL,"
+                    " tech_decision_evidence = NULL, updated_at = ?"
+                    " WHERE task_id = ? AND status IN (?, ?)",
+                    (
+                        TECH_DESIGN,
+                        tech_design_version,
+                        tech_design_digest,
+                        tech_design_gate_json,
+                        now,
+                        task_id,
+                        TECH_DESIGN,
+                        TECH_DESIGN_NEEDS_REVISION,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "CONFLICT",
+                            "error": "technical-design state changed concurrently"}
+                self._conn.execute(
+                    "INSERT INTO tech_design_versions (task_id,"
+                    " tech_design_version, tech_design_digest,"
+                    " tech_design_gate_json, created_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        task_id,
+                        tech_design_version,
+                        tech_design_digest,
+                        tech_design_gate_json,
+                        now,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._rollback_quietly()
+                raise
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "status": TECH_DESIGN,
+            "tech_design_version": tech_design_version,
+            "coding_allowed": False,
+            "worker_allowed": False,
+        }
+
+    def claim_tech_design_request(
+        self,
+        task_id: str,
+        tech_design_version: str,
+        claim_id: str,
+        confirm_code_hash: str,
+    ) -> Dict[str, Any]:
+        """Durably claim one technical-design confirmation delivery."""
+        request_version = self._tech_request_version(tech_design_version)
+        now = _now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._row(task_id)
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "acquired": False,
+                            "reason": "UNKNOWN_TASK",
+                            "error": f"unknown task {task_id!r}"}
+                if (
+                    row["status"] != TECH_DESIGN
+                    or row["tech_design_version"] != tech_design_version
+                ):
+                    self._conn.execute("ROLLBACK")
+                    return {
+                        "ok": False,
+                        "acquired": False,
+                        "reason": "NOT_CURRENT_TECH_DESIGN",
+                        "status": row["status"],
+                        "current_version": row["tech_design_version"],
+                        "error": "confirmation requires the current"
+                                 " TECH_DESIGN version",
+                    }
+                request = self._conn.execute(
+                    "SELECT * FROM confirmation_requests WHERE task_id = ?"
+                    " AND proposal_version = ?",
+                    (task_id, request_version),
+                ).fetchone()
+                if request is None:
+                    self._conn.execute(
+                        "INSERT INTO confirmation_requests (task_id,"
+                        " proposal_version, state, claim_id, confirm_code_hash,"
+                        " attempt_count, created_at, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                        (
+                            task_id,
+                            request_version,
+                            REQUEST_CLAIMED,
+                            claim_id,
+                            confirm_code_hash,
+                            now,
+                            now,
+                        ),
+                    )
+                    attempt_count = 1
+                elif request["state"] == REQUEST_FAILED:
+                    self._conn.execute(
+                        "UPDATE confirmation_requests SET state = ?,"
+                        " claim_id = ?, confirm_code_hash = ?,"
+                        " delivery_ref = NULL, last_error = NULL,"
+                        " attempt_count = attempt_count + 1, updated_at = ?"
+                        " WHERE task_id = ? AND proposal_version = ?"
+                        " AND state = ?",
+                        (
+                            REQUEST_CLAIMED,
+                            claim_id,
+                            confirm_code_hash,
+                            now,
+                            task_id,
+                            request_version,
+                            REQUEST_FAILED,
+                        ),
+                    )
+                    attempt_count = int(request["attempt_count"]) + 1
+                else:
+                    self._conn.execute("COMMIT")
+                    state = request["state"]
+                    return {
+                        "ok": state == REQUEST_DELIVERED,
+                        "acquired": False,
+                        "reason": (
+                            "REQUEST_ALREADY_DELIVERED"
+                            if state == REQUEST_DELIVERED
+                            else "REQUEST_IN_PROGRESS"
+                        ),
+                        "request_state": state,
+                        "status": row["status"],
+                        "attempt_count": request["attempt_count"],
+                    }
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._rollback_quietly()
+                raise
+        return {
+            "ok": True,
+            "acquired": True,
+            "task_id": task_id,
+            "tech_design_version": tech_design_version,
+            "request_state": REQUEST_CLAIMED,
+            "attempt_count": attempt_count,
+        }
+
+    def complete_tech_design_request_delivery(
+        self,
+        task_id: str,
+        tech_design_version: str,
+        claim_id: str,
+        delivery_ref: str = "",
+    ) -> Dict[str, Any]:
+        """Commit a delivered second-gate request and enter the waiting state."""
+        request_version = self._tech_request_version(tech_design_version)
+        now = _now()
+        evidence = f"dingtalk_delivery_ref={delivery_ref}"
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                request = self._conn.execute(
+                    "SELECT * FROM confirmation_requests WHERE task_id = ?"
+                    " AND proposal_version = ?",
+                    (task_id, request_version),
+                ).fetchone()
+                if request is None:
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "REQUEST_NOT_CLAIMED",
+                            "error": "no persistent request claim exists"}
+                if request["state"] == REQUEST_DELIVERED:
+                    same_claim = request["claim_id"] == claim_id
+                    self._conn.execute("COMMIT")
+                    return {
+                        "ok": same_claim,
+                        "idempotent": same_claim,
+                        "reason": "REQUEST_ALREADY_DELIVERED",
+                        "request_state": REQUEST_DELIVERED,
+                        "status": WAITING_TECH_DESIGN_CONFIRMATION,
+                    }
+                if (
+                    request["state"] != REQUEST_CLAIMED
+                    or request["claim_id"] != claim_id
+                ):
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "REQUEST_CLAIM_MISMATCH",
+                            "error": "request finalization does not own the claim"}
+                cur = self._conn.execute(
+                    "UPDATE confirmations SET status = ?,"
+                    " tech_requested_at = ?, tech_request_evidence = ?,"
+                    " tech_confirm_code_hash = ?, updated_at = ?"
+                    " WHERE task_id = ? AND tech_design_version = ?"
+                    " AND status = ?",
+                    (
+                        WAITING_TECH_DESIGN_CONFIRMATION,
+                        now,
+                        evidence,
+                        request["confirm_code_hash"],
+                        now,
+                        task_id,
+                        tech_design_version,
+                        TECH_DESIGN,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    self._conn.execute("ROLLBACK")
+                    return {"ok": False, "reason": "FINALIZE_CONFLICT",
+                            "error": "delivered request could not finalize state"}
+                self._conn.execute(
+                    "UPDATE confirmation_requests SET state = ?,"
+                    " delivery_ref = ?, last_error = NULL, updated_at = ?"
+                    " WHERE task_id = ? AND proposal_version = ?"
+                    " AND state = ? AND claim_id = ?",
+                    (
+                        REQUEST_DELIVERED,
+                        delivery_ref or None,
+                        now,
+                        task_id,
+                        request_version,
+                        REQUEST_CLAIMED,
+                        claim_id,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._rollback_quietly()
+                raise
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "tech_design_version": tech_design_version,
+            "status": WAITING_TECH_DESIGN_CONFIRMATION,
+            "request_state": REQUEST_DELIVERED,
+            "requested_at": now,
+        }
+
+    def fail_tech_design_request(
+        self,
+        task_id: str,
+        tech_design_version: str,
+        claim_id: str,
+        error: str,
+    ) -> Dict[str, Any]:
+        """Release a second-gate claim only after definite non-delivery."""
+        result = self.fail_request(
+            task_id,
+            self._tech_request_version(tech_design_version),
+            claim_id,
+            error,
+        )
+        if result.get("ok"):
+            result["status"] = TECH_DESIGN
+        return result
+
+    def apply_tech_design_decision(
+        self,
+        task_id: str,
+        tech_design_version: str,
+        decision: str,
+        actor_id: str,
+        owner_id: str,
+        evidence: str = "",
+        confirmation_code: str = "",
+    ) -> Dict[str, Any]:
+        """Apply the configured owner's decision at the technical-design gate."""
+        canonical = normalize_decision(decision)
+        if canonical is None:
+            return {"ok": False, "applied": False,
+                    "error": "invalid decision; expected APPROVED or"
+                             " NEEDS_REVISION"}
+        log_version = self._tech_request_version(tech_design_version)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._row(task_id)
+                if row is None:
+                    self._log_decision(task_id, log_version, actor_id,
+                                       canonical, False, "UNKNOWN_TASK")
+                    self._conn.execute("COMMIT")
+                    return {"ok": False, "applied": False,
+                            "reason": "UNKNOWN_TASK"}
+                if not actor_id or not owner_id or actor_id != owner_id:
+                    self._log_decision(task_id, log_version, actor_id,
+                                       canonical, False, "NOT_OWNER")
+                    self._conn.execute("COMMIT")
+                    return {"ok": False, "applied": False,
+                            "reason": "NOT_OWNER", "status": row["status"],
+                            "error": "technical-design decision rejected:"
+                                     " replier is not the configured owner"}
+                if tech_design_version != row["tech_design_version"]:
+                    self._log_decision(task_id, log_version, actor_id,
+                                       canonical, False, "STALE_VERSION")
+                    self._conn.execute("COMMIT")
+                    return {
+                        "ok": False,
+                        "applied": False,
+                        "reason": "STALE_VERSION",
+                        "status": row["status"],
+                        "current_version": row["tech_design_version"],
+                    }
+                status = row["status"]
+                stored_code_hash = row["tech_confirm_code_hash"] or ""
+                if status != TECH_DESIGN and stored_code_hash:
+                    supplied = str(confirmation_code or "").strip().lower()
+                    if not supplied or code_hash(supplied) != stored_code_hash:
+                        self._log_decision(task_id, log_version, actor_id,
+                                           canonical, False, "BAD_CODE")
+                        self._conn.execute("COMMIT")
+                        return {"ok": False, "applied": False,
+                                "reason": "BAD_CODE", "status": status,
+                                "error": "missing or wrong technical-design"
+                                         " confirmation code"}
+                if status == WAITING_TECH_DESIGN_CONFIRMATION:
+                    target = (
+                        TECH_DESIGN_APPROVED
+                        if canonical == DECISION_APPROVED
+                        else TECH_DESIGN_NEEDS_REVISION
+                    )
+                    now = _now()
+                    cur = self._conn.execute(
+                        "UPDATE confirmations SET status = ?,"
+                        " tech_decision = ?, tech_confirmed_at = ?,"
+                        " tech_decision_evidence = ?, updated_at = ?"
+                        " WHERE task_id = ? AND status = ?"
+                        " AND tech_design_version = ?",
+                        (
+                            target,
+                            canonical,
+                            now,
+                            evidence,
+                            now,
+                            task_id,
+                            WAITING_TECH_DESIGN_CONFIRMATION,
+                            tech_design_version,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        self._conn.execute("ROLLBACK")
+                        return {"ok": False, "applied": False,
+                                "reason": "CONFLICT"}
+                    self._log_decision(task_id, log_version, actor_id,
+                                       canonical, True, "APPLIED")
+                    self._conn.execute("COMMIT")
+                    return {"ok": True, "applied": True,
+                            "decision": canonical, "status": target,
+                            "confirmed_at": now,
+                            "coding_allowed": False,
+                            "worker_allowed": False}
+                effective = row["tech_decision"]
+                if effective == canonical and status in (
+                    TECH_DESIGN_APPROVED,
+                    TECH_DESIGN_NEEDS_REVISION,
+                ):
+                    self._log_decision(task_id, log_version, actor_id,
+                                       canonical, True, "DUPLICATE")
+                    self._conn.execute("COMMIT")
+                    return {"ok": True, "applied": False, "idempotent": True,
+                            "decision": effective, "status": status,
+                            "coding_allowed": False, "worker_allowed": False}
+                reason = "NOT_WAITING" if status == TECH_DESIGN else "CONFLICT"
+                self._log_decision(task_id, log_version, actor_id,
+                                   canonical, False, reason)
+                self._conn.execute("COMMIT")
+                return {"ok": False, "applied": False, "reason": reason,
+                        "status": status,
+                        "error": "no matching technical-design confirmation"
+                                 " is waiting; state unchanged"}
+            except Exception:
+                self._rollback_quietly()
+                raise
+
     # -- queries ---------------------------------------------------------------
+
+    def resolve_task_key(
+        self, logical_task_id: str, source_conversation: str,
+    ) -> Optional[str]:
+        """Resolve the internal key for a logical id in exactly one session."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT task_id FROM confirmations WHERE logical_task_id = ?"
+                " AND source_conversation = ?",
+                (logical_task_id, source_conversation),
+            ).fetchone()
+        return str(row["task_id"]) if row else None
+
+    def logical_task_exists(self, logical_task_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM confirmations WHERE logical_task_id = ? LIMIT 1",
+                (logical_task_id,),
+            ).fetchone()
+        return row is not None
 
     def get(self, task_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             row = self._row(task_id)
         return self._to_dict(row) if row else None
 
-    def list_pending(self) -> List[Dict[str, Any]]:
-        """All confirmations still waiting on the product owner (restart-safe)."""
+    def list_pending(
+        self, source_conversation: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Waiting product confirmations, optionally scoped to one session."""
         with self._lock:
-            cur = self._conn.execute(
-                "SELECT * FROM confirmations WHERE status = ? ORDER BY requested_at",
-                (WAITING_PRODUCT_CONFIRMATION,),
-            )
+            if source_conversation is None:
+                cur = self._conn.execute(
+                    "SELECT * FROM confirmations WHERE status = ?"
+                    " ORDER BY requested_at",
+                    (WAITING_PRODUCT_CONFIRMATION,),
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT * FROM confirmations WHERE status = ?"
+                    " AND source_conversation = ? ORDER BY requested_at",
+                    (WAITING_PRODUCT_CONFIRMATION, source_conversation),
+                )
+            return [self._to_dict(r) for r in cur.fetchall()]
+
+    def list_pending_tech_design(
+        self, source_conversation: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Waiting second-gate confirmations, optionally scoped to one session."""
+        with self._lock:
+            if source_conversation is None:
+                cur = self._conn.execute(
+                    "SELECT * FROM confirmations WHERE status = ?"
+                    " ORDER BY tech_requested_at",
+                    (WAITING_TECH_DESIGN_CONFIRMATION,),
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT * FROM confirmations WHERE status = ?"
+                    " AND source_conversation = ? ORDER BY tech_requested_at",
+                    (WAITING_TECH_DESIGN_CONFIRMATION, source_conversation),
+                )
             return [self._to_dict(r) for r in cur.fetchall()]
 
     def list_versions(self, task_id: str) -> List[Dict[str, Any]]:
         with self._lock:
             cur = self._conn.execute(
                 "SELECT * FROM confirmation_versions WHERE task_id = ?"
+                " ORDER BY created_at",
+                (task_id,),
+            )
+            return [self._to_dict(r) for r in cur.fetchall()]
+
+    def list_tech_design_versions(self, task_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM tech_design_versions WHERE task_id = ?"
                 " ORDER BY created_at",
                 (task_id,),
             )
@@ -830,16 +1398,36 @@ class ProductConfirmationStore:
             ).fetchone()
         return self._to_dict(row) if row else None
 
-    def list_unsettled_requests(self) -> List[Dict[str, Any]]:
-        """Claims needing reconciliation and failed sends eligible for retry."""
+    def get_tech_design_request_status(
+        self, task_id: str, tech_design_version: str,
+    ) -> Optional[Dict[str, Any]]:
+        row = self.get_request_status(
+            task_id, self._tech_request_version(tech_design_version)
+        )
+        if row:
+            row["tech_design_version"] = tech_design_version
+            row.pop("proposal_version", None)
+        return row
+
+    def list_unsettled_requests(
+        self, source_conversation: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Unsettled outbox rows, optionally scoped to one origin session."""
         with self._lock:
-            cur = self._conn.execute(
-                "SELECT task_id, proposal_version, state, delivery_ref,"
-                " attempt_count, last_error, created_at, updated_at"
-                " FROM confirmation_requests WHERE state IN (?, ?)"
-                " ORDER BY updated_at, task_id",
-                (REQUEST_CLAIMED, REQUEST_FAILED),
+            query = (
+                "SELECT r.task_id, r.proposal_version, r.state,"
+                " r.delivery_ref, r.attempt_count, r.last_error,"
+                " r.created_at, r.updated_at"
+                " FROM confirmation_requests AS r"
+                " JOIN confirmations AS c ON c.task_id = r.task_id"
+                " WHERE r.state IN (?, ?)"
             )
+            params: tuple[Any, ...] = (REQUEST_CLAIMED, REQUEST_FAILED)
+            if source_conversation is not None:
+                query += " AND c.source_conversation = ?"
+                params += (source_conversation,)
+            query += " ORDER BY r.updated_at, r.task_id"
+            cur = self._conn.execute(query, params)
             return [self._to_dict(r) for r in cur.fetchall()]
 
     def decision_history(self, task_id: str) -> List[Dict[str, Any]]:

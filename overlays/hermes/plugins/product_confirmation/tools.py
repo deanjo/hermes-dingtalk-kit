@@ -1,6 +1,6 @@
 """Agent-callable tools for the product-confirmation state machine.
 
-Five narrow tools — draft / request / decide / advance / status — over
+Eight narrow tools — two confirmation gates plus status — over
 :mod:`plugins.product_confirmation.store`. Hard rules live in code, not in
 prompts:
 
@@ -130,23 +130,47 @@ def _current_conversation() -> str:
     return ""
 
 
-def _conversation_mismatch(record: Dict[str, Any]) -> Optional[str]:
-    """Non-None when the current session is not the task's home conversation.
+def _scoped_task_key(logical_task_id: str, source_conversation: str) -> str:
+    """Opaque DB key for the public ``(conversation, task_id)`` namespace."""
+    material = f"{source_conversation}\0{logical_task_id}"
+    return "pc:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
-    Confirmation requests and decisions are bound to the conversation the
-    task was drafted in; a decision arriving from any other chat (including
-    a DM with the owner) is rejected so the model cannot re-route the human
-    gate. An empty ``source_conversation`` (CLI drafts) skips the binding.
-    """
-    bound = record.get("source_conversation") or ""
-    if not bound:
-        return None
+
+def _resolve_scoped_record(
+    store: pc_store.ProductConfirmationStore,
+    logical_task_id: str,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Resolve only in the current conversation and explain cross-chat misses."""
     current = _current_conversation()
-    if current == bound:
-        return None
-    return (f"this task is bound to its origin conversation; the current"
-            f" session ({current or 'unknown'}) does not match — state"
-            " unchanged")
+    internal_task_id = store.resolve_task_key(logical_task_id, current)
+    if internal_task_id:
+        return internal_task_id, store.get(internal_task_id), None
+    if store.logical_task_exists(logical_task_id):
+        return None, None, {
+            "ok": False,
+            "reason": "WRONG_CONVERSATION",
+            "error": "this task id exists, but not in the current origin"
+                     f" conversation ({current or 'unknown'}); state unchanged",
+        }
+    return None, None, {
+        "ok": False,
+        "reason": "UNKNOWN_TASK",
+        "error": f"unknown task {logical_task_id!r} in the current conversation",
+    }
+
+
+def _public_result(result: Dict[str, Any], logical_task_id: str) -> Dict[str, Any]:
+    public = dict(result)
+    if "task_id" in public:
+        public["task_id"] = logical_task_id
+    return public
+
+
+def _public_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    public = dict(record)
+    public["task_id"] = record.get("logical_task_id") or record.get("task_id")
+    public.pop("logical_task_id", None)
+    return public
 
 
 # -- draft ---------------------------------------------------------------------
@@ -175,6 +199,9 @@ PRODUCT_CONFIRM_DRAFT_SCHEMA = {
 def _handle_draft(args: dict, **kw) -> str:
     task_id = str(args.get("task_id") or "").strip()
     version = str(args.get("proposal_version") or "").strip()
+    if not task_id or not version:
+        return _json({"ok": False,
+                      "error": "task_id and proposal_version are required"})
     text = args.get("proposal_text") or ""
     digest = str(args.get("proposal_digest") or "").strip() or (
         _digest(text) if text else ""
@@ -183,13 +210,15 @@ def _handle_draft(args: dict, **kw) -> str:
         return _json({"error": "provide proposal_text or proposal_digest so the"
                                " version can be uniquely identified"})
     source_conversation = _current_conversation()
+    internal_task_id = _scoped_task_key(task_id, source_conversation)
     _, owner_name = _resolve_owner()
     result = _get_store().create_draft(
-        task_id, version, digest,
+        internal_task_id, version, digest,
         source_conversation=source_conversation,
         product_owner=owner_name,
+        logical_task_id=task_id,
     )
-    return _json(result)
+    return _json(_public_result(result, task_id))
 
 
 # -- request -------------------------------------------------------------------
@@ -233,7 +262,7 @@ def _compose_confirmation_message(
         f"### 产品方案确认请求\n"
         f"@{owner_name} 请确认以下产品方案。\n\n"
         f"- **需求**: {args['title']}\n"
-        f"- **task_id**: `{record['task_id']}`\n"
+        f"- **task_id**: `{record['logical_task_id']}`\n"
         f"- **方案版本**: `{record['proposal_version']}`"
         f"（digest `{record['proposal_digest']}`）\n"
         f"- **用户问题**: {args['problem']}\n"
@@ -344,13 +373,16 @@ def _deliver_to_current_chat(content: str, at_staff_id: str) -> Dict[str, Any]:
 
 
 def _handle_request(args: dict, **kw) -> str:
-    task_id = str(args.get("task_id") or "").strip()
+    logical_task_id = str(args.get("task_id") or "").strip()
     version = str(args.get("proposal_version") or "").strip()
     store = _get_store()
-    record = store.get(task_id)
-    if record is None:
-        return _json({"error": f"unknown task {task_id!r}; call"
-                               " product_confirm_draft first"})
+    task_id, record, resolution_error = _resolve_scoped_record(
+        store, logical_task_id
+    )
+    if resolution_error:
+        resolution_error["error"] += "; call product_confirm_draft first"
+        return _json(resolution_error)
+    assert task_id is not None and record is not None
     if record["status"] != pc_store.PRODUCT_DRAFT:
         return _json({"error": f"task is in {record['status']}; a confirmation"
                                " request requires PRODUCT_DRAFT",
@@ -359,9 +391,6 @@ def _handle_request(args: dict, **kw) -> str:
         return _json({"error": f"current proposal version is"
                                f" {record['proposal_version']!r}, not"
                                f" {version!r}"})
-    mismatch = _conversation_mismatch(record)
-    if mismatch:
-        return _json({"error": mismatch, "status": record["status"]})
     owner_staff_id, owner_name = _resolve_owner()
     if not owner_staff_id:
         return _json({"error": "product owner staff id is not configured; set"
@@ -379,13 +408,13 @@ def _handle_request(args: dict, **kw) -> str:
         confirm_code_hash=pc_store.code_hash(confirmation_code),
     )
     if not claim.get("acquired"):
-        return _json(claim)
+        return _json(_public_result(claim, logical_task_id))
     content = _compose_confirmation_message(args, record, owner_name,
                                             confirmation_code)
     delivery = _deliver_to_current_chat(content, owner_staff_id)
     if "error" in delivery:
         if delivery.get("delivery_outcome") == "unknown":
-            return _json({
+            return _json(_public_result({
                 **delivery,
                 "ok": False,
                 "reason": "REQUEST_OUTCOME_UNKNOWN",
@@ -395,14 +424,14 @@ def _handle_request(args: dict, **kw) -> str:
                 "note": "delivery may have happened; the persistent claim is"
                         " retained for manual reconciliation, and another"
                         " request will not be sent automatically",
-            })
+            }, logical_task_id))
         try:
             compensation = store.fail_request(
                 task_id, version, claim_id, delivery["error"]
             )
         except Exception as exc:
             logger.exception("failed to persist product request compensation")
-            return _json({
+            return _json(_public_result({
                 **delivery,
                 "ok": False,
                 "reason": "REQUEST_COMPENSATION_FAILED",
@@ -411,8 +440,8 @@ def _handle_request(args: dict, **kw) -> str:
                 "retryable": False,
                 "note": "delivery was not accepted, but claim release could not"
                         f" be persisted ({type(exc).__name__}); no automatic retry",
-            })
-        return _json({
+            }, logical_task_id))
+        return _json(_public_result({
             **delivery,
             "ok": False,
             "reason": "DELIVERY_FAILED",
@@ -421,7 +450,7 @@ def _handle_request(args: dict, **kw) -> str:
             "retryable": bool(compensation.get("retryable")),
             "note": "delivery was definitely rejected; state remains"
                     " PRODUCT_DRAFT and a later call may retry",
-        })
+        }, logical_task_id))
     try:
         result = store.complete_request_delivery(
             task_id,
@@ -431,7 +460,7 @@ def _handle_request(args: dict, **kw) -> str:
         )
     except Exception as exc:
         logger.exception("failed to finalize delivered product request")
-        return _json({
+        return _json(_public_result({
             "ok": False,
             "error": f"confirmation was delivered but finalization failed:"
                      f" {type(exc).__name__}",
@@ -442,7 +471,7 @@ def _handle_request(args: dict, **kw) -> str:
             "delivery": delivery,
             "note": "claim retained; reconcile before any retry to avoid a"
                     " duplicate confirmation message",
-        })
+        }, logical_task_id))
     if not result.get("ok"):
         result.setdefault("delivery", delivery)
         result.setdefault("retryable", False)
@@ -451,14 +480,14 @@ def _handle_request(args: dict, **kw) -> str:
             "message was delivered; claim retained and no automatic retry is"
             " allowed until the state is reconciled",
         )
-        return _json(result)
+        return _json(_public_result(result, logical_task_id))
     result.setdefault("delivery", delivery)
     result.setdefault(
         "note",
         "the owner's reply must quote the confirmation code from the chat"
         " message; pass it to product_confirm_decide as confirmation_code",
     )
-    return _json(result)
+    return _json(_public_result(result, logical_task_id))
 
 
 # -- decide --------------------------------------------------------------------
@@ -492,7 +521,7 @@ PRODUCT_CONFIRM_DECIDE_SCHEMA = {
 
 
 def _handle_decide(args: dict, **kw) -> str:
-    task_id = str(args.get("task_id") or "").strip()
+    logical_task_id = str(args.get("task_id") or "").strip()
     version = str(args.get("proposal_version") or "").strip()
     decision = str(args.get("decision") or "").strip()
     confirmation_code = str(args.get("confirmation_code") or "").strip()
@@ -506,14 +535,14 @@ def _handle_decide(args: dict, **kw) -> str:
                      " rejected, state unchanged",
         })
     store = _get_store()
-    record = store.get(task_id)
-    if record is not None:
-        mismatch = _conversation_mismatch(record)
-        if mismatch:
-            store.log_rejection(task_id, version, actor_id, decision,
-                                "WRONG_CONVERSATION")
-            return _json({"ok": False, "applied": False,
-                          "reason": "WRONG_CONVERSATION", "error": mismatch})
+    task_id, record, resolution_error = _resolve_scoped_record(
+        store, logical_task_id
+    )
+    if resolution_error:
+        if resolution_error["reason"] == "WRONG_CONVERSATION":
+            resolution_error["applied"] = False
+        return _json(resolution_error)
+    assert task_id is not None and record is not None
     owner_staff_id, _ = _resolve_owner()
     message_id = context.message_id if context else ""
     evidence = (
@@ -531,7 +560,7 @@ def _handle_decide(args: dict, **kw) -> str:
     if result.get("applied") and result.get("decision") == pc_store.DECISION_NEEDS_REVISION:
         result["next"] = ("revise the proposal and register it with"
                           " product_confirm_draft under a new proposal_version")
-    return _json(result)
+    return _json(_public_result(result, logical_task_id))
 
 
 # -- advance -------------------------------------------------------------------
@@ -551,8 +580,505 @@ PRODUCT_CONFIRM_ADVANCE_SCHEMA = {
 
 
 def _handle_advance(args: dict, **kw) -> str:
-    task_id = str(args.get("task_id") or "").strip()
-    return _json(_get_store().enter_tech_design(task_id))
+    logical_task_id = str(args.get("task_id") or "").strip()
+    store = _get_store()
+    task_id, _, resolution_error = _resolve_scoped_record(
+        store, logical_task_id
+    )
+    if resolution_error:
+        return _json(resolution_error)
+    assert task_id is not None
+    return _json(_public_result(
+        store.enter_tech_design(task_id), logical_task_id
+    ))
+
+
+# -- technical-design confirmation -------------------------------------------
+
+_BUGFIX_ENVIRONMENTS = {"local", "dev", "uat", "production"}
+_BUGFIX_LEVELS = {"B0", "B1", "B2", "B3"}
+_CORE_MODULES = {
+    "deep_search_or_search",
+    "llm_or_prompt",
+    "data_model_or_schema",
+}
+
+
+def _validate_tech_design_gate(
+    args: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Build the durable non-coding gate snapshot or return a hard rejection."""
+    work_kind = str(args.get("work_kind") or "").strip().lower()
+    if work_kind not in {"feature", "bugfix"}:
+        return None, {
+            "ok": False,
+            "reason": "INVALID_WORK_KIND",
+            "error": "work_kind must be feature or bugfix",
+        }
+    base = {
+        "work_kind": work_kind,
+        "coding_allowed": False,
+        "worker_allowed": False,
+    }
+    if work_kind == "feature":
+        return base, None
+
+    bugfix = args.get("bugfix_context")
+    if not isinstance(bugfix, dict):
+        return None, {
+            "ok": False,
+            "reason": "BUGFIX_GATE_INCOMPLETE",
+            "error": "bugfix_context is required for a bugfix",
+        }
+    required = (
+        "environment",
+        "tenant_or_scope",
+        "time_window",
+        "reproduction_entry",
+        "risk_level",
+        "change_scope",
+        "deliverable",
+    )
+    missing = [name for name in required if not str(bugfix.get(name) or "").strip()]
+    if "core_modules" not in bugfix:
+        missing.append("core_modules")
+    if missing:
+        return None, {
+            "ok": False,
+            "reason": "BUGFIX_GATE_INCOMPLETE",
+            "missing": missing,
+            "error": "bugfix environment gate is incomplete",
+        }
+    environment = str(bugfix["environment"]).strip().lower()
+    risk_level = str(bugfix["risk_level"]).strip().upper()
+    change_scope = str(bugfix["change_scope"]).strip().lower()
+    deliverable = str(bugfix["deliverable"]).strip().upper()
+    raw_core_modules = bugfix["core_modules"]
+    if not isinstance(raw_core_modules, list):
+        return None, {
+            "ok": False,
+            "reason": "INVALID_CORE_MODULES",
+            "error": "core_modules must be an explicit array; use [] when none apply",
+        }
+    core_modules = sorted({
+        str(item).strip().lower()
+        for item in raw_core_modules
+        if str(item).strip()
+    })
+    unknown_modules = sorted(set(core_modules) - _CORE_MODULES)
+    if environment not in _BUGFIX_ENVIRONMENTS:
+        return None, {
+            "ok": False,
+            "reason": "INVALID_BUGFIX_ENVIRONMENT",
+            "error": "environment must be local, dev, uat or production",
+        }
+    if risk_level not in _BUGFIX_LEVELS:
+        return None, {
+            "ok": False,
+            "reason": "INVALID_BUGFIX_LEVEL",
+            "error": "risk_level must be B0, B1, B2 or B3",
+        }
+    expected_scope = {
+        "B0": "non_behavioral",
+        "B1": "single_surface",
+        "B2": "cross_component",
+    }.get(risk_level)
+    if expected_scope and change_scope != expected_scope:
+        return None, {
+            "ok": False,
+            "reason": "RISK_SCOPE_MISMATCH",
+            "expected_change_scope": expected_scope,
+            "error": f"{risk_level} requires change_scope={expected_scope}",
+        }
+    if risk_level == "B3" and change_scope not in {
+        "core_module",
+        "high_risk",
+    }:
+        return None, {
+            "ok": False,
+            "reason": "RISK_SCOPE_MISMATCH",
+            "error": "B3 requires change_scope=core_module or high_risk",
+        }
+    if unknown_modules:
+        return None, {
+            "ok": False,
+            "reason": "UNKNOWN_CORE_MODULE",
+            "unknown_core_modules": unknown_modules,
+        }
+    if core_modules and risk_level != "B3":
+        return None, {
+            "ok": False,
+            "reason": "CORE_MODULE_REQUIRES_B3",
+            "error": "search, model/prompt, and data-model/schema changes are"
+                     " structurally B3",
+        }
+    if risk_level == "B3" and deliverable != "RCA_PLAN_ONLY":
+        return None, {
+            "ok": False,
+            "reason": "B3_PLAN_ONLY",
+            "error": "B3 may only submit RCA_PLAN_ONLY for confirmation",
+        }
+    if risk_level != "B3" and deliverable not in {
+        "TECHNICAL_DESIGN",
+        "RCA_PLAN_ONLY",
+    }:
+        return None, {
+            "ok": False,
+            "reason": "INVALID_DELIVERABLE",
+            "error": "deliverable must be TECHNICAL_DESIGN or RCA_PLAN_ONLY",
+        }
+    return {
+        **base,
+        "environment": environment,
+        "tenant_or_scope": str(bugfix["tenant_or_scope"]).strip(),
+        "time_window": str(bugfix["time_window"]).strip(),
+        "reproduction_entry": str(bugfix["reproduction_entry"]).strip(),
+        "risk_level": risk_level,
+        "change_scope": change_scope,
+        "core_modules": core_modules,
+        "deliverable": deliverable,
+    }, None
+
+
+TECH_DESIGN_CONFIRM_DRAFT_SCHEMA = {
+    "name": "tech_design_confirm_draft",
+    "description": (
+        "Register an immutable technical-design version after product approval. "
+        "This is a non-coding gate: it never starts a coding worker. Bugfixes "
+        "must explicitly provide environment, B0-B3 risk, change scope, an "
+        "enumerated core_modules assessment (use [] only after checking), and "
+        "deliverable structure; B3 and core-module changes are plan-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string"},
+            "tech_design_version": {"type": "string"},
+            "tech_design_text": {"type": "string"},
+            "tech_design_digest": {"type": "string"},
+            "work_kind": {"type": "string", "enum": ["feature", "bugfix"]},
+            "bugfix_context": {
+                "type": "object",
+                "properties": {
+                    "environment": {
+                        "type": "string",
+                        "enum": ["local", "dev", "uat", "production"],
+                    },
+                    "tenant_or_scope": {"type": "string"},
+                    "time_window": {"type": "string"},
+                    "reproduction_entry": {"type": "string"},
+                    "risk_level": {
+                        "type": "string",
+                        "enum": ["B0", "B1", "B2", "B3"],
+                    },
+                    "change_scope": {
+                        "type": "string",
+                        "enum": [
+                            "non_behavioral",
+                            "single_surface",
+                            "cross_component",
+                            "core_module",
+                            "high_risk",
+                        ],
+                    },
+                    "core_modules": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": sorted(_CORE_MODULES),
+                        },
+                    },
+                    "deliverable": {
+                        "type": "string",
+                        "enum": ["TECHNICAL_DESIGN", "RCA_PLAN_ONLY"],
+                    },
+                },
+                "required": [
+                    "environment",
+                    "tenant_or_scope",
+                    "time_window",
+                    "reproduction_entry",
+                    "risk_level",
+                    "change_scope",
+                    "core_modules",
+                    "deliverable",
+                ],
+            },
+        },
+        "required": ["task_id", "tech_design_version", "work_kind"],
+    },
+}
+
+
+def _handle_tech_design_draft(args: dict, **kw) -> str:
+    logical_task_id = str(args.get("task_id") or "").strip()
+    version = str(args.get("tech_design_version") or "").strip()
+    if not logical_task_id or not version:
+        return _json({"ok": False,
+                      "error": "task_id and tech_design_version are required"})
+    text = str(args.get("tech_design_text") or "")
+    digest = str(args.get("tech_design_digest") or "").strip() or (
+        _digest(text) if text else ""
+    )
+    if not digest:
+        return _json({"ok": False, "reason": "MISSING_DESIGN_DIGEST",
+                      "error": "provide tech_design_text or tech_design_digest"})
+    gate, gate_error = _validate_tech_design_gate(args)
+    if gate_error:
+        return _json(gate_error)
+    store = _get_store()
+    task_id, _, resolution_error = _resolve_scoped_record(
+        store, logical_task_id
+    )
+    if resolution_error:
+        return _json(resolution_error)
+    assert task_id is not None and gate is not None
+    result = store.create_tech_design_draft(
+        task_id,
+        version,
+        digest,
+        json.dumps(gate, ensure_ascii=False, sort_keys=True),
+    )
+    if result.get("ok"):
+        result["gate"] = gate
+    return _json(_public_result(result, logical_task_id))
+
+
+TECH_DESIGN_CONFIRM_REQUEST_SCHEMA = {
+    "name": "tech_design_confirm_request",
+    "description": (
+        "Send the current technical design to the configured owner for the "
+        "second confirmation gate. Delivery is bound to the origin chat and "
+        "uses the same durable one-time-code outbox as product confirmation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string"},
+            "tech_design_version": {"type": "string"},
+            "title": {"type": "string"},
+            "design_summary": {"type": "string"},
+            "risks": {"type": "array", "items": {"type": "string"}},
+            "rollback_plan": {"type": "string"},
+            "verification_plan": {"type": "string"},
+        },
+        "required": [
+            "task_id",
+            "tech_design_version",
+            "title",
+            "design_summary",
+            "risks",
+            "rollback_plan",
+            "verification_plan",
+        ],
+    },
+}
+
+
+def _compose_tech_design_message(
+    args: dict,
+    record: Dict[str, Any],
+    owner_name: str,
+    confirmation_code: str,
+) -> str:
+    gate = json.loads(record["tech_design_gate_json"])
+    risks = "\n".join(f"  - {item}" for item in (args.get("risks") or []))
+    return (
+        "### 技术设计确认请求\n"
+        f"@{owner_name} 请确认以下技术设计。\n\n"
+        f"- **需求**: {args['title']}\n"
+        f"- **task_id**: `{record['logical_task_id']}`\n"
+        f"- **技术设计版本**: `{record['tech_design_version']}`"
+        f"（digest `{record['tech_design_digest']}`）\n"
+        f"- **设计摘要**: {args['design_summary']}\n"
+        f"- **结构化闸门**: `{json.dumps(gate, ensure_ascii=False, sort_keys=True)}`\n"
+        f"- **风险**:\n{risks}\n"
+        f"- **回滚方案**: {args['rollback_plan']}\n"
+        f"- **验证方案**: {args['verification_plan']}\n\n"
+        f"请 {owner_name} **在本群 @我 回复**其中之一，并带上技术设计确认码"
+        f" `{confirmation_code}`：\n"
+        f"1. **技术设计通过 {confirmation_code}**\n"
+        f"2. **技术设计需修改 {confirmation_code}**（请说明修改点）\n\n"
+        "此门只确认技术设计，不启动编码或 worker。"
+    )
+
+
+def _handle_tech_design_request(args: dict, **kw) -> str:
+    logical_task_id = str(args.get("task_id") or "").strip()
+    version = str(args.get("tech_design_version") or "").strip()
+    store = _get_store()
+    task_id, record, resolution_error = _resolve_scoped_record(
+        store, logical_task_id
+    )
+    if resolution_error:
+        return _json(resolution_error)
+    assert task_id is not None and record is not None
+    if (
+        record["status"] != pc_store.TECH_DESIGN
+        or record["tech_design_version"] != version
+    ):
+        return _json({
+            "ok": False,
+            "reason": "NOT_CURRENT_TECH_DESIGN",
+            "status": record["status"],
+            "current_version": record["tech_design_version"],
+        })
+    owner_staff_id, owner_name = _resolve_owner()
+    if not owner_staff_id:
+        return _json({"ok": False, "reason": "OWNER_NOT_CONFIGURED",
+                      "error": "product owner staff id is not configured"})
+    confirmation_code = secrets.token_hex(3)
+    claim_id = secrets.token_hex(16)
+    claim = store.claim_tech_design_request(
+        task_id,
+        version,
+        claim_id,
+        pc_store.code_hash(confirmation_code),
+    )
+    if not claim.get("acquired"):
+        return _json(_public_result(claim, logical_task_id))
+    content = _compose_tech_design_message(
+        args, record, owner_name, confirmation_code
+    )
+    delivery = _deliver_to_current_chat(content, owner_staff_id)
+    if "error" in delivery:
+        if delivery.get("delivery_outcome") == "unknown":
+            return _json({
+                **delivery,
+                "ok": False,
+                "reason": "REQUEST_OUTCOME_UNKNOWN",
+                "request_state": pc_store.REQUEST_CLAIMED,
+                "status": pc_store.TECH_DESIGN,
+                "retryable": False,
+                "coding_allowed": False,
+                "worker_allowed": False,
+            })
+        try:
+            compensation = store.fail_tech_design_request(
+                task_id, version, claim_id, delivery["error"]
+            )
+        except Exception as exc:
+            logger.exception(
+                "failed to persist technical-design request compensation"
+            )
+            return _json({
+                **delivery,
+                "ok": False,
+                "reason": "REQUEST_COMPENSATION_FAILED",
+                "request_state": pc_store.REQUEST_CLAIMED,
+                "status": pc_store.TECH_DESIGN,
+                "retryable": False,
+                "coding_allowed": False,
+                "worker_allowed": False,
+                "note": f"claim retained after {type(exc).__name__}",
+            })
+        return _json({
+            **delivery,
+            "ok": False,
+            "reason": "DELIVERY_FAILED",
+            "request_state": compensation.get("request_state"),
+            "status": pc_store.TECH_DESIGN,
+            "retryable": bool(compensation.get("retryable")),
+            "coding_allowed": False,
+            "worker_allowed": False,
+        })
+    try:
+        result = store.complete_tech_design_request_delivery(
+            task_id,
+            version,
+            claim_id,
+            delivery.get("message_id", ""),
+        )
+    except Exception as exc:
+        logger.exception("failed to finalize technical-design request")
+        return _json({
+            "ok": False,
+            "reason": "REQUEST_FINALIZE_UNKNOWN",
+            "request_state": pc_store.REQUEST_CLAIMED,
+            "status": pc_store.TECH_DESIGN,
+            "retryable": False,
+            "delivery": delivery,
+            "coding_allowed": False,
+            "worker_allowed": False,
+            "note": f"claim retained after {type(exc).__name__}",
+        })
+    result["delivery"] = delivery
+    result["coding_allowed"] = False
+    result["worker_allowed"] = False
+    return _json(_public_result(result, logical_task_id))
+
+
+TECH_DESIGN_CONFIRM_DECIDE_SCHEMA = {
+    "name": "tech_design_confirm_decide",
+    "description": (
+        "Record the configured owner's decision at the second, technical-design "
+        "gate. Identity comes only from the live platform event; wrong session, "
+        "missing identity, stale version, wrong code and conflicting repeats "
+        "fail closed. Approval remains a non-coding terminal state."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string"},
+            "tech_design_version": {"type": "string"},
+            "decision": {
+                "type": "string",
+                "enum": ["APPROVED", "NEEDS_REVISION"],
+            },
+            "confirmation_code": {"type": "string"},
+        },
+        "required": [
+            "task_id",
+            "tech_design_version",
+            "decision",
+            "confirmation_code",
+        ],
+    },
+}
+
+
+def _handle_tech_design_decide(args: dict, **kw) -> str:
+    logical_task_id = str(args.get("task_id") or "").strip()
+    version = str(args.get("tech_design_version") or "").strip()
+    decision = str(args.get("decision") or "").strip()
+    confirmation_code = str(args.get("confirmation_code") or "").strip()
+    context = _dispatch_context.get()
+    actor_id = context.actor_staff_id if context else ""
+    if not actor_id:
+        return _json({"ok": False, "applied": False,
+                      "reason": "NO_ACTOR_IDENTITY",
+                      "error": "cannot verify the configured owner"})
+    store = _get_store()
+    task_id, _, resolution_error = _resolve_scoped_record(
+        store, logical_task_id
+    )
+    if resolution_error:
+        resolution_error["applied"] = False
+        return _json(resolution_error)
+    assert task_id is not None
+    owner_staff_id, _ = _resolve_owner()
+    message_id = context.message_id if context else ""
+    evidence = (
+        f"dingtalk_message_id={message_id};"
+        f"actor_sha={hashlib.sha256(actor_id.encode('utf-8')).hexdigest()[:12]}"
+    )
+    result = store.apply_tech_design_decision(
+        task_id,
+        version,
+        decision,
+        actor_id,
+        owner_staff_id,
+        evidence,
+        confirmation_code,
+    )
+    if result.get("applied"):
+        result["next"] = (
+            "technical design is confirmed; this plugin has no coding or"
+            " worker transition"
+            if result.get("decision") == pc_store.DECISION_APPROVED
+            else "revise and register a new technical-design version"
+        )
+    return _json(_public_result(result, logical_task_id))
 
 
 # -- status --------------------------------------------------------------------
@@ -576,25 +1102,66 @@ PRODUCT_CONFIRM_STATUS_SCHEMA = {
 def _redact(record: Dict[str, Any]) -> Dict[str, Any]:
     # The code hash must never reach the model: revealing it would let a
     # motivated caller offline-brute-force the short one-time code.
-    return {k: v for k, v in record.items() if k != "confirm_code_hash"}
+    return {
+        k: v for k, v in _public_record(record).items()
+        if k not in {"confirm_code_hash", "tech_confirm_code_hash"}
+    }
 
 
 def _handle_status(args: dict, **kw) -> str:
     store = _get_store()
-    task_id = str(args.get("task_id") or "").strip()
-    if task_id:
-        record = store.get(task_id)
-        if record is None:
-            return _json({"error": f"unknown task {task_id!r}"})
+    logical_task_id = str(args.get("task_id") or "").strip()
+    if logical_task_id:
+        task_id, record, resolution_error = _resolve_scoped_record(
+            store, logical_task_id
+        )
+        if resolution_error:
+            return _json(resolution_error)
+        assert task_id is not None and record is not None
+        versions = store.list_versions(task_id)
+        tech_versions = store.list_tech_design_versions(task_id)
+        for item in versions + tech_versions:
+            item["task_id"] = logical_task_id
+        product_request = store.get_request_status(
+            task_id, record["proposal_version"]
+        )
+        if product_request:
+            product_request = _public_result(
+                product_request, logical_task_id
+            )
+        tech_request = (
+            store.get_tech_design_request_status(
+                task_id, record["tech_design_version"]
+            )
+            if record.get("tech_design_version")
+            else None
+        )
+        if tech_request:
+            tech_request = _public_result(tech_request, logical_task_id)
+        decision_log = store.decision_history(task_id)
+        for item in decision_log:
+            item["task_id"] = logical_task_id
         return _json({
             "record": _redact(record),
-            "request": store.get_request_status(
-                task_id, record["proposal_version"]
-            ),
-            "versions": store.list_versions(task_id),
-            "decision_log": store.decision_history(task_id),
+            "request": product_request,
+            "tech_design_request": tech_request,
+            "versions": versions,
+            "tech_design_versions": tech_versions,
+            "decision_log": decision_log,
         })
-    pending = [_redact(r) for r in store.list_pending()]
+    current_conversation = _current_conversation()
+    pending = [
+        _redact(r)
+        for r in store.list_pending(current_conversation)
+    ]
+    pending_tech = [
+        _redact(r)
+        for r in store.list_pending_tech_design(current_conversation)
+    ]
     return _json({"waiting_product_confirmation": pending,
-                  "count": len(pending),
-                  "unsettled_requests": store.list_unsettled_requests()})
+                  "waiting_tech_design_confirmation": pending_tech,
+                  "count": len(pending) + len(pending_tech),
+                  "unsettled_request_count":
+                      len(store.list_unsettled_requests(
+                          current_conversation
+                      ))})

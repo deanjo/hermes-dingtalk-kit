@@ -1,6 +1,6 @@
 """Product-confirmation plugin — standalone, opt-in via ``plugins.enabled``.
 
-Registers five narrow tools implementing the product-confirmation contract
+Registers eight narrow tools implementing the two-gate confirmation contract
 (see ``plugins/product_confirmation/store.py`` for the state machine and
 ``tools.py`` for the identity / delivery rules). Kept ``kind: standalone``
 deliberately: enabling it on a live gateway is an explicit config rollout
@@ -15,11 +15,17 @@ from .tools import (
     PRODUCT_CONFIRM_DRAFT_SCHEMA,
     PRODUCT_CONFIRM_REQUEST_SCHEMA,
     PRODUCT_CONFIRM_STATUS_SCHEMA,
+    TECH_DESIGN_CONFIRM_DECIDE_SCHEMA,
+    TECH_DESIGN_CONFIRM_DRAFT_SCHEMA,
+    TECH_DESIGN_CONFIRM_REQUEST_SCHEMA,
     _handle_advance,
     _handle_decide,
     _handle_draft,
     _handle_request,
     _handle_status,
+    _handle_tech_design_decide,
+    _handle_tech_design_draft,
+    _handle_tech_design_request,
     capture_dispatch_context,
 )
 
@@ -28,6 +34,12 @@ _TOOLS = (
     ("product_confirm_request", PRODUCT_CONFIRM_REQUEST_SCHEMA, _handle_request, "📨"),
     ("product_confirm_decide",  PRODUCT_CONFIRM_DECIDE_SCHEMA,  _handle_decide,  "✅"),
     ("product_confirm_advance", PRODUCT_CONFIRM_ADVANCE_SCHEMA, _handle_advance, "🏗️"),
+    ("tech_design_confirm_draft", TECH_DESIGN_CONFIRM_DRAFT_SCHEMA,
+     _handle_tech_design_draft, "📐"),
+    ("tech_design_confirm_request", TECH_DESIGN_CONFIRM_REQUEST_SCHEMA,
+     _handle_tech_design_request, "📨"),
+    ("tech_design_confirm_decide", TECH_DESIGN_CONFIRM_DECIDE_SCHEMA,
+     _handle_tech_design_decide, "✅"),
     ("product_confirm_status",  PRODUCT_CONFIRM_STATUS_SCHEMA,  _handle_status,  "🔎"),
 )
 

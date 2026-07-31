@@ -385,6 +385,13 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
     def invoke(self, handler, args, **context):
         return asyncio.run(self.invoke_async(handler, args, **context))
 
+    def internal_task_id(self, task_id="T-1", chat_id="conv-1"):
+        return self.store.resolve_task_key(task_id, f"dingtalk:{chat_id}")
+
+    def stored(self, task_id="T-1", chat_id="conv-1"):
+        internal = self.internal_task_id(task_id, chat_id)
+        return self.store.get(internal) if internal else None
+
     @staticmethod
     def draft_args(task_id="T-1", version="v1"):
         return {
@@ -416,7 +423,65 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
         self.assertIsNotNone(match, self.adapter.calls[-1]["content"])
         return requested, match.group(1)
 
-    def test_register_exposes_exactly_five_tools_and_public_hook(self):
+    @staticmethod
+    def tech_draft_args(task_id="T-1", version="td-v1", work_kind="feature"):
+        return {
+            "task_id": task_id,
+            "tech_design_version": version,
+            "tech_design_text": "技术设计正文",
+            "work_kind": work_kind,
+        }
+
+    @staticmethod
+    def tech_request_args(task_id="T-1", version="td-v1"):
+        return {
+            "task_id": task_id,
+            "tech_design_version": version,
+            "title": "采购单导出",
+            "design_summary": "新增只读导出服务",
+            "risks": ["导出数据量"],
+            "rollback_plan": "关闭入口并回滚版本",
+            "verification_plan": "离线、集成与回归测试",
+        }
+
+    def enter_tech_design(self):
+        _, code = self.draft_and_request()
+        decided = self.invoke(
+            self.tools._handle_decide,
+            {
+                "task_id": "T-1",
+                "proposal_version": "v1",
+                "decision": "APPROVED",
+                "confirmation_code": code,
+            },
+        )
+        self.assertTrue(decided["applied"], decided)
+        advanced = self.invoke(
+            self.tools._handle_advance,
+            {"task_id": "T-1"},
+        )
+        self.assertTrue(advanced["ok"], advanced)
+
+    def tech_draft_and_request(self):
+        self.enter_tech_design()
+        drafted = self.invoke(
+            self.tools._handle_tech_design_draft,
+            self.tech_draft_args(),
+        )
+        self.assertTrue(drafted["ok"], drafted)
+        requested = self.invoke(
+            self.tools._handle_tech_design_request,
+            self.tech_request_args(),
+        )
+        self.assertTrue(requested["ok"], requested)
+        match = re.search(
+            r"技术设计确认码 `([0-9a-f]{6})`",
+            self.adapter.calls[-1]["content"],
+        )
+        self.assertIsNotNone(match, self.adapter.calls[-1]["content"])
+        return requested, match.group(1)
+
+    def test_register_exposes_exactly_eight_non_coding_tools_and_public_hook(self):
         class Context:
             def __init__(self):
                 self.tools = []
@@ -437,11 +502,47 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
                 "product_confirm_request",
                 "product_confirm_decide",
                 "product_confirm_advance",
+                "tech_design_confirm_draft",
+                "tech_design_confirm_request",
+                "tech_design_confirm_decide",
                 "product_confirm_status",
             },
             set(context.tools),
         )
+        self.assertFalse(
+            any(
+                "coding" in name.lower() or "worker" in name.lower()
+                for name in context.tools
+            )
+        )
         self.assertEqual(["pre_gateway_dispatch"], [name for name, _ in context.hooks])
+
+    def test_bugfix_schema_requires_structured_classification_fields(self):
+        bugfix_schema = self.tools.TECH_DESIGN_CONFIRM_DRAFT_SCHEMA[
+            "parameters"
+        ]["properties"]["bugfix_context"]
+
+        self.assertEqual(
+            {
+                "environment",
+                "tenant_or_scope",
+                "time_window",
+                "reproduction_entry",
+                "risk_level",
+                "change_scope",
+                "core_modules",
+                "deliverable",
+            },
+            set(bugfix_schema["required"]),
+        )
+        self.assertEqual(
+            {
+                "deep_search_or_search",
+                "llm_or_prompt",
+                "data_model_or_schema",
+            },
+            set(bugfix_schema["properties"]["core_modules"]["items"]["enum"]),
+        )
 
     def test_request_uses_current_chat_and_structured_owner_mention(self):
         request_result, code = self.draft_and_request()
@@ -471,7 +572,7 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
         self.assertNotIn(code.encode(), self.db_path.read_bytes())
         self.assertEqual(
             self.store_module.WAITING_PRODUCT_CONFIRMATION,
-            self.store.get("T-1")["status"],
+            self.stored()["status"],
         )
 
     def test_decision_identity_comes_from_event_source_user_id_alt(self):
@@ -491,7 +592,7 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
         )
 
         self.assertTrue(result["applied"], result)
-        record = self.store.get("T-1")
+        record = self.stored()
         self.assertIn("owner-reply-1", record["decision_evidence"])
         self.assertNotIn(OWNER, record["decision_evidence"])
 
@@ -512,7 +613,7 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
         self.assertEqual("NO_ACTOR_IDENTITY", result["reason"])
         self.assertEqual(
             self.store_module.WAITING_PRODUCT_CONFIRMATION,
-            self.store.get("T-1")["status"],
+            self.stored()["status"],
         )
 
     def test_non_owner_public_hook_identity_is_rejected(self):
@@ -531,7 +632,7 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
 
         self.assertEqual("NOT_OWNER", result["reason"])
 
-    def test_wrong_conversation_is_rejected_and_audited(self):
+    def test_wrong_conversation_is_rejected_without_cross_session_mutation(self):
         _, code = self.draft_and_request()
 
         result = self.invoke(
@@ -547,8 +648,8 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
 
         self.assertEqual("WRONG_CONVERSATION", result["reason"])
         self.assertEqual(
-            "WRONG_CONVERSATION",
-            self.store.decision_history("T-1")[-1]["reason"],
+            self.store_module.WAITING_PRODUCT_CONFIRMATION,
+            self.stored()["status"],
         )
 
     def test_delivery_failure_keeps_product_draft(self):
@@ -557,10 +658,11 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
         self.assertTrue(drafted["ok"], drafted)
 
         failed = self.invoke(self.tools._handle_request, self.request_args())
-        failed_status = self.store.get_request_status("T-1", "v1")
+        internal = self.internal_task_id()
+        failed_status = self.store.get_request_status(internal, "v1")
         self.adapter.success = True
         retried = self.invoke(self.tools._handle_request, self.request_args())
-        delivered_status = self.store.get_request_status("T-1", "v1")
+        delivered_status = self.store.get_request_status(internal, "v1")
         match = re.search(
             r"确认码 `([0-9a-f]{6})`", self.adapter.calls[-1]["content"]
         )
@@ -578,11 +680,11 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
         self.assertIsNotNone(match)
         self.assertEqual(
             self.store_module.WAITING_PRODUCT_CONFIRMATION,
-            self.store.get("T-1")["status"],
+            self.stored()["status"],
         )
         self.assertEqual(
             self.store_module.code_hash(match.group(1)),
-            self.store.get("T-1")["confirm_code_hash"],
+            self.stored()["confirm_code_hash"],
         )
 
     def test_concurrent_request_claim_delivers_exactly_once(self):
@@ -624,8 +726,9 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
         match = re.search(
             r"确认码 `([0-9a-f]{6})`", self.adapter.calls[0]["content"]
         )
-        record = self.store.get("T-1")
-        request = self.store.get_request_status("T-1", "v1")
+        internal = self.internal_task_id()
+        record = self.store.get(internal)
+        request = self.store.get_request_status(internal, "v1")
 
         self.assertTrue(first["ok"], first)
         self.assertEqual(
@@ -654,7 +757,9 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
 
         first = self.invoke(self.tools._handle_request, self.request_args())
         second = self.invoke(self.tools._handle_request, self.request_args())
-        request = self.store.get_request_status("T-1", "v1")
+        request = self.store.get_request_status(
+            self.internal_task_id(), "v1"
+        )
 
         self.assertEqual("REQUEST_OUTCOME_UNKNOWN", first["reason"])
         self.assertFalse(first["retryable"], first)
@@ -693,6 +798,490 @@ class ProductConfirmationPublicHookTest(ProductTestBase):
         )
 
         self.assertIn("proposal_text or proposal_digest", result["error"])
+
+    def test_same_logical_task_id_is_isolated_by_origin_conversation(self):
+        first = self.invoke(
+            self.tools._handle_draft,
+            self.draft_args(task_id="SAME"),
+            chat_id="conv-1",
+        )
+        second = self.invoke(
+            self.tools._handle_draft,
+            self.draft_args(task_id="SAME"),
+            chat_id="conv-2",
+        )
+
+        first_key = self.internal_task_id("SAME", "conv-1")
+        second_key = self.internal_task_id("SAME", "conv-2")
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertIsNotNone(first_key)
+        self.assertIsNotNone(second_key)
+        self.assertNotEqual(first_key, second_key)
+        self.assertEqual("SAME", self.store.get(first_key)["logical_task_id"])
+        self.assertEqual("SAME", self.store.get(second_key)["logical_task_id"])
+
+    def test_second_gate_approval_is_non_coding_terminal_state(self):
+        _, code = self.tech_draft_and_request()
+
+        result = self.invoke(
+            self.tools._handle_tech_design_decide,
+            {
+                "task_id": "T-1",
+                "tech_design_version": "td-v1",
+                "decision": "APPROVED",
+                "confirmation_code": code,
+            },
+        )
+
+        self.assertTrue(result["applied"], result)
+        self.assertEqual(
+            self.store_module.TECH_DESIGN_APPROVED,
+            self.stored()["status"],
+        )
+        self.assertFalse(result["coding_allowed"])
+        self.assertFalse(result["worker_allowed"])
+        self.assertIn("no coding or worker transition", result["next"])
+        self.assertIn("不启动编码或 worker", self.adapter.calls[-1]["content"])
+
+    def test_second_gate_identity_code_and_conversation_fail_closed(self):
+        _, code = self.tech_draft_and_request()
+        payload = {
+            "task_id": "T-1",
+            "tech_design_version": "td-v1",
+            "decision": "APPROVED",
+            "confirmation_code": code,
+        }
+
+        no_identity = self.invoke(
+            self.tools._handle_tech_design_decide, payload, actor=""
+        )
+        non_owner = self.invoke(
+            self.tools._handle_tech_design_decide, payload, actor=OTHER
+        )
+        wrong_conversation = self.invoke(
+            self.tools._handle_tech_design_decide,
+            payload,
+            chat_id="conv-other",
+        )
+        bad_code = self.invoke(
+            self.tools._handle_tech_design_decide,
+            {**payload, "confirmation_code": "000000"},
+        )
+
+        self.assertEqual("NO_ACTOR_IDENTITY", no_identity["reason"])
+        self.assertEqual("NOT_OWNER", non_owner["reason"])
+        self.assertEqual("WRONG_CONVERSATION", wrong_conversation["reason"])
+        self.assertEqual("BAD_CODE", bad_code["reason"])
+        self.assertEqual(
+            self.store_module.WAITING_TECH_DESIGN_CONFIRMATION,
+            self.stored()["status"],
+        )
+
+    def test_second_gate_stale_version_and_duplicate_decision(self):
+        _, code_v1 = self.tech_draft_and_request()
+        revision = self.invoke(
+            self.tools._handle_tech_design_decide,
+            {
+                "task_id": "T-1",
+                "tech_design_version": "td-v1",
+                "decision": "NEEDS_REVISION",
+                "confirmation_code": code_v1,
+            },
+        )
+        self.assertTrue(revision["applied"], revision)
+        redraft = self.invoke(
+            self.tools._handle_tech_design_draft,
+            self.tech_draft_args(version="td-v2"),
+        )
+        self.assertTrue(redraft["ok"], redraft)
+        requested = self.invoke(
+            self.tools._handle_tech_design_request,
+            self.tech_request_args(version="td-v2"),
+        )
+        self.assertTrue(requested["ok"], requested)
+        code_v2 = re.search(
+            r"技术设计确认码 `([0-9a-f]{6})`",
+            self.adapter.calls[-1]["content"],
+        ).group(1)
+
+        stale = self.invoke(
+            self.tools._handle_tech_design_decide,
+            {
+                "task_id": "T-1",
+                "tech_design_version": "td-v1",
+                "decision": "APPROVED",
+                "confirmation_code": code_v1,
+            },
+        )
+        first = self.invoke(
+            self.tools._handle_tech_design_decide,
+            {
+                "task_id": "T-1",
+                "tech_design_version": "td-v2",
+                "decision": "APPROVED",
+                "confirmation_code": code_v2,
+            },
+        )
+        duplicate = self.invoke(
+            self.tools._handle_tech_design_decide,
+            {
+                "task_id": "T-1",
+                "tech_design_version": "td-v2",
+                "decision": "APPROVED",
+                "confirmation_code": code_v2,
+            },
+        )
+
+        self.assertEqual("STALE_VERSION", stale["reason"])
+        self.assertTrue(first["applied"], first)
+        self.assertTrue(duplicate["idempotent"], duplicate)
+
+    def test_second_gate_waiting_and_code_survive_restart(self):
+        _, code = self.tech_draft_and_request()
+        internal = self.internal_task_id()
+        self.store.close()
+        reopened = self.store_module.ProductConfirmationStore(self.db_path)
+        self.store = reopened
+        self.tools._store = reopened
+
+        pending = reopened.list_pending_tech_design()
+        result = self.invoke(
+            self.tools._handle_tech_design_decide,
+            {
+                "task_id": "T-1",
+                "tech_design_version": "td-v1",
+                "decision": "APPROVED",
+                "confirmation_code": code,
+            },
+        )
+
+        self.assertEqual([internal], [row["task_id"] for row in pending])
+        self.assertTrue(result["applied"], result)
+
+    def test_second_gate_concurrent_request_delivers_exactly_once(self):
+        self.enter_tech_design()
+        drafted = self.invoke(
+            self.tools._handle_tech_design_draft,
+            self.tech_draft_args(),
+        )
+        self.assertTrue(drafted["ok"], drafted)
+
+        async def scenario():
+            source = SimpleNamespace(
+                platform=_FakePlatform("dingtalk"),
+                chat_id="conv-1",
+                user_id_alt=OWNER,
+                message_id="tech-request",
+            )
+            self.tools.capture_dispatch_context(
+                SimpleNamespace(source=source, message_id="tech-request"),
+                self.gateway,
+            )
+            self.adapter.started = asyncio.Event()
+            self.adapter.release = asyncio.Event()
+            first_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.tools._handle_tech_design_request,
+                    self.tech_request_args(),
+                )
+            )
+            await asyncio.wait_for(self.adapter.started.wait(), timeout=2)
+            second = json.loads(
+                await asyncio.to_thread(
+                    self.tools._handle_tech_design_request,
+                    self.tech_request_args(),
+                )
+            )
+            self.adapter.release.set()
+            first = json.loads(await first_task)
+            return first, second
+
+        prior_calls = len(self.adapter.calls)
+        first, second = asyncio.run(scenario())
+        self.assertTrue(first["ok"], first)
+        self.assertEqual("REQUEST_IN_PROGRESS", second["reason"])
+        self.assertEqual(prior_calls + 1, len(self.adapter.calls))
+
+    def test_bugfix_gate_freezes_b0_b3_scope_and_b3_plan_only(self):
+        self.enter_tech_design()
+        missing = self.invoke(
+            self.tools._handle_tech_design_draft,
+            {
+                **self.tech_draft_args(work_kind="bugfix"),
+                "bugfix_context": {
+                    "risk_level": "B1",
+                    "change_scope": "single_surface",
+                    "deliverable": "TECHNICAL_DESIGN",
+                },
+            },
+        )
+        missing_core_assessment = self.invoke(
+            self.tools._handle_tech_design_draft,
+            {
+                **self.tech_draft_args(work_kind="bugfix"),
+                "bugfix_context": {
+                    "environment": "uat",
+                    "tenant_or_scope": "tenant-a",
+                    "time_window": "2026-07-30T10:00Z/11:00Z",
+                    "reproduction_entry": "订单详情页",
+                    "risk_level": "B1",
+                    "change_scope": "single_surface",
+                    "deliverable": "TECHNICAL_DESIGN",
+                },
+            },
+        )
+        invalid_core_assessment = self.invoke(
+            self.tools._handle_tech_design_draft,
+            {
+                **self.tech_draft_args(work_kind="bugfix"),
+                "bugfix_context": {
+                    "environment": "uat",
+                    "tenant_or_scope": "tenant-a",
+                    "time_window": "2026-07-30T10:00Z/11:00Z",
+                    "reproduction_entry": "订单详情页",
+                    "risk_level": "B1",
+                    "change_scope": "single_surface",
+                    "core_modules": "none",
+                    "deliverable": "TECHNICAL_DESIGN",
+                },
+            },
+        )
+        b0_behavioral = self.invoke(
+            self.tools._handle_tech_design_draft,
+            {
+                **self.tech_draft_args(work_kind="bugfix"),
+                "bugfix_context": {
+                    "environment": "local",
+                    "tenant_or_scope": "fixture",
+                    "time_window": "offline-test",
+                    "reproduction_entry": "unit test",
+                    "risk_level": "B0",
+                    "change_scope": "single_surface",
+                    "core_modules": [],
+                    "deliverable": "TECHNICAL_DESIGN",
+                },
+            },
+        )
+        core_b1 = self.invoke(
+            self.tools._handle_tech_design_draft,
+            {
+                **self.tech_draft_args(work_kind="bugfix"),
+                "bugfix_context": {
+                    "environment": "uat",
+                    "tenant_or_scope": "tenant-a",
+                    "time_window": "2026-07-30T10:00Z/11:00Z",
+                    "reproduction_entry": "订单详情页",
+                    "risk_level": "B1",
+                    "change_scope": "single_surface",
+                    "core_modules": ["llm_or_prompt"],
+                    "deliverable": "TECHNICAL_DESIGN",
+                },
+            },
+        )
+        b2_single_surface = self.invoke(
+            self.tools._handle_tech_design_draft,
+            {
+                **self.tech_draft_args(work_kind="bugfix"),
+                "bugfix_context": {
+                    "environment": "dev",
+                    "tenant_or_scope": "tenant-a",
+                    "time_window": "2026-07-30T10:00Z/11:00Z",
+                    "reproduction_entry": "订单详情页",
+                    "risk_level": "B2",
+                    "change_scope": "single_surface",
+                    "core_modules": [],
+                    "deliverable": "TECHNICAL_DESIGN",
+                },
+            },
+        )
+        b3_coding = self.invoke(
+            self.tools._handle_tech_design_draft,
+            {
+                **self.tech_draft_args(work_kind="bugfix"),
+                "bugfix_context": {
+                    "environment": "production",
+                    "tenant_or_scope": "tenant-a",
+                    "time_window": "2026-07-30T10:00Z/11:00Z",
+                    "reproduction_entry": "搜索入口",
+                    "risk_level": "B3",
+                    "change_scope": "core_module",
+                    "core_modules": ["deep_search_or_search"],
+                    "deliverable": "TECHNICAL_DESIGN",
+                },
+            },
+        )
+        valid = self.invoke(
+            self.tools._handle_tech_design_draft,
+            {
+                **self.tech_draft_args(work_kind="bugfix"),
+                "bugfix_context": {
+                    "environment": "production",
+                    "tenant_or_scope": "tenant-a",
+                    "time_window": "2026-07-30T10:00Z/11:00Z",
+                    "reproduction_entry": "搜索入口",
+                    "risk_level": "B3",
+                    "change_scope": "core_module",
+                    "core_modules": ["deep_search_or_search"],
+                    "deliverable": "RCA_PLAN_ONLY",
+                },
+            },
+        )
+
+        self.assertEqual("BUGFIX_GATE_INCOMPLETE", missing["reason"])
+        self.assertEqual(
+            "BUGFIX_GATE_INCOMPLETE", missing_core_assessment["reason"]
+        )
+        self.assertEqual(
+            ["core_modules"], missing_core_assessment["missing"]
+        )
+        self.assertEqual(
+            "INVALID_CORE_MODULES", invalid_core_assessment["reason"]
+        )
+        self.assertEqual("RISK_SCOPE_MISMATCH", b0_behavioral["reason"])
+        self.assertEqual("CORE_MODULE_REQUIRES_B3", core_b1["reason"])
+        self.assertEqual("RISK_SCOPE_MISMATCH", b2_single_surface["reason"])
+        self.assertEqual("B3_PLAN_ONLY", b3_coding["reason"])
+        self.assertTrue(valid["ok"], valid)
+        self.assertFalse(valid["gate"]["coding_allowed"])
+        self.assertFalse(valid["gate"]["worker_allowed"])
+
+    def test_pending_status_lists_are_isolated_by_origin_conversation(self):
+        def create_product_pending(logical_task_id, chat_id):
+            conversation = f"dingtalk:{chat_id}"
+            internal = self.tools._scoped_task_key(
+                logical_task_id, conversation
+            )
+            created = self.store.create_draft(
+                internal,
+                "v1",
+                "product-digest",
+                source_conversation=conversation,
+                product_owner="左肖肖",
+                logical_task_id=logical_task_id,
+            )
+            self.assertTrue(created["ok"], created)
+            waiting = self.store.mark_waiting(internal, "v1")
+            self.assertTrue(waiting["ok"], waiting)
+
+        def create_tech_pending(logical_task_id, chat_id):
+            conversation = f"dingtalk:{chat_id}"
+            internal = self.tools._scoped_task_key(
+                logical_task_id, conversation
+            )
+            created = self.store.create_draft(
+                internal,
+                "v1",
+                "product-digest",
+                source_conversation=conversation,
+                product_owner="左肖肖",
+                logical_task_id=logical_task_id,
+            )
+            self.assertTrue(created["ok"], created)
+            code = "a1b2c3"
+            self.store.mark_waiting(
+                internal,
+                "v1",
+                confirm_code_hash=self.store_module.code_hash(code),
+            )
+            approved = self.store.apply_decision(
+                internal,
+                "v1",
+                "APPROVED",
+                actor_id=OWNER,
+                owner_id=OWNER,
+                confirmation_code=code,
+            )
+            self.assertTrue(approved["applied"], approved)
+            self.store.enter_tech_design(internal)
+            tech = self.store.create_tech_design_draft(
+                internal,
+                "td-v1",
+                "tech-digest",
+                json.dumps({
+                    "work_kind": "feature",
+                    "coding_allowed": False,
+                    "worker_allowed": False,
+                }),
+            )
+            self.assertTrue(tech["ok"], tech)
+            claim = self.store.claim_tech_design_request(
+                internal,
+                "td-v1",
+                "claim-tech",
+                self.store_module.code_hash("d4e5f6"),
+            )
+            self.assertTrue(claim["acquired"], claim)
+            delivered = self.store.complete_tech_design_request_delivery(
+                internal,
+                "td-v1",
+                "claim-tech",
+                "sent-tech",
+            )
+            self.assertTrue(delivered["ok"], delivered)
+
+        create_product_pending("P-CONV-1", "conv-1")
+        create_product_pending("P-CONV-2", "conv-2")
+        create_tech_pending("TD-CONV-1", "conv-1")
+        create_tech_pending("TD-CONV-2", "conv-2")
+
+        other_conversation = "dingtalk:conv-2"
+        unsettled_internal = self.tools._scoped_task_key(
+            "OUTBOX-CONV-2", other_conversation
+        )
+        self.store.create_draft(
+            unsettled_internal,
+            "v1",
+            "digest",
+            source_conversation=other_conversation,
+            logical_task_id="OUTBOX-CONV-2",
+        )
+        self.store.claim_request(
+            unsettled_internal,
+            "v1",
+            "claim-outbox",
+            self.store_module.code_hash("f1e2d3"),
+        )
+
+        conv1 = self.invoke(
+            self.tools._handle_status, {}, chat_id="conv-1"
+        )
+        conv2 = self.invoke(
+            self.tools._handle_status, {}, chat_id="conv-2"
+        )
+
+        self.assertEqual(2, conv1["count"])
+        self.assertEqual(
+            ["P-CONV-1"],
+            [
+                row["task_id"]
+                for row in conv1["waiting_product_confirmation"]
+            ],
+        )
+        self.assertEqual(
+            ["TD-CONV-1"],
+            [
+                row["task_id"]
+                for row in conv1["waiting_tech_design_confirmation"]
+            ],
+        )
+        self.assertEqual(0, conv1["unsettled_request_count"])
+        self.assertEqual(2, conv2["count"])
+        self.assertEqual(
+            ["P-CONV-2"],
+            [
+                row["task_id"]
+                for row in conv2["waiting_product_confirmation"]
+            ],
+        )
+        self.assertEqual(
+            ["TD-CONV-2"],
+            [
+                row["task_id"]
+                for row in conv2["waiting_tech_design_confirmation"]
+            ],
+        )
+        self.assertEqual(1, conv2["unsettled_request_count"])
 
 
 if __name__ == "__main__":

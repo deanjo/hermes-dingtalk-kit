@@ -1062,12 +1062,20 @@ def _assert_product_plugin(root: Path) -> str:
             "product_confirm_request",
             "product_confirm_decide",
             "product_confirm_advance",
+            "tech_design_confirm_draft",
+            "tech_design_confirm_request",
+            "tech_design_confirm_decide",
             "product_confirm_status",
         }
         if set(context.tools) != expected_tools:
             raise AssertionError(f"unexpected Product tools: {sorted(context.tools)!r}")
         if [name for name, _ in context.hooks] != ["pre_gateway_dispatch"]:
             raise AssertionError(f"unexpected Product hooks: {context.hooks!r}")
+        if any(
+            "coding" in name.lower() or "worker" in name.lower()
+            for name in context.tools
+        ):
+            raise AssertionError("coding/worker tool exposed by confirmation plugin")
     finally:
         for loaded_name in list(sys.modules):
             if loaded_name == module_name or loaded_name.startswith(module_name + "."):
@@ -1091,7 +1099,7 @@ def _assert_product_plugin(root: Path) -> str:
     missing = [marker for marker in required if marker not in tools_text]
     if missing:
         raise AssertionError("missing public hook wiring: " + ", ".join(missing))
-    return "five Product tools plus pre_gateway_dispatch hook registered"
+    return "eight non-coding confirmation tools plus public hook registered"
 
 
 def _assert_product_manifest(root: Path) -> str:
@@ -1103,12 +1111,15 @@ def _assert_product_manifest(root: Path) -> str:
         "product_confirm_request",
         "product_confirm_decide",
         "product_confirm_advance",
+        "tech_design_confirm_draft",
+        "tech_design_confirm_request",
+        "tech_design_confirm_decide",
         "product_confirm_status",
     ]
     missing = [marker for marker in required if marker not in text]
     if missing:
         raise AssertionError("missing Product manifest markers: " + ", ".join(missing))
-    return "Product manifest declares standalone plugin and five tools"
+    return "Product manifest declares standalone plugin and eight tools"
 
 
 def _product_hook_contract_probe(root: Path) -> CheckResult:
