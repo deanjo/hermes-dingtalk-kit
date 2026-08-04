@@ -338,9 +338,10 @@ def _assert_reply_context(root: Path) -> str:
 
 
 def _assert_reply_context_forwarded(root: Path) -> str:
-    """Ensure the adapter forwards reply facts without making history decisions."""
+    """Ensure unavailable quoted text stops before model dispatch."""
     adapter = root / PLUGIN_REL / "adapter.py"
-    tree = _read_tree(adapter)
+    adapter_text = adapter.read_text(encoding="utf-8")
+    tree = ast.parse(adapter_text, filename=str(adapter))
     method = None
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == "DingTalkAdapter":
@@ -355,12 +356,6 @@ def _assert_reply_context_forwarded(root: Path) -> str:
             break
     if method is None:
         raise AssertionError("DingTalkAdapter._on_message not found")
-    if any(
-        isinstance(node, ast.Name)
-        and node.id in {"_REPLY_CONTEXT_CLARIFICATION", "_REPLY_ORIGINAL_UNAVAILABLE"}
-        for node in ast.walk(method)
-    ):
-        raise AssertionError("adapter still owns unresolved-reply policy")
 
     kwargs_indices: list[int] = []
     event_indices: list[int] = []
@@ -425,9 +420,21 @@ def _assert_reply_context_forwarded(root: Path) -> str:
     )
     if not kwargs_index < event_index < dispatch_index:
         raise AssertionError("reply context is not forwarded in dispatch order")
-    if event_index != kwargs_index + 1:
-        raise AssertionError("adapter policy branch remains between reply parsing and MessageEvent")
-    return "adapter forwards reply kwargs exactly once to MessageEvent"
+    if event_index != kwargs_index + 2:
+        raise AssertionError("unexpected reply policy branch before MessageEvent")
+    guard = method.body[kwargs_index + 1]
+    guard_text = ast.get_source_segment(adapter_text, guard) or ""
+    required = (
+        "__HERMES_REPLY_ORIGINAL_UNAVAILABLE__",
+        "await self.send",
+        "我暂时拿不到你引用消息的原文",
+        '"delivery_class": "business_error"',
+    )
+    if not isinstance(guard, ast.If) or any(item not in guard_text for item in required):
+        raise AssertionError("unavailable reply does not send the required clarification")
+    if guard.orelse or not any(isinstance(node, ast.Return) for node in guard.body):
+        raise AssertionError("unavailable reply does not stop before model dispatch")
+    return "unavailable reply clarifies once; other reply kwargs reach MessageEvent"
 
 
 def _assert_gateway_reply_context_layering(root: Path) -> str:

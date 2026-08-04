@@ -659,9 +659,17 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
-        # Surface reply facts without making a history decision here. Missing
-        # quoted text remains a sentinel for the history-aware Gateway policy.
+        # DingTalk may identify a quoted message without returning its text.
+        # Fail closed here so an internal sentinel never reaches the model.
         reply_kwargs = build_reply_kwargs(message)
+        if reply_kwargs.get("reply_to_text") == "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00":
+            await self.send(
+                chat_id,
+                "我暂时拿不到你引用消息的原文。请把关键原文贴在消息里，或重新描述要我处理的内容。",
+                reply_to=msg_id,
+                metadata={"delivery_class": "business_error"},
+            )
+            return
 
         event = MessageEvent(
             text=text,

@@ -190,18 +190,31 @@ class DingTalkReplyResolutionTest(unittest.TestCase):
         asyncio.run(self.on_message(adapter, message))
         return adapter
 
-    def test_missing_original_reaches_gateway_with_sentinel(self):
+    def test_missing_original_clarifies_without_model_dispatch(self):
         adapter = self.run_message(
             make_message(replied={"msgId": "quoted-1", "msgType": "text"})
         )
 
-        self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assertEqual("quoted-1", adapter.events[0].reply_to_message_id)
+        self.assertEqual([], adapter.events)
+        self.assertEqual(1, len(adapter.sent))
         self.assertEqual(
-            self.reply_context._REPLY_ORIGINAL_UNAVAILABLE,
-            adapter.events[0].reply_to_text,
+            self.reply_context._REPLY_ORIGINAL_CLARIFICATION,
+            adapter.sent[0]["content"],
         )
+        self.assertEqual("incoming-1", adapter.sent[0]["reply_to"])
+        self.assertEqual(
+            {"delivery_class": "business_error"},
+            adapter.sent[0]["metadata"],
+        )
+
+    def test_missing_original_stays_closed_when_clarification_send_fails(self):
+        adapter = self.run_message(
+            make_message(replied={"msgId": "quoted-1", "msgType": "text"}),
+            send_success=False,
+        )
+
+        self.assertEqual([], adapter.events)
+        self.assertEqual(1, len(adapter.sent))
 
     def test_callback_original_reaches_model_without_clarification(self):
         adapter = self.run_message(

@@ -322,7 +322,7 @@ class BasePlatformAdapter:
         self.assertEqual("failed", failure["status"])
         self.assertIn("does not expand reply_kwargs", failure["message"])
 
-    def test_reply_context_policy_reintroduced_in_adapter_fails(self):
+    def test_extra_reply_context_policy_in_adapter_fails(self):
         root = self.make_target()
         adapter = root / "plugins/platforms/dingtalk/adapter.py"
         text = adapter.read_text(encoding="utf-8")
@@ -347,7 +347,7 @@ class BasePlatformAdapter:
             if item["name"] == "plugin.reply_context_forwarded"
         )
         self.assertEqual("failed", failure["status"])
-        self.assertIn("still owns unresolved-reply policy", failure["message"])
+        self.assertIn("unexpected reply policy branch", failure["message"])
 
     def test_literal_reply_context_guard_in_adapter_fails(self):
         root = self.make_target()
@@ -374,7 +374,7 @@ class BasePlatformAdapter:
             if item["name"] == "plugin.reply_context_forwarded"
         )
         self.assertEqual("failed", failure["status"])
-        self.assertIn("policy branch remains", failure["message"])
+        self.assertIn("unexpected reply policy branch", failure["message"])
 
     def test_gateway_reply_context_without_return_none_fails(self):
         root = self.make_target()

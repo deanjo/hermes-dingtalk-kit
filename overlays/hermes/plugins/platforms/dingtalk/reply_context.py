@@ -10,10 +10,12 @@ logger = logging.getLogger(__name__)
 _FORWARD_DIAG_MAX_ITEMS = 8
 _DINGTALK_PLACEHOLDER_TEXTS = {"[图文消息]", "群聊的聊天记录"}
 
-# T27: sentinel meaning "user replied to an earlier message but the platform did
-# not deliver the original text". Value MUST match run.py's _REPLY_ORIGINAL_UNAVAILABLE
-# exactly - run.py keys off it to inject a Chinese back-reference instruction.
+# Internal sentinel meaning "the user replied to an earlier message but DingTalk
+# did not deliver the original text". The adapter consumes it before dispatch.
 _REPLY_ORIGINAL_UNAVAILABLE = "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00"
+_REPLY_ORIGINAL_CLARIFICATION = (
+    "我暂时拿不到你引用消息的原文。请把关键原文贴在消息里，或重新描述要我处理的内容。"
+)
 
 
 def _safe_keys(value: Any) -> List[str]:
@@ -263,7 +265,7 @@ def _extract_replied_text_original(replied: Dict[str, Any]) -> str:
     DingTalk usually omits the original text for a text-reply (``repliedMsg`` carries
     only ``msgId``/``msgType``). When ``content`` is present it may be a plain string
     or a dict such as ``{"content": "..."}`` / ``{"text": "..."}``. Return "" when no
-    usable text is found so the caller can fall back to the sentinel.
+    usable text is found so the adapter can ask the user for clarification.
     """
     content = replied.get("content")
     if isinstance(content, str):
