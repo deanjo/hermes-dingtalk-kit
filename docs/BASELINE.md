@@ -15,16 +15,17 @@ base image: hermes-agent:stable-daocloud
 
 | 文件 | sha256 |
 |---|---|
-| `overlays/hermes/plugins/platforms/dingtalk/adapter.py` | `0b4d2f0dc373e72d7e798794cb9932fc0546161934fbda5df983bfa84318facc` |
+| `overlays/hermes/plugins/platforms/dingtalk/adapter.py` | `67fd0f7fd82eeaff65b394722ac435e8815dbb3c5a4f6dce6f8c58d61d325aed` |
 | `overlays/hermes/plugins/platforms/dingtalk/delivery_gate.py` | `7c3d2682570274a31f398d07e6e5e1b81e9a6f602fdb7903ea6d82c9cb74dd60` |
 | `overlays/hermes/plugins/platforms/dingtalk/incoming.py` | `0153d9e33113b0fa807bb7ea8af2560364bd6b800f45faf862300a300a4e01d0` |
 | `overlays/hermes/plugins/platforms/dingtalk/markdown.py` | `72344b724b6a87fa17c7a75fb8f5001c2ea00be65c0ec879cc088d71e1b80808` |
-| `overlays/hermes/plugins/platforms/dingtalk/media.py` | `ad23f379f3de94fb41c615c88b5aa3c5f930ba4ac8da913cb11a28088ce698c4` |
+| `overlays/hermes/plugins/platforms/dingtalk/media.py` | `0b0a6accdcc9ac7f9db956b645598b73c7ec7833d27dbbd135ea04eece72126c` |
 | `overlays/hermes/plugins/platforms/dingtalk/mentions.py` | `7755bf8621d4c25c1661afc884cd4572b77b446e5e405247277d4d69ecb4b852` |
 | `overlays/hermes/plugins/platforms/dingtalk/plugin_setup.py` | `d658c297f916fcab9c579dc015d30c5df13b632c809eedbe99e4f306553b0dec` |
 | `overlays/hermes/plugins/platforms/dingtalk/private_send.py` | `fd1b0eadce1320760526a997dc8b356031e26ca0af2a4608e2ff3e498c0aec04` |
 | `overlays/hermes/plugins/platforms/dingtalk/reply_context.py` | `0c2718440fb20c7bba3a45511748110dbf46cb247df75c65e910105bc74d45fb` |
 | `overlays/hermes/plugins/platforms/dingtalk/task_binding.py` | `b3079250bd62bb7bf25e2b93e1fd917c07891b2ada6f86ce1bc09a79adf23626` |
+| `overlays/hermes/plugins/platforms/dingtalk/text.py` | `81377dc485271f34410087ca020a072cbe19323ffc7551367844665e77c74c90` |
 | `overlays/hermes/plugins/product_confirmation/store.py` | `00bb443b5a9aa50e04876350a2e883983274dd341ddfadd1307aeba79f931455` |
 | `overlays/hermes/plugins/product_confirmation/tools.py` | `6b28849ad53aa668d8fe1916e5d2ca79254bd7adff1a6ed4fd58a056f2794e26` |
 | `overlays/hermes/plugins/h1_task_write/tools.py` | `964b385eab4025523f97e51b1e9ddb98874d3fb3bacd8a24243dd9bbfc819774` |
@@ -56,6 +57,7 @@ shasum -a 256 \
   overlays/hermes/plugins/platforms/dingtalk/private_send.py \
   overlays/hermes/plugins/platforms/dingtalk/reply_context.py \
   overlays/hermes/plugins/platforms/dingtalk/task_binding.py \
+  overlays/hermes/plugins/platforms/dingtalk/text.py \
   overlays/hermes/plugins/product_confirmation/store.py \
   overlays/hermes/plugins/product_confirmation/tools.py \
   overlays/hermes/plugins/h1_task_write/tools.py \

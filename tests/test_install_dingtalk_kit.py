@@ -17,8 +17,9 @@ BASELINE = ROOT / ".baseline/hermes"
 SCRIPT = ROOT / "scripts/install_dingtalk_kit.py"
 DOCKERFILE = ROOT / "docker/Dockerfile"
 # 61 -> 62：T1 增加安装后 Gateway 分层行为探针
+# 62 -> 64：T2 新增 text.py 的存在性与行数检查
 # gateway.reply_context_layering，不能再只验证 adapter 的固定拒绝。
-EXPECTED_VERIFIER_CHECKS = 62
+EXPECTED_VERIFIER_CHECKS = 64
 
 
 def load_installer():

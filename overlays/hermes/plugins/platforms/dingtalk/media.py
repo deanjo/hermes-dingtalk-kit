@@ -91,10 +91,27 @@ def extract_media(message: "ChatbotMessage", message_type: Any):
     if msg_type_str == "picture" and not media_urls:
         msg_type = message_type.PHOTO
     elif msg_type_str == "richText":
-        msg_type = (
-            message_type.PHOTO
-            if any("image" in t for t in media_types)
-            else message_type.TEXT
-        )
+        if msg_type == message_type.TEXT and any("image" in t for t in media_types):
+            msg_type = message_type.PHOTO
+    elif msg_type_str == "audio":
+        if msg_type == message_type.TEXT:
+            msg_type = message_type.VOICE
+    elif msg_type_str in {"file", "image"}:
+        extensions = getattr(message, "extensions", {}) or {}
+        ext_content = extensions.get("content", {})
+        if isinstance(ext_content, dict):
+            dl_code = ext_content.get("downloadCode") or ""
+            filename = ext_content.get("fileName") or ""
+            if dl_code and dl_code not in media_urls:
+                mime = mimetypes.guess_type(str(filename))[0] if filename else None
+                mime = mime or "application/octet-stream"
+                media_urls.append(dl_code)
+                media_types.append(mime)
+                if msg_type == message_type.TEXT:
+                    msg_type = (
+                        message_type.PHOTO
+                        if msg_type_str == "image" or mime.startswith("image/")
+                        else message_type.DOCUMENT
+                    )
 
     return msg_type, media_urls, media_types

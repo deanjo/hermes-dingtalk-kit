@@ -110,6 +110,7 @@ try:
     from .markdown import normalize_markdown
     from .media import extract_media
     from .mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message, stamp_group_text
+    from .text import extract_text
     from .plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup
     from .reply_context import (
         _forwarded_chat_text_from_raw,
@@ -129,6 +130,7 @@ except ImportError:
     from markdown import normalize_markdown  # type: ignore
     from media import extract_media  # type: ignore
     from mentions import compile_mention_patterns, is_user_allowed, load_allowed_users, mention_meta_line, should_process_message, stamp_group_text  # type: ignore
+    from text import extract_text  # type: ignore
     from plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup  # type: ignore
     from reply_context import (  # type: ignore
         _forwarded_chat_text_from_raw,
@@ -141,6 +143,18 @@ except ImportError:
     from task_binding import restore_h1_binding, set_h1_dispatch_scope, mark_h1_turn_delivered, h1_turn_meta_lines, is_h1_failure_receipt  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+# Keep the official module-level handler entry available for Core callers and
+# tests.  connect() still builds a fresh class after optional lazy dependency
+# loading, so this compatibility alias does not interfere with that path.
+_IncomingHandler = make_incoming_handler(
+    dingtalk_stream=dingtalk_stream,
+    dingtalk_stream_available=DINGTALK_STREAM_AVAILABLE,
+    chatbot_message_cls=ChatbotMessage,
+    ack_message_cls=AckMessage,
+    logger=logger,
+    log_forward_diag=_log_forward_diag,
+)
 
 
 MAX_MESSAGE_LENGTH = 20000
@@ -268,6 +282,30 @@ class DingTalkAdapter(BasePlatformAdapter):
         # doesn't drop them mid-flight, and we can cancel them on disconnect.
         self._bg_tasks: Set[asyncio.Task] = set()
         self._gateway_profile: Optional[str] = resolve_gateway_profile()  # owning multiplex profile
+
+    # -- Official adapter compatibility surface ---------------------------
+
+    def _is_user_allowed(self, sender_id: str, sender_staff_id: str) -> bool:
+        return is_user_allowed(self._allowed_users, sender_id, sender_staff_id)
+
+    def _message_matches_mention_patterns(self, text: str) -> bool:
+        return bool(text) and any(pattern.search(text) for pattern in self._mention_patterns)
+
+    def _should_process_message(
+        self,
+        message: "ChatbotMessage",
+        text: str,
+        is_group: bool,
+        chat_id: str,
+    ) -> bool:
+        return should_process_message(
+            extra=self.config.extra or {},
+            mention_patterns=self._mention_patterns,
+            message=message,
+            text=text,
+            is_group=is_group,
+            chat_id=chat_id,
+        )
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -693,50 +731,10 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _extract_text(message: "ChatbotMessage") -> str:
-        """Extract plain text from a DingTalk chatbot message.
+        return extract_text(message)
 
-        Handles both legacy and current dingtalk-stream SDK payload shapes:
-          * legacy: ``message.text`` was a dict ``{"content": "..."}``
-          * >= 0.20: ``message.text`` is a ``TextContent`` dataclass whose
-            ``__str__`` returns ``"TextContent(content=...)"`` — never fall
-            back to ``str(text)`` without extracting ``.content`` first.
-          * rich text moved from ``message.rich_text`` (list) to
-            ``message.rich_text_content.rich_text_list`` (list of dicts).
-        """
-        text = getattr(message, "text", None) or ""
-
-        # Handle TextContent object (SDK style)
-        if hasattr(text, "content"):
-            content = (text.content or "").strip()
-        elif isinstance(text, dict):
-            content = text.get("content", "").strip()
-        else:
-            content = str(text).strip()
-
-        if not content:
-            rich_text = getattr(message, "rich_text_content", None) or getattr(
-                message, "rich_text", None
-            )
-            if rich_text:
-                rich_list = getattr(rich_text, "rich_text_list", None) or rich_text
-                if isinstance(rich_list, list):
-                    parts = []
-                    for item in rich_list:
-                        if isinstance(item, dict):
-                            t = item.get("text") or item.get("content") or ""
-                            if t:
-                                parts.append(t)
-                        elif hasattr(item, "text") and item.text:
-                            parts.append(item.text)
-                    content = " ".join(parts).strip()
-
-        # Do NOT strip "@bot" from the text.  The mention is a routing
-        # signal (delivered structurally via callback `isInAtList`), and
-        # regex-stripping @handles would collateral-damage e-mails
-        # (alice@example.com), SSH URLs (git@github.com), and literal
-        # references the user wrote ("what does @openai think").  Let the
-        # LLM see the raw text — it handles "@bot hello" cleanly.
-        return content
+    def _extract_media(self, message: "ChatbotMessage"):
+        return extract_media(message, MessageType)
 
     @staticmethod
     def _normalize_markdown(text: str) -> str:
