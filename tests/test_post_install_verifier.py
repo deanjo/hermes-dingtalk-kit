@@ -280,6 +280,28 @@ class BasePlatformAdapter:
         self.assertNotIn("DINGTALK_CLIENT_SECRET", env)
         self.assertNotIn("HERMES_SAFE_MODE", env)
 
+    def test_product_hook_accepts_official_getattr_session_store_shape(self):
+        root = self.make_target()
+        registry = root / "hermes_cli/plugins.py"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(
+            'VALID_HOOKS = {"pre_gateway_dispatch"}\n',
+            encoding="utf-8",
+        )
+        run_py = root / "gateway/run.py"
+        run_py.write_text(
+            run_py.read_text(encoding="utf-8").replace(
+                "session_store=self.session_store,",
+                'session_store=getattr(self, "session_store", None),',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.verifier._product_hook_contract_probe(root)
+
+        self.assertEqual("ok", result.status, result)
+
     def test_gateway_structure_failure_is_reported_from_compat_verify(self):
         root = self.make_target()
         run_py = root / "gateway/run.py"

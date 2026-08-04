@@ -1147,9 +1147,14 @@ def _product_hook_contract_probe(root: Path) -> CheckResult:
             '"pre_gateway_dispatch",',
             "event=event,",
             "gateway=self,",
-            "session_store=self.session_store,",
         ]
         missing = [marker for marker in required if marker not in run_text]
+        session_store_shapes = (
+            "session_store=self.session_store,",
+            'session_store=getattr(self, "session_store", None),',
+        )
+        if not any(marker in run_text for marker in session_store_shapes):
+            missing.append("session_store=<gateway session store>,")
         if missing:
             raise AssertionError("gateway hook kwargs missing: " + ", ".join(missing))
     except AssertionError as exc:
