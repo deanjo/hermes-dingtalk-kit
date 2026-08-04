@@ -423,7 +423,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._message_contexts.clear()
         self._streaming_cards.clear()
         self._done_emoji_fired.clear()
-        self._intake_prompt_msgs.clear()
         self._dedup.clear()
         logger.info("[%s] Disconnected", self.name)
 
