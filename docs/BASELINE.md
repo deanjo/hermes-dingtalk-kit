@@ -24,11 +24,11 @@ base image: hermes-agent:stable-daocloud
 | `overlays/hermes/plugins/platforms/dingtalk/plugin_setup.py` | `d658c297f916fcab9c579dc015d30c5df13b632c809eedbe99e4f306553b0dec` |
 | `overlays/hermes/plugins/platforms/dingtalk/private_send.py` | `fd1b0eadce1320760526a997dc8b356031e26ca0af2a4608e2ff3e498c0aec04` |
 | `overlays/hermes/plugins/platforms/dingtalk/reply_context.py` | `0c2718440fb20c7bba3a45511748110dbf46cb247df75c65e910105bc74d45fb` |
-| `overlays/hermes/plugins/platforms/dingtalk/task_binding.py` | `b3079250bd62bb7bf25e2b93e1fd917c07891b2ada6f86ce1bc09a79adf23626` |
+| `overlays/hermes/plugins/platforms/dingtalk/task_binding.py` | `1adb2aa53f4b40b6820116e2d962dae26222ce35e911dbf4c0219a4ddd87f7d9` |
 | `overlays/hermes/plugins/platforms/dingtalk/text.py` | `81377dc485271f34410087ca020a072cbe19323ffc7551367844665e77c74c90` |
 | `overlays/hermes/plugins/product_confirmation/store.py` | `00bb443b5a9aa50e04876350a2e883983274dd341ddfadd1307aeba79f931455` |
 | `overlays/hermes/plugins/product_confirmation/tools.py` | `6b28849ad53aa668d8fe1916e5d2ca79254bd7adff1a6ed4fd58a056f2794e26` |
-| `overlays/hermes/plugins/h1_task_write/tools.py` | `964b385eab4025523f97e51b1e9ddb98874d3fb3bacd8a24243dd9bbfc819774` |
+| `overlays/hermes/plugins/h1_task_write/tools.py` | `c1023dc7dee2f2676323823ae9c509d5476b352644cd51eb7bf01fde0f8746a3` |
 | `overlays/hermes/gateway/run.py` | `88e6ac2e7ab2f30c8a0ba3f85d73abecc046149e06deeb84ff0fe6714af236f7` |
 | `overlays/hermes/gateway/session.py` | `948a86ac483a63668a7b6990e5107778345b0415190c5bf72796dfb100217cc9` |
 | `overlays/hermes/gateway/session_context.py` | `bbea82bea958c1c336647455aa2c84fd0119204bbf2af38558d7ce72bcfc404c` |

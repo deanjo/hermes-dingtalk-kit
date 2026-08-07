@@ -54,17 +54,25 @@ def load_plugin_package():
 class FakeStore:
     def __init__(self):
         self._db = object()
-        self.state = None
+        self.metadata = {}
 
-    def get_task_state(self, source):
-        return copy.deepcopy(self.state)
+    @staticmethod
+    def _generate_session_key(source):
+        return f"dingtalk:{source.chat_id}:{source.user_id or source.user_id_alt}"
 
-    def cas_task_state(self, source, expected_revision, new_state):
-        revision = self.state["revision"] if self.state else 0
-        if revision != expected_revision:
-            return False
-        self.state = copy.deepcopy(new_state)
+    def get_session_metadata(self, session_key, key, default=None):
+        return copy.deepcopy(self.metadata.get((session_key, key), default))
+
+    def set_session_metadata(self, session_key, key, value):
+        self.metadata[(session_key, key)] = copy.deepcopy(value)
         return True
+
+    @property
+    def current_binding(self):
+        return self.get_session_metadata(
+            "dingtalk:cid-1:sender-1",
+            "h1_current_binding",
+        )
 
 
 class FakeAdapter:
@@ -128,7 +136,6 @@ class H1TaskWriteTestBase(unittest.TestCase):
     def _install_gateway_fakes(self):
         names = (
             "gateway",
-            "gateway.task_intake",
             "gateway.honest_failure",
             "hermes_cli",
             "hermes_cli.kanban_db",
@@ -137,56 +144,14 @@ class H1TaskWriteTestBase(unittest.TestCase):
 
         gateway = types.ModuleType("gateway")
         gateway.__path__ = []
-        ti = types.ModuleType("gateway.task_intake")
-
-        def _normalized_identity_source(source):
-            user_id = getattr(source, "user_id", None)
-            user_id_alt = getattr(source, "user_id_alt", None)
-            stripped = str(user_id).strip() if user_id is not None else ""
-            stripped_alt = str(user_id_alt).strip() if user_id_alt is not None else ""
-            if not (stripped or stripped_alt):
-                return None
-            return source
-
-        def _state_copy(raw):
-            return (
-                copy.deepcopy(raw)
-                if raw is not None
-                else {"revision": 0, "current_binding": None, "pending_confirmation": None}
-            )
-
-        def _cas_state(store, source, state, **changes):
-            replacement = copy.deepcopy(state)
-            replacement.update(copy.deepcopy(changes))
-            replacement["revision"] = int(state.get("revision", 0)) + 1
-            if store.cas_task_state(source, state.get("revision", 0), replacement):
-                return replacement
-            return None
-
-        class TaskIntakeRetryableError(RuntimeError):
-            def __init__(self, message, *, code="task_intake_retryable"):
-                super().__init__(message)
-                self.code = code
-
-        class TaskIntakePermanentError(RuntimeError):
-            def __init__(self, message, *, code):
-                super().__init__(message)
-                self.code = code
-
-        class TaskIntakeOutcomeUnknownError(RuntimeError):
-            def __init__(self, message, *, root_task_id=None):
-                super().__init__(message)
-                self.root_task_id = root_task_id
-
-        ti._normalized_identity_source = _normalized_identity_source
-        ti._state_copy = _state_copy
-        ti._cas_state = _cas_state
-        ti._validate_binding_snapshot = lambda target: copy.deepcopy(target)
-        ti._create_task_binding = self._fake_create
-        ti.TaskIntakeRetryableError = TaskIntakeRetryableError
-        ti.TaskIntakePermanentError = TaskIntakePermanentError
-        ti.TaskIntakeOutcomeUnknownError = TaskIntakeOutcomeUnknownError
-        self.ti = ti
+        self.tools._validate_binding_snapshot = lambda target: _candidate(
+            board_slug=target.get("board_slug", "agong"),
+            board_name=target.get("board_name", "AGong"),
+            task_id=target.get("task_id", "t_aaaabbbb"),
+            task_title=target.get("task_title", "联系人展示问题"),
+        )
+        self.tools._create_task_binding = self._fake_create
+        self.ti = self.tools
 
         hermes_cli = types.ModuleType("hermes_cli")
         hermes_cli.__path__ = []
@@ -197,6 +162,7 @@ class H1TaskWriteTestBase(unittest.TestCase):
 
         kb.BoardMetadataCorruptError = BoardMetadataCorruptError
         kb.list_boards = lambda **kwargs: copy.deepcopy(_boards())
+        kb.board_metadata_path = lambda slug: Path("/nonexistent") / slug / "board.json"
         kb._normalize_board_slug = lambda value: (
             value if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value) else None
         )
@@ -209,7 +175,6 @@ class H1TaskWriteTestBase(unittest.TestCase):
         honest.is_failure_receipt = lambda: self.failure_receipt
 
         sys.modules["gateway"] = gateway
-        sys.modules["gateway.task_intake"] = ti
         sys.modules["gateway.honest_failure"] = honest
         sys.modules["hermes_cli"] = hermes_cli
         sys.modules["hermes_cli.kanban_db"] = kb
@@ -433,7 +398,7 @@ class TestWriteGate(H1TaskWriteTestBase):
             calls.append(operation_id)
             if len(calls) == 1:
                 raise self.ti.TaskIntakeOutcomeUnknownError(
-                    "建卡提交后结果暂时无法核验。", root_task_id="t_ccccdddd"
+                    "建卡提交后结果暂时无法核验。"
                 )
             return _candidate()
 
@@ -492,9 +457,9 @@ class TestWriteGate(H1TaskWriteTestBase):
             target,
         )
         # 建卡后绑定到当前任务（跟踪语义）。
-        self.assertIsNotNone(self.adapter._session_store.state["current_binding"])
+        self.assertIsNotNone(self.adapter._session_store.current_binding)
 
-    def test_bind_and_switch_write_binding_via_cas(self):
+    def test_bind_and_switch_write_persisted_binding(self):
         proposal_id = self._declared(
             kind="bind_task",
             board_slug="agong",
@@ -505,22 +470,23 @@ class TestWriteGate(H1TaskWriteTestBase):
         self._deliver(proposal_id)
         result = self._write("bind_task", proposal_id)
         self.assertTrue(result["ok"])
-        self.assertEqual("t_aaaabbbb", self.adapter._session_store.state["current_binding"]["task_id"])
+        self.assertEqual(
+            "t_aaaabbbb",
+            self.adapter._session_store.current_binding["task_id"],
+        )
 
     def test_unbind_clears_binding(self):
-        self.adapter._session_store.state = {
-            "schema": "gateway-task-state/v1",
-            "revision": 1,
-            "current_binding": _candidate(),
-            "pending_confirmation": None,
-            "last_applied": None,
-        }
+        self.adapter._session_store.set_session_metadata(
+            "dingtalk:cid-1:sender-1",
+            "h1_current_binding",
+            _candidate(),
+        )
         self._capture()
         result = self._declare(kind="unbind_task", target={})
         proposal_id = result["proposal_id"]
         self._deliver(proposal_id)
         self.assertTrue(self._write("unbind_task", proposal_id)["ok"])
-        self.assertIsNone(self.adapter._session_store.state["current_binding"])
+        self.assertIsNone(self.adapter._session_store.current_binding)
 
     def test_synthetic_msgid_rejected_on_write(self):
         proposal_id = self._declared()

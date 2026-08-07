@@ -28,6 +28,8 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+_H1_BINDING_METADATA_KEY = "h1_current_binding"
+
 
 _PREFIX_RE = re.compile(r"^\s*#任务\s+(\S+)\s+(.+?)\s*$", re.DOTALL)
 _BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -150,19 +152,75 @@ async def materialize_natural_binding(adapter: object, source: object):
     """Restore the current task binding onto ``source`` (read-only, D3).
 
     The thin gate runs this for every intake-eligible message so a bound
-    user's message always carries its task context.  Core's
-    ``materialize_current_task_source`` never creates or consumes anything
-    and returns the source unchanged when there is no current binding.
-    Same profile stamping + ``asyncio.to_thread`` offload as before.
+    user's message always carries its task context. The binding lives in
+    Core's existing persisted session metadata; no Core schema extension is
+    required.
     """
-    from gateway.task_intake import materialize_current_task_source
-
     if not getattr(source, "profile", None):
         source.profile = adapter._gateway_profile
-    return await asyncio.to_thread(
-        materialize_current_task_source,
-        adapter._session_store,
+    binding = await asyncio.to_thread(get_h1_binding, adapter, source)
+    if binding is None:
+        return source
+    board_slug = str(binding.get("board_slug") or "")
+    task_id = str(binding.get("task_id") or "")
+    exists = await asyncio.to_thread(task_binding_exists, board_slug, task_id)
+    if not exists:
+        raise TaskBindingError("persisted task binding is no longer valid")
+    source.board_slug = board_slug
+    source.task_id = task_id
+    return source
+
+
+def _h1_session_key(adapter: object, source: object, store: object) -> str:
+    generate = getattr(store, "_generate_session_key", None)
+    if callable(generate):
+        return generate(source)
+
+    from gateway.session import build_session_key
+
+    extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+    return build_session_key(
         source,
+        group_sessions_per_user=extra.get("group_sessions_per_user", True),
+        thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+    )
+
+
+def get_h1_binding(adapter: object, source: object, *, session_store=None):
+    store = session_store or getattr(adapter, "_session_store", None)
+    if store is None:
+        raise RuntimeError("session store is unavailable")
+    value = store.get_session_metadata(
+        _h1_session_key(adapter, source, store),
+        _H1_BINDING_METADATA_KEY,
+    )
+    return value if isinstance(value, dict) else None
+
+
+def set_h1_binding(
+    adapter: object,
+    source: object,
+    binding,
+    *,
+    session_store=None,
+) -> bool:
+    store = session_store or getattr(adapter, "_session_store", None)
+    if store is None:
+        return False
+    value = None
+    if binding is not None:
+        value = {
+            "board_slug": str(binding.get("board_slug") or ""),
+            "task_id": str(binding.get("task_id") or ""),
+        }
+        if not value["board_slug"] or not value["task_id"]:
+            return False
+    return bool(
+        store.set_session_metadata(
+            _h1_session_key(adapter, source, store),
+            _H1_BINDING_METADATA_KEY,
+            value,
+        )
     )
 
 

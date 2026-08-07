@@ -76,8 +76,7 @@ def load_reply_context_module():
 
 
 def load_task_binding_module():
-    """Load the real task_binding.py helpers under test (thin gate drives
-    the real implementations — only ``gateway.task_intake`` is faked)."""
+    """Load the real task_binding.py helpers used by the thin gate."""
     import importlib.util
 
     load_reply_context_module()
@@ -351,20 +350,26 @@ class DingTalkThinGateTest(unittest.TestCase):
     ):
         materialize_calls = []
 
-        def fake_materialize(session_store, source):
-            materialize_calls.append({"session_store": session_store, "source": source})
+        def fake_get_binding(adapter, source):
+            materialize_calls.append(
+                {"session_store": adapter._session_store, "source": source}
+            )
             if materialize_raises:
                 raise RuntimeError("task-selection state unavailable")
-            return source if materialize_result is None else materialize_result
+            if materialize_result is None:
+                return None
+            return {
+                "board_slug": materialize_result.board_slug,
+                "task_id": materialize_result.task_id,
+            }
 
-        gateway = types.ModuleType("gateway")
-        gateway.__path__ = []
-        task_intake = types.ModuleType("gateway.task_intake")
-        task_intake.materialize_current_task_source = fake_materialize
-        old_gateway = sys.modules.get("gateway")
-        old_task_intake = sys.modules.get("gateway.task_intake")
-        sys.modules["gateway"] = gateway
-        sys.modules["gateway.task_intake"] = task_intake
+        handler = on_message or self.on_message
+        restore = handler.__globals__["restore_h1_binding"]
+        binding_globals = restore.__globals__
+        real_get_binding = binding_globals["get_h1_binding"]
+        real_binding_exists = binding_globals["task_binding_exists"]
+        binding_globals["get_h1_binding"] = fake_get_binding
+        binding_globals["task_binding_exists"] = lambda board_slug, task_id: True
         try:
             adapter = FakeAdapter(
                 enabled=enabled,
@@ -372,20 +377,13 @@ class DingTalkThinGateTest(unittest.TestCase):
                 gateway_profile=gateway_profile,
             )
             adapter.materialize_calls = materialize_calls
-            handler = on_message or self.on_message
             if drive is None:
                 asyncio.run(handler(adapter, make_message(text)))
             else:
                 asyncio.run(drive(adapter))
         finally:
-            if old_gateway is None:
-                sys.modules.pop("gateway", None)
-            else:
-                sys.modules["gateway"] = old_gateway
-            if old_task_intake is None:
-                sys.modules.pop("gateway.task_intake", None)
-            else:
-                sys.modules["gateway.task_intake"] = old_task_intake
+            binding_globals["get_h1_binding"] = real_get_binding
+            binding_globals["task_binding_exists"] = real_binding_exists
         return adapter, materialize_calls
 
     # -- feature flag / structural short-circuits ----------------------------
@@ -467,7 +465,8 @@ class DingTalkThinGateTest(unittest.TestCase):
         adapter, calls = self.run_message("这个索引为什么没数据", materialize_result=bound)
 
         self.assertEqual(1, len(calls))
-        self.assertIs(bound, adapter.events[0].source)
+        self.assertEqual("agong", adapter.events[0].source.board_slug)
+        self.assertEqual("t_3852e516", adapter.events[0].source.task_id)
         self.assertIn("这个索引为什么没数据", adapter.events[0].text)
 
     def test_materialize_failure_degrades_to_unbound_delivery(self):
@@ -492,7 +491,8 @@ class DingTalkThinGateTest(unittest.TestCase):
 
         self.assertEqual(1, len(calls))
         self.assertEqual(1, len(adapter.events))
-        self.assertIs(bound, adapter.events[0].source)
+        self.assertEqual("agong", adapter.events[0].source.board_slug)
+        self.assertEqual("t_3852e516", adapter.events[0].source.task_id)
         self.assertEqual(["https://cdn.example.com/img.png"], adapter.events[0].media_urls)
 
     def test_media_materialize_failure_still_delivers_unbound(self):

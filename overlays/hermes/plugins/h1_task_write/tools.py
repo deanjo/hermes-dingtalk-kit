@@ -23,17 +23,34 @@ import importlib.util
 import json
 import logging
 import re
+import sqlite3
 import sys
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 _PLUGIN_ID = "h1_task_write"
 _WRITE_KINDS = ("create_task", "bind_task", "switch_task", "new_project", "unbind_task")
+
+
+class TaskIntakeRetryableError(RuntimeError):
+    def __init__(self, message: str, *, code: str = "task_intake_retryable"):
+        super().__init__(message)
+        self.code = code
+
+
+class TaskIntakePermanentError(RuntimeError):
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+class TaskIntakeOutcomeUnknownError(RuntimeError):
+    pass
 
 
 H1_DECLARE_PROPOSAL_SCHEMA = {
@@ -199,6 +216,154 @@ def _normalize_text(value: Any) -> str:
     return " ".join(normalized.split())
 
 
+def _normalized_identity_source(source: Any) -> Optional[Any]:
+    """Return a source with a non-empty, normalized sender identity."""
+    user_id = str(getattr(source, "user_id", None) or "").strip()
+    user_id_alt = str(getattr(source, "user_id_alt", None) or "").strip()
+    if not (user_id or user_id_alt):
+        return None
+    if user_id == (getattr(source, "user_id", None) or "") and user_id_alt == (
+        getattr(source, "user_id_alt", None) or ""
+    ):
+        return source
+    return replace(source, user_id=user_id or None, user_id_alt=user_id_alt or None)
+
+
+def _display_stage(task: Any) -> str:
+    stage = str(getattr(task, "current_step_key", None) or "").strip()
+    labels = {
+        "explorer": "Explorer：待核验",
+        "planner": "Planner：待设计",
+        "implementer": "Implementer：待实现",
+        "reviewer": "Reviewer：待审阅",
+        "verifier": "Verifier：待验证",
+        "reporter": "Reporter：待汇报",
+    }
+    if stage:
+        return labels.get(stage.casefold(), stage)
+    status = str(getattr(task, "status", None) or "未分阶段").strip()
+    return f"未分阶段：{status}" if status != "未分阶段" else status
+
+
+def _strict_boards() -> list[dict]:
+    """Use the public board API while refusing malformed board.json files."""
+    from hermes_cli import kanban_db as kb
+
+    boards = kb.list_boards(include_archived=False)
+    for board in boards:
+        slug = str(board.get("slug") or board.get("board_slug") or "")
+        path = kb.board_metadata_path(slug)
+        if not path.is_file():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise TaskIntakePermanentError(
+                "项目元数据损坏。", code="board_metadata_corrupt"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise TaskIntakePermanentError(
+                "项目元数据损坏。", code="board_metadata_corrupt"
+            )
+    return boards
+
+
+def _validate_binding_snapshot(target: dict) -> dict:
+    """Refresh one exact task through the current public Kanban API."""
+    from hermes_cli import kanban_db as kb
+
+    board_slug = str(target.get("board_slug") or "").strip()
+    task_id = str(target.get("task_id") or "").strip()
+    if not board_slug or not task_id or kb._normalize_board_slug(board_slug) != board_slug:
+        raise TaskIntakePermanentError(
+            "任务绑定缺少内部地址。", code="binding_invalid"
+        )
+    try:
+        boards = _strict_boards()
+        board = next(
+            (item for item in boards if str(item.get("slug") or "") == board_slug),
+            None,
+        )
+        if board is None:
+            raise TaskIntakePermanentError("目标项目已不存在。", code="board_missing")
+        with kb.connect_closing(board=board_slug) as conn:
+            task = kb.get_task(conn, task_id)
+    except TaskIntakePermanentError:
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        raise TaskIntakeRetryableError(
+            "当前任务暂时无法重新核验。", code="binding_revalidation_unavailable"
+        ) from exc
+    except Exception as exc:
+        raise TaskIntakeRetryableError(
+            "当前任务暂时无法重新核验。", code="binding_revalidation_unknown"
+        ) from exc
+    if task is None or str(task.status or "") == "archived":
+        raise TaskIntakePermanentError(
+            "当前任务已不存在或已归档。", code="task_missing"
+        )
+    board_name = str(board.get("name") or board_slug)
+    return {
+        "board_slug": board_slug,
+        "board_name": board_name,
+        "task_id": str(task.id),
+        "task_title": str(task.title),
+        "current_stage": _display_stage(task),
+        "status": str(task.status),
+    }
+
+
+def _create_task_binding(target: dict, operation_id: str) -> dict:
+    """Create one confirmed intake card through the current public Kanban API."""
+    from hermes_cli import kanban_db as kb
+
+    board_slug = str(target["board_slug"])
+    board_name = str(target["board_name"])
+    idempotency_key = f"h1-task-write:{operation_id}"
+    try:
+        if target.get("create_board"):
+            if kb.board_exists(board_slug):
+                error = _validate_create_target(
+                    {"board_slug": board_slug, "board_name": board_name}
+                )
+                if error is not None:
+                    raise TaskIntakePermanentError(
+                        "项目名称与已有项目冲突。", code=str(error["reason"])
+                    )
+            else:
+                kb.create_board(board_slug, name=board_name)
+        else:
+            error = _validate_create_target(
+                {"board_slug": board_slug, "board_name": board_name}
+            )
+            if error is not None:
+                raise TaskIntakePermanentError(
+                    "目标项目不可用。", code=str(error["reason"])
+                )
+        with kb.connect_closing(board=board_slug) as conn:
+            task_id = kb.create_task(
+                conn,
+                title=str(target["task_title"]),
+                body=str(target.get("body") or ""),
+                created_by="h1-task-write",
+                idempotency_key=idempotency_key,
+                triage=True,
+                board=board_slug,
+            )
+    except TaskIntakePermanentError:
+        raise
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        raise TaskIntakeRetryableError(
+            "任务卡暂时无法创建。", code="task_create_unavailable"
+        ) from exc
+    try:
+        return _validate_binding_snapshot(
+            {"board_slug": board_slug, "task_id": str(task_id)}
+        )
+    except Exception as exc:
+        raise TaskIntakeOutcomeUnknownError("建卡结果暂时无法核验。") from exc
+
+
 def _project_slug(display_name: str) -> str:
     """Derive the board slug for a new project (code derivation, same
     algorithm the V1 intake used; never model-supplied)."""
@@ -229,15 +394,11 @@ def _required_fields(target: Any, fields: tuple[str, ...]) -> Optional[str]:
 
 
 def _validate_create_target(target: dict) -> dict | None:
-    """I8: board existence + slug↔name consistency via full strict
-    enumeration (fail-closed on corrupt board.json).  Returns a structured
-    error payload or None."""
-    from hermes_cli import kanban_db as kb
-
+    """Validate board existence and slug/name consistency, failing closed."""
     try:
-        boards = kb.list_boards(include_archived=False, strict_metadata=True)
-    except kb.BoardMetadataCorruptError:
-        return {"ok": False, "reason": "board_metadata_corrupt"}
+        boards = _strict_boards()
+    except TaskIntakePermanentError as exc:
+        return {"ok": False, "reason": exc.code}
     except Exception:
         return {"ok": False, "reason": "boards_unavailable"}
     wanted_slug = str(target["board_slug"]).strip()
@@ -275,12 +436,6 @@ def _validate_declared_target(kind: str, target: Any) -> dict | None:
         missing = _required_fields(target, ("board_slug", "board_name", "task_id", "task_title"))
         if missing:
             return {"ok": False, "reason": "invalid_args", "detail": missing}
-        from gateway.task_intake import (
-            TaskIntakePermanentError,
-            TaskIntakeRetryableError,
-            _validate_binding_snapshot,
-        )
-
         try:
             snapshot = _validate_binding_snapshot(target)
         except TaskIntakePermanentError as exc:
@@ -323,8 +478,6 @@ def _handle_declare(args: dict, **_kwargs: Any) -> str:
     request_id = scope.message_id.strip()
     if not request_id or request_id.casefold().startswith("synthetic:"):
         return _json({"ok": False, "reason": "request_id_unstable"})
-    from gateway.task_intake import _normalized_identity_source
-
     identity_source = _normalized_identity_source(scope.source)
     if identity_source is None:
         return _json({"ok": False, "reason": "identity_unavailable"})
@@ -356,29 +509,23 @@ def _handle_declare(args: dict, **_kwargs: Any) -> str:
 
 
 def _write_binding(scope, source, binding) -> None:
-    """Set/clear current_binding via revision CAS (pending rows untouched —
-    dormant V1 records are never read nor written)."""
-    from gateway.task_intake import (
-        TaskIntakeRetryableError,
-        _cas_state,
-        _state_copy,
-    )
-
-    store = scope.session_store
-    for _attempt in range(8):
-        state = _state_copy(store.get_task_state(source))
-        if _cas_state(store, source, state, current_binding=binding) is not None:
-            return
-    raise TaskIntakeRetryableError(
-        "任务绑定状态竞争过于频繁。", code="binding_cas_exhausted"
-    )
+    """Persist the current binding in Core's existing session metadata."""
+    tb = _task_binding_module()
+    adapter = _adapter_for(scope)
+    if tb is None or adapter is None or not tb.set_h1_binding(
+        adapter,
+        source,
+        binding,
+        session_store=scope.session_store,
+    ):
+        raise TaskIntakeRetryableError(
+            "任务绑定状态暂时无法保存。", code="binding_state_unavailable"
+        )
 
 
 def _apply_write(kind: str, record: dict, scope, source) -> dict:
     """Business write OUTSIDE the consumption lock (idempotency key from the
     proposal id — a committed bootstrap deduplicates replays naturally)."""
-    from gateway.task_intake import _create_task_binding, _validate_binding_snapshot
-
     target = record["target"]
     if kind in ("create_task", "new_project"):
         operation_id = hashlib.sha256(
@@ -416,8 +563,6 @@ def _handle_write(kind: str, args: dict, **_kwargs: Any) -> str:
     # ③ confirm_msg_id must be THIS turn's real inbound msgId (fabrication-proof).
     if confirm_msg_id != request_id:
         return _json({"ok": False, "reason": "confirm_msg_mismatch"})
-    from gateway.task_intake import _normalized_identity_source
-
     identity_source = _normalized_identity_source(scope.source)
     if identity_source is None:
         return _json({"ok": False, "reason": "identity_unavailable"})
@@ -432,11 +577,6 @@ def _handle_write(kind: str, args: dict, **_kwargs: Any) -> str:
     if reason is not None:
         return _json({"ok": False, "reason": reason})
     # ⑥ idempotent write outside the lock.
-    from gateway.task_intake import (
-        TaskIntakeOutcomeUnknownError,
-        TaskIntakePermanentError,
-    )
-
     try:
         outcome = _apply_write(record["kind"], record, scope, identity_source)
     except TaskIntakeOutcomeUnknownError:

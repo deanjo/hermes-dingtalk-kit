@@ -101,6 +101,25 @@ class PostInstallVerifierTest(unittest.TestCase):
         )
         self.assertEqual("skipped", signature["status"])
 
+    def test_public_hook_accepts_optional_session_store_kwarg(self):
+        root = self.make_target()
+        registry = root / "hermes_cli/plugins.py"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text('VALID_HOOKS = {"pre_gateway_dispatch"}\n', encoding="utf-8")
+        run_py = root / "gateway/run.py"
+        run_py.write_text(
+            run_py.read_text(encoding="utf-8").replace(
+                "session_store=self.session_store,",
+                'session_store=getattr(self, "session_store", None),',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.verifier._product_hook_contract_probe(root)
+
+        self.assertEqual("ok", result.status, result)
+
     REAL_BUILD_SOURCE_SIGNATURE = '''
 class BasePlatformAdapter:
     def build_source(
