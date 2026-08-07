@@ -398,6 +398,27 @@ class BasePlatformAdapter:
         self.assertEqual("failed", failure["status"])
         self.assertIn("unexpected reply policy branch", failure["message"])
 
+    def test_card_reply_recovery_without_unknown_return_fails(self):
+        root = self.make_target()
+        adapter = root / "plugins/platforms/dingtalk/adapter.py"
+        text = adapter.read_text(encoding="utf-8")
+        marker = "                return\n\n        event = MessageEvent(\n"
+        self.assertIn(marker, text)
+        adapter.write_text(
+            text.replace(marker, "\n        event = MessageEvent(\n", 1),
+            encoding="utf-8",
+        )
+
+        report = self.verifier.build_report(root)
+
+        failure = next(
+            item
+            for item in report["checks"]
+            if item["name"] == "plugin.reply_context_forwarded"
+        )
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("does not stop before model dispatch", failure["message"])
+
     def test_gateway_reply_context_without_return_none_fails(self):
         root = self.make_target()
         run_py = root / "gateway/run.py"

@@ -31,6 +31,7 @@ import logging
 import mimetypes
 import os
 import re
+import time
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -113,6 +114,7 @@ try:
     from .text import extract_text
     from .plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup
     from .reply_context import (
+        CardReplyStore,
         _forwarded_chat_text_from_raw,
         _get_replied_file_content,
         _is_placeholder_text,
@@ -133,6 +135,7 @@ except ImportError:
     from text import extract_text  # type: ignore
     from plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup  # type: ignore
     from reply_context import (  # type: ignore
+        CardReplyStore,
         _forwarded_chat_text_from_raw,
         _get_replied_file_content,
         _is_placeholder_text,
@@ -278,6 +281,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # auto-close them as siblings — otherwise tool-progress cards get
         # stuck in streaming state forever.
         self._streaming_cards: Dict[str, Dict[str, str]] = {}
+        self._card_reply_store = CardReplyStore()
         # Track fire-and-forget emoji/reaction coroutines so Python's GC
         # doesn't drop them mid-flight, and we can cancel them on disconnect.
         self._bg_tasks: Set[asyncio.Task] = set()
@@ -700,13 +704,17 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Fail closed here so an internal sentinel never reaches the model.
         reply_kwargs = build_reply_kwargs(message)
         if reply_kwargs.get("reply_to_text") == "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00":
-            await self.send(
-                chat_id,
-                "我暂时拿不到你引用消息的原文。请把关键原文贴在消息里，或重新描述要我处理的内容。",
-                reply_to=msg_id,
-                metadata={"delivery_class": "business_error"},
-            )
-            return
+            recovered = self._card_reply_store.resolve_message(chat_id, message)
+            if recovered:
+                reply_kwargs["reply_to_text"] = recovered
+            else:
+                await self.send(
+                    chat_id,
+                    "我暂时拿不到你引用消息的原文。请把关键原文贴在消息里，或重新描述要我处理的内容。",
+                    reply_to=msg_id,
+                    metadata={"delivery_class": "business_error"},
+                )
+                return
 
         event = MessageEvent(
             text=text,
@@ -846,9 +854,11 @@ class DingTalkAdapter(BasePlatformAdapter):
             payload["at"] = {"atUserIds": at_user_ids, "isAtAll": False}
 
         try:
+            webhook_started_ms = time.time_ns() // 1_000_000
             resp = await self._http_client.post(
                 session_webhook, json=payload, timeout=15.0
             )
+            webhook_finished_ms = time.time_ns() // 1_000_000
             if resp.status_code < 300:
                 # DingTalk webhooks report most delivery failures (robot
                 # removed from the chat, content blocked by moderation,
@@ -870,6 +880,9 @@ class DingTalkAdapter(BasePlatformAdapter):
                               f" {str(body_json.get('errmsg'))[:200]}",
                         raw_response={"delivery_outcome": "rejected"},
                     )
+                self._card_reply_store.remember_webhook_delivery(
+                    chat_id, normalized, webhook_started_ms, webhook_finished_ms, body_json,
+                )
                 # Webhook path: fire Done only for final replies, same as
                 # the card path; flags delivery too (I1: the kit knows the
                 # send succeeded — no quote authentication in V2).
@@ -1087,7 +1100,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                 x_acs_dingtalk_access_token=token,
             )
 
-            await self._card_sdk.deliver_card_with_options_async(
+            delivery_response = await self._card_sdk.deliver_card_with_options_async(
                 deliver_request, deliver_headers, runtime
             )
 
@@ -1096,6 +1109,9 @@ class DingTalkAdapter(BasePlatformAdapter):
             # for streaming edit_message updates by out_track_id.
             await self._stream_card_content(
                 out_track_id, token, content, finalize=finalize,
+            )
+            self._card_reply_store.remember_delivery(
+                chat_id, out_track_id, content, delivery_response
             )
 
             logger.info(
@@ -1138,6 +1154,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             await self._stream_card_content(
                 message_id, token, content, finalize=finalize,
             )
+            self._card_reply_store.update_content(chat_id, message_id, content)
             if finalize:
                 # Remove from streaming-cards tracking and fire Done.  This
                 # is the canonical "response ended" signal from stream

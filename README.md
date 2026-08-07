@@ -2,12 +2,12 @@
 
 Hermes DingTalk Kit 是独立维护的 Hermes DingTalk adapter（适配器）与 Product Confirmation（产品确认）源码项目，用来把平台修改先固化为可审阅 Git 提交，再通过安装器进入 Hermes。
 
-当前状态：`PUBLIC / SOURCE_COMPLETE / RELEASE_READY`。**legacy compat 的两个 `ADAPT_REQUIRED` 锚点已于 2026-07-29 解除**（`run.reply_sentinel_constant` 在当前 core 上自愈；`session.path_sensitive_validation` 通过 `Step.native_marker` 识别 core 的等价实现形态解决），12 个补丁在 core `0f01b5577` 上 apply/verify 全绿且幂等，默认 legacy-compat 模式已可发布。详见 H1 治理第 6 项任务卡 `T6_RELEASE_CHAIN_FIX_20260729.md`。
+当前状态：`PUBLIC / SOURCE_COMPLETE / RELEASE_READY`，当前版本 `v2026.8.7`。**legacy compat 的两个 `ADAPT_REQUIRED` 锚点已于 2026-07-29 解除**（`run.reply_sentinel_constant` 在当前 core 上自愈；`session.path_sensitive_validation` 通过 `Step.native_marker` 识别 core 的等价实现形态解决），12 个补丁在 core `0f01b5577` 上 apply/verify 全绿且幂等，默认 legacy-compat 模式已可发布。详见 H1 治理第 6 项任务卡 `T6_RELEASE_CHAIN_FIX_20260729.md`。
 
 ## 包含内容
 
 - `raw_process` / `AckMessage` 兼容：修复 `dingtalk-stream 0.24.3` 调用 `handler.raw_process(msg)` 时官方 adapter 不响应的问题。
-- 引用上下文注入：把钉钉 `repliedMsg` 转成 Hermes `reply_to_message_id` / `reply_to_text`，避免群里“这个问题”错绑到最近话题。
+- 引用上下文注入：把钉钉 `repliedMsg` 转成 Hermes `reply_to_message_id` / `reply_to_text`；机器人通过 session webhook 或 Card SDK 发出的原文会持久化，引用 `interactiveCard` 时按同群精确 ID 或唯一 `createdAt` 时间窗恢复，多个候选时拒绝猜测。
 - 重启不失忆：放行 DingTalk base64 conversation id 中的内部 `/`，同时保留 `session_id` 的严格路径校验。
 - 会话环境修复：向 `set_session_vars(...)` 补传 `session_id`，让插件稳定读取 `HERMES_SESSION_ID`。
 - 群内 @ 元信息：从钉钉结构化 `atUsers` 还原“本消息还 @ 了谁”，并在发送侧用 `at_user_ids` 生成结构化 @。
@@ -78,7 +78,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/install_dingtalk_kit.py --target /o
 
 ## Post-Install Verifier
 
-`scripts/post_install_verifier.py` 对安装后的 Hermes root 做只读验收，确认 gateway compat 结构、DingTalk 插件 manifest、Hermes runtime 可发现 `dingtalk` adapter、`raw_process` ACK，以及引用缺原文时的分层合同：adapter 透传 sentinel；Gateway 有非空 assistant 历史才注入严格定位提示，无可用历史则固定澄清并在模型前停止。它还验证 Product 的 5 个工具与公开 hook、`session_key` slash 和 `session_context` bridge。
+`scripts/post_install_verifier.py` 对安装后的 Hermes root 做只读验收，确认 gateway compat 结构、DingTalk 插件 manifest、Hermes runtime 可发现 `dingtalk` adapter、`raw_process` ACK，以及引用原文恢复合同：普通文本直接投影；session webhook 与 Card SDK 输出持久化后，`interactiveCard` 可按同群消息 ID 或唯一 `createdAt` 时间窗恢复；未命中或候选不唯一时仍在模型前固定澄清。它还验证 Product 的 5 个工具与公开 hook、`session_key` slash 和 `session_context` bridge。
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/post_install_verifier.py --target /opt/hermes
@@ -86,7 +86,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/post_install_verifier.py --target /
 PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/post_install_verifier.py --target /opt/hermes --plugins-only --json
 ```
 
-本地 overlay 默认模式当前输出 `check_count=62 failure_count=0`（含 compat 段 13 条 = 12 个 Step 各 1 条 + 组级 `compat.verify` 汇总 1 条；去静音前该段为 0 条），其中 **3 条**在只有 overlay、没有完整 Hermes 运行时的 root 上为 `skipped`：`plugin.build_source_signature`（缺 `gateway/platforms/base.py`）、`plugin.runtime_discovery`（缺 Hermes runtime 模块）、`product.public_hook_contract`（缺公开 hook 运行时）；完整 Hermes canary root 必须输出 `plugin.runtime_discovery ... runtime_dingtalk_entry=dingtalk plugin=dingtalk-platform`、`gateway.reply_context_layering ... ok`，并且 `product.public_hook_contract` 为 `ok`。这个 verifier 不做真实 DingTalk 网络收发；需要真实消息验收时另开带凭证和脱敏边界的任务。
+本地 overlay 默认模式当前输出 `check_count=64 failure_count=0`（含 compat 段 13 条 = 12 个 Step 各 1 条 + 组级 `compat.verify` 汇总 1 条；去静音前该段为 0 条），其中 **3 条**在只有 overlay、没有完整 Hermes 运行时的 root 上为 `skipped`：`plugin.build_source_signature`（缺 `gateway/platforms/base.py`）、`plugin.runtime_discovery`（缺 Hermes runtime 模块）、`product.public_hook_contract`（缺公开 hook 运行时）；完整 Hermes canary root 必须输出 `plugin.runtime_discovery ... runtime_dingtalk_entry=dingtalk plugin=dingtalk-platform`、`gateway.reply_context_layering ... ok`，并且 `product.public_hook_contract` 为 `ok`。这个 verifier 不做真实 DingTalk 网络收发；需要真实消息验收时另开带凭证和脱敏边界的任务。
 
 ## 发布状态
 

@@ -335,11 +335,60 @@ def _assert_reply_context(root: Path) -> str:
 
     if reply_context.build_reply_kwargs(FileMessage()) != {}:
         raise AssertionError("file replies must stay on the file-content path")
-    return "repliedMsg maps to reply_to_message_id/reply_to_text"
+
+    class CardText:
+        extensions = {
+            "repliedMsg": {
+                "msgId": "carrier-27",
+                "msgType": "interactiveCard",
+            }
+        }
+
+    class CardMessage:
+        text = CardText()
+
+    class WebhookCardText:
+        extensions = {
+            "repliedMsg": {
+                "msgId": "dingtalk-generated-id",
+                "msgType": "interactiveCard",
+                "createdAt": 1_800_000_000_100,
+            }
+        }
+
+    class WebhookCardMessage:
+        text = WebhookCardText()
+
+    response = types.SimpleNamespace(
+        body=types.SimpleNamespace(
+            result=[types.SimpleNamespace(carrier_id="carrier-27", success=True)]
+        )
+    )
+    with tempfile.TemporaryDirectory() as state_dir:
+        store = reply_context.CardReplyStore(state_dir)
+        if not store.remember_delivery(
+            "chat-1", "hermes-track-19", "card original", response
+        ):
+            raise AssertionError("card delivery carrier id was not persisted")
+        if store.resolve_message("chat-1", CardMessage()) != "card original":
+            raise AssertionError("interactiveCard carrier id did not resolve")
+        if store.resolve_message("chat-2", CardMessage()) is not None:
+            raise AssertionError("interactiveCard lookup is not isolated by chat")
+        if not store.remember_webhook_delivery(
+            "chat-1",
+            "webhook original",
+            1_800_000_000_000,
+            1_800_000_000_200,
+            {"errcode": 0},
+        ):
+            raise AssertionError("session webhook output was not persisted")
+        if store.resolve_message("chat-1", WebhookCardMessage()) != "webhook original":
+            raise AssertionError("interactiveCard createdAt did not resolve webhook output")
+    return "repliedMsg maps text directly and interactiveCard to persisted card/webhook output"
 
 
 def _assert_reply_context_forwarded(root: Path) -> str:
-    """Ensure unavailable quoted text stops before model dispatch."""
+    """Ensure only an exact card lookup can bypass unavailable-text rejection."""
     adapter = root / PLUGIN_REL / "adapter.py"
     adapter_text = adapter.read_text(encoding="utf-8")
     tree = ast.parse(adapter_text, filename=str(adapter))
@@ -427,15 +476,23 @@ def _assert_reply_context_forwarded(root: Path) -> str:
     guard_text = ast.get_source_segment(adapter_text, guard) or ""
     required = (
         "__HERMES_REPLY_ORIGINAL_UNAVAILABLE__",
+        "resolve_message(chat_id, message)",
+        'reply_kwargs["reply_to_text"] = recovered',
         "await self.send",
         "我暂时拿不到你引用消息的原文",
         '"delivery_class": "business_error"',
     )
     if not isinstance(guard, ast.If) or any(item not in guard_text for item in required):
         raise AssertionError("unavailable reply does not send the required clarification")
-    if guard.orelse or not any(isinstance(node, ast.Return) for node in guard.body):
+    inner_guards = [statement for statement in guard.body if isinstance(statement, ast.If)]
+    if guard.orelse or len(inner_guards) != 1:
+        raise AssertionError("unavailable reply does not use one exact recovery branch")
+    recovery_guard = inner_guards[0]
+    if any(isinstance(node, ast.Return) for node in recovery_guard.body):
+        raise AssertionError("resolved card reply stops before model dispatch")
+    if not any(isinstance(node, ast.Return) for node in recovery_guard.orelse):
         raise AssertionError("unavailable reply does not stop before model dispatch")
-    return "unavailable reply clarifies once; other reply kwargs reach MessageEvent"
+    return "exact card replies recover; unknown replies clarify once before dispatch"
 
 
 def _assert_gateway_reply_context_layering(root: Path) -> str:
