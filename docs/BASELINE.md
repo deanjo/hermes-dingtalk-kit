@@ -19,7 +19,7 @@ base image: hermes-agent:stable-daocloud
 | `overlays/hermes/plugins/platforms/dingtalk/delivery_gate.py` | `7c3d2682570274a31f398d07e6e5e1b81e9a6f602fdb7903ea6d82c9cb74dd60` |
 | `overlays/hermes/plugins/platforms/dingtalk/incoming.py` | `0153d9e33113b0fa807bb7ea8af2560364bd6b800f45faf862300a300a4e01d0` |
 | `overlays/hermes/plugins/platforms/dingtalk/markdown.py` | `72344b724b6a87fa17c7a75fb8f5001c2ea00be65c0ec879cc088d71e1b80808` |
-| `overlays/hermes/plugins/platforms/dingtalk/media.py` | `0b0a6accdcc9ac7f9db956b645598b73c7ec7833d27dbbd135ea04eece72126c` |
+| `overlays/hermes/plugins/platforms/dingtalk/media.py` | `3252ed3a7536f5bdbdaa4ebeb6b979896589c411468bb2e8fff351403f66d547` |
 | `overlays/hermes/plugins/platforms/dingtalk/mentions.py` | `7755bf8621d4c25c1661afc884cd4572b77b446e5e405247277d4d69ecb4b852` |
 | `overlays/hermes/plugins/platforms/dingtalk/plugin_setup.py` | `d658c297f916fcab9c579dc015d30c5df13b632c809eedbe99e4f306553b0dec` |
 | `overlays/hermes/plugins/platforms/dingtalk/private_send.py` | `fd1b0eadce1320760526a997dc8b356031e26ca0af2a4608e2ff3e498c0aec04` |

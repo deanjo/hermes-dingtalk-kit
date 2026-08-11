@@ -15,6 +15,21 @@ DINGTALK_TYPE_MAPPING = {
 }
 
 
+def _image_mime_type(media_ref: Any) -> str:
+    """Return a concrete image MIME for a resolved DingTalk media reference.
+
+    Native picture payloads do not include a content type. By extraction time
+    the adapter normally replaced their download code with a cached local path,
+    so prefer that suffix. The cache uses PNG as its filename fallback when the
+    provider URL has no suffix, which also gives opaque unresolved codes a MIME
+    that the gateway can route through its image pipeline.
+    """
+    guessed = mimetypes.guess_type(str(media_ref).split("?", 1)[0])[0]
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    return "image/png"
+
+
 def extract_media(message: "ChatbotMessage", message_type: Any):
     """Extract media info from message. Returns (MessageType, [urls], [mime_types])."""
     msg_type = message_type.TEXT
@@ -26,7 +41,7 @@ def extract_media(message: "ChatbotMessage", message_type: Any):
         download_code = getattr(image_content, "download_code", None)
         if download_code:
             media_urls.append(download_code)
-            media_types.append("image")
+            media_types.append(_image_mime_type(download_code))
             msg_type = message_type.PHOTO
 
     rich_text = getattr(message, "rich_text_content", None) or getattr(
@@ -48,7 +63,7 @@ def extract_media(message: "ChatbotMessage", message_type: Any):
                         mapped = DINGTALK_TYPE_MAPPING.get(item_type, "file")
                         media_urls.append(dl_code)
                         if mapped == "image":
-                            media_types.append("image")
+                            media_types.append(_image_mime_type(dl_code))
                             if msg_type == message_type.TEXT:
                                 msg_type = message_type.PHOTO
                         elif mapped == "audio":

@@ -105,6 +105,46 @@ class DingTalkCoreCompatibilityTest(unittest.TestCase):
         self.assertEqual(["image-1"], urls)
         self.assertEqual(["application/octet-stream"], mime_types)
 
+    def test_native_picture_uses_gateway_routable_image_mime(self):
+        message = SimpleNamespace(
+            image_content=SimpleNamespace(download_code="/tmp/dingtalk-native.png"),
+            rich_text_content=None,
+            rich_text=None,
+            message_type="picture",
+            extensions={},
+        )
+
+        media_type, urls, mime_types = self.media.extract_media(message, MessageType)
+
+        self.assertEqual(MessageType.PHOTO, media_type)
+        self.assertEqual(["/tmp/dingtalk-native.png"], urls)
+        self.assertEqual(["image/png"], mime_types)
+        self.assertTrue(mime_types[0].startswith("image/"))
+
+    def test_rich_text_picture_uses_suffix_or_png_fallback(self):
+        jpeg_message = SimpleNamespace(
+            image_content=None,
+            rich_text_content=None,
+            rich_text=[{"type": "picture", "downloadCode": "/tmp/dingtalk-rich.jpg"}],
+            message_type="richText",
+            extensions={},
+        )
+        opaque_message = SimpleNamespace(
+            image_content=None,
+            rich_text_content=None,
+            rich_text=[{"type": "picture", "downloadCode": "opaque-code"}],
+            message_type="richText",
+            extensions={},
+        )
+
+        jpeg_type, _, jpeg_mimes = self.media.extract_media(jpeg_message, MessageType)
+        opaque_type, _, opaque_mimes = self.media.extract_media(opaque_message, MessageType)
+
+        self.assertEqual(MessageType.PHOTO, jpeg_type)
+        self.assertEqual(["image/jpeg"], jpeg_mimes)
+        self.assertEqual(MessageType.PHOTO, opaque_type)
+        self.assertEqual(["image/png"], opaque_mimes)
+
     def test_adapter_keeps_official_compatibility_methods(self):
         tree = ast.parse((PLUGIN_ROOT / "adapter.py").read_text(encoding="utf-8"))
         adapter = next(
