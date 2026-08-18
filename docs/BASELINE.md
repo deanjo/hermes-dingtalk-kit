@@ -15,7 +15,7 @@ base image: hermes-agent:stable-daocloud
 
 | 文件 | sha256 |
 |---|---|
-| `overlays/hermes/plugins/platforms/dingtalk/adapter.py` | `67fd0f7fd82eeaff65b394722ac435e8815dbb3c5a4f6dce6f8c58d61d325aed` |
+| `overlays/hermes/plugins/platforms/dingtalk/adapter.py` | `374c1b06bc8f4254096f12083bf5b704b1aacc2de9a798e7421134d875a2c122` |
 | `overlays/hermes/plugins/platforms/dingtalk/delivery_gate.py` | `7c3d2682570274a31f398d07e6e5e1b81e9a6f602fdb7903ea6d82c9cb74dd60` |
 | `overlays/hermes/plugins/platforms/dingtalk/incoming.py` | `0153d9e33113b0fa807bb7ea8af2560364bd6b800f45faf862300a300a4e01d0` |
 | `overlays/hermes/plugins/platforms/dingtalk/markdown.py` | `72344b724b6a87fa17c7a75fb8f5001c2ea00be65c0ec879cc088d71e1b80808` |

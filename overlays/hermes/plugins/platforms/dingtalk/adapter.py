@@ -104,6 +104,17 @@ from gateway.platforms.base import (
     SendResult,
     cache_media_bytes,
 )
+from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _get_scoped_secret(name, default=None):
+    """Read a profile-scoped secret, with the default profile env fallback."""
+    try:
+        value = _scoped_get_secret(name, default)
+    except _UnscopedSecretError:
+        value = os.getenv(name)
+    return value if value is not None else default
 
 try:
     from .incoming import make_incoming_handler
@@ -163,37 +174,43 @@ _SESSION_WEBHOOKS_MAX = 500
 _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
 _TASK_BINDING_CLARIFICATION = "我没有找到有效的任务绑定。请用“#任务 board/task 你的问题”重试，例如：#任务 agong/t_deadbeef 联系人为什么没显示。"
 
-def check_dingtalk_requirements() -> bool:
-    """Check if DingTalk dependencies are available and configured.
+def dingtalk_deps_present() -> bool:
+    """PASSIVE probe: are dingtalk-stream/httpx importable right now?"""
+    return DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE
 
-    Lazy-installs dingtalk-stream via ``tools.lazy_deps.ensure("platform.dingtalk")``
-    on first call if not present.
-    """
+
+def ensure_dingtalk_deps() -> bool:
+    """Install optional DingTalk dependencies without reading credentials."""
     global DINGTALK_STREAM_AVAILABLE, dingtalk_stream, ChatbotMessage, CallbackMessage, AckMessage
     global HTTPX_AVAILABLE, httpx
-    if not DINGTALK_STREAM_AVAILABLE or not HTTPX_AVAILABLE:
-        try:
-            from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("platform.dingtalk", prompt=False)
-        except Exception:
-            return False
-        try:
-            import dingtalk_stream as _ds
-            from dingtalk_stream import ChatbotMessage as _CM
-            from dingtalk_stream.frames import CallbackMessage as _CBM, AckMessage as _AM
-            import httpx as _httpx
-        except Exception:
-            return False
-        dingtalk_stream = _ds
-        ChatbotMessage = _CM
-        CallbackMessage = _CBM
-        AckMessage = _AM
-        httpx = _httpx
-        DINGTALK_STREAM_AVAILABLE = True
-        HTTPX_AVAILABLE = True
-    if not os.getenv("DINGTALK_CLIENT_ID") or not os.getenv("DINGTALK_CLIENT_SECRET"):
+    if DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE:
+        return True
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("platform.dingtalk", prompt=False)
+    except Exception:
         return False
+    try:
+        import dingtalk_stream as _ds
+        from dingtalk_stream import ChatbotMessage as _CM
+        from dingtalk_stream.frames import CallbackMessage as _CBM, AckMessage as _AM
+        import httpx as _httpx
+    except Exception:
+        return False
+    dingtalk_stream = _ds
+    ChatbotMessage = _CM
+    CallbackMessage = _CBM
+    AckMessage = _AM
+    httpx = _httpx
+    DINGTALK_STREAM_AVAILABLE = True
+    HTTPX_AVAILABLE = True
     return True
+
+
+def check_dingtalk_requirements() -> bool:
+    """Return whether dependencies and DingTalk credentials are available."""
+    return bool(ensure_dingtalk_deps() and os.getenv("DINGTALK_CLIENT_ID") and
+                _get_scoped_secret("DINGTALK_CLIENT_SECRET"))
 
 class DingTalkAdapter(BasePlatformAdapter):
     """DingTalk chatbot adapter using Stream Mode.
@@ -237,7 +254,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._client_id: str = extra.get("client_id") or os.getenv(
             "DINGTALK_CLIENT_ID", ""
         )
-        self._client_secret: str = extra.get("client_secret") or os.getenv(
+        self._client_secret: str = extra.get("client_secret") or _get_scoped_secret(
             "DINGTALK_CLIENT_SECRET", ""
         )
 
@@ -1456,7 +1473,8 @@ def register(ctx) -> None:
         name="dingtalk",
         label="DingTalk",
         adapter_factory=_build_adapter,
-        check_fn=check_dingtalk_requirements,
+        check_fn=dingtalk_deps_present,
+        ensure_deps_fn=ensure_dingtalk_deps,
         is_connected=_is_connected,
         validate_config=_is_connected,
         required_env=["DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"],
