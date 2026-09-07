@@ -87,6 +87,9 @@ def load_stamp_group_text():
 def load_on_message(*, natural_intake=False, with_media=False, mention_meta="", binding=None):
     """AST-extract DingTalkAdapter._on_message with a fake namespace, the same
     harness style as test_dingtalk_task_binding.py / test_dingtalk_natural_task_intake.py."""
+    spec = importlib.util.spec_from_file_location("reply_context_for_sender_stamp", PLUGIN_ROOT / "reply_context.py")
+    reply_context = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reply_context)
     tree = ast.parse(ADAPTER_PATH.read_text(encoding="utf-8"), filename=str(ADAPTER_PATH))
     method = None
     for node in tree.body:
@@ -148,6 +151,7 @@ def load_on_message(*, natural_intake=False, with_media=False, mention_meta="", 
         "_log_forward_diag": lambda *args, **kwargs: None,
         "asyncio": asyncio,
         "build_reply_kwargs": lambda message: {},
+        "append_full_reply_text": reply_context.append_full_reply_text,
         "datetime": datetime,
         "extract_media": extract_media,
         "h1_turn_meta_lines": lambda adapter, **kwargs: ["[消息编号: incoming-1]"],
