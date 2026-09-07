@@ -337,6 +337,17 @@ def _assert_reply_context(root: Path) -> str:
     if reply_context.build_reply_kwargs(FileMessage()) != {}:
         raise AssertionError("file replies must stay on the file-content path")
 
+    original = "完整引用正文。" * 100 + "\n尾部标记：install-tail-731"
+    long_kwargs = {"reply_to_message_id": "long-1", "reply_to_text": original}
+    complete = reply_context.append_full_reply_text("请整理末段", long_kwargs)
+    if not complete.startswith("请整理末段\n\n") or original not in complete:
+        raise AssertionError("long reply original or user request was truncated")
+    if long_kwargs != {"reply_to_message_id": "long-1", "reply_to_text": original}:
+        raise AssertionError("long reply forwarding mutated reply kwargs")
+    for short_kwargs in ({}, {"reply_to_text": "字" * 500}):
+        if reply_context.append_full_reply_text("用户原请求", short_kwargs) != "用户原请求":
+            raise AssertionError("short or absent reply changed user request text")
+
     class CardText:
         extensions = {
             "repliedMsg": {
@@ -455,6 +466,9 @@ def _assert_reply_context_forwarded(root: Path) -> str:
                 for keyword in statement.value.keywords
             ):
                 raise AssertionError("MessageEvent does not expand reply_kwargs")
+            if not any(keyword.arg == "text" and isinstance(keyword.value, ast.Name)
+                       and keyword.value.id == "text" for keyword in statement.value.keywords):
+                raise AssertionError("MessageEvent does not receive complete request text")
             event_indices.append(index)
         if (
             isinstance(statement, ast.Expr)
@@ -486,6 +500,10 @@ def _assert_reply_context_forwarded(root: Path) -> str:
     )
     if not kwargs_index < event_index < dispatch_index:
         raise AssertionError("reply context is not forwarded in dispatch order")
+    append_index = event_index - 1
+    expected_append = ast.parse("text = append_full_reply_text(text, reply_kwargs)").body[0]
+    if ast.dump(method.body[append_index]) != ast.dump(expected_append):
+        raise AssertionError("long reply text must be appended immediately before MessageEvent")
     confirmation_guard = method.body[kwargs_index + 1]
     if not (
         isinstance(confirmation_guard, ast.If)
@@ -499,7 +517,7 @@ def _assert_reply_context_forwarded(root: Path) -> str:
     guard = method.body[kwargs_index + 2]
     if any(
         isinstance(node, ast.Name) and node.id == "reply_kwargs"
-        for statement in method.body[kwargs_index + 3:event_index]
+        for statement in method.body[kwargs_index + 3:append_index]
         for node in ast.walk(statement)
     ):
         raise AssertionError("unexpected reply policy branch before MessageEvent")
@@ -524,7 +542,7 @@ def _assert_reply_context_forwarded(root: Path) -> str:
         raise AssertionError("resolved card reply stops before model dispatch")
     if not any(isinstance(node, ast.Return) for node in recovery_guard.orelse):
         raise AssertionError("unavailable reply does not stop before model dispatch")
-    return "exact ids or consumed confirmations recover; other replies stop before dispatch"
+    return "exact ids or consumed confirmations recover; complete long originals reach event text"
 
 
 def _assert_gateway_reply_context_layering(root: Path) -> str:

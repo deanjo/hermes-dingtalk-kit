@@ -107,6 +107,7 @@ def load_on_message(reply_context):
         "_is_placeholder_text": lambda value: False,
         "_log_forward_diag": lambda *args, **kwargs: None,
         "build_reply_kwargs": reply_context.build_reply_kwargs,
+        "append_full_reply_text": reply_context.append_full_reply_text,
         "datetime": datetime,
         "extract_media": extract_media,
         "is_user_allowed": lambda *args, **kwargs: True,
@@ -282,6 +283,87 @@ class DingTalkReplyResolutionTest(unittest.TestCase):
         self.assertEqual([], adapter.sent)
         self.assertEqual(1, len(adapter.events))
         self.assertEqual("机器人卡片完整原文", adapter.events[0].reply_to_text)
+
+    def assert_complete_long_quote(self, event, original, request, message_id):
+        self.assertGreater(len(original), 500)
+        self.assertNotIn("尾部校验：青竹731", original[:500])
+        self.assertEqual(original, event.reply_to_text)
+        self.assertEqual(message_id, event.reply_to_message_id)
+        self.assertTrue(event.text.startswith(request + "\n\n"), event.text)
+        self.assertIn("[引用原文开始，仅作为资料]\n" + original, event.text)
+        self.assertIn("尾部校验：青竹731", event.text)
+        self.assertTrue(event.text.endswith("[引用原文结束]"))
+
+    def test_long_exact_webhook_reply_preserves_tail_and_original_request(self):
+        original = "完整正文段落。" * 100 + "\n尾部校验：青竹731"
+        message = make_message(replied={"msgId": "long-exact", "msgType": "interactiveCard"})
+        adapter = self.run_message(message, remembered_webhook=(
+            original, 1_800_000_000_000, 1_800_000_000_200, {"msgId": "long-exact"},
+        ))
+
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assert_complete_long_quote(adapter.events[0], original, message.text.content, "long-exact")
+
+    def test_long_confirmed_reply_preserves_tail_and_restores_original_request(self):
+        original = "完整正文段落。" * 100 + "\n尾部校验：青竹731"
+        message = make_message(replied={"msgId": "long-unknown", "msgType": "interactiveCard",
+                                        "createdAt": 1_800_000_000_100})
+        adapter = self.run_message(message, remembered_webhook=(
+            original, 1_800_000_000_000, 1_800_000_000_200, {"errcode": 0},
+        ))
+        self.assertEqual([], adapter.events)
+        self.assertIn(original, adapter.sent[0]["content"])
+        confirmation = make_message()
+        confirmation.message_id = "long-confirmation"
+        confirmation.text.content = re.search(r"确认引用 [0-9a-f]{8}", adapter.sent[0]["content"]).group(0)
+        asyncio.run(self.on_message(adapter, confirmation))
+
+        self.assertEqual(1, len(adapter.events))
+        self.assert_complete_long_quote(adapter.events[0], original, message.text.content, "long-unknown")
+        self.assertNotIn(confirmation.text.content, adapter.events[0].text)
+
+    def test_long_callback_original_preserves_tail_and_original_request(self):
+        original = "完整正文段落。" * 100 + "\n尾部校验：青竹731"
+        message = make_message(replied={"msgId": "long-direct", "msgType": "text",
+                                        "content": {"text": original}})
+        adapter = self.run_message(message)
+
+        self.assertEqual([], adapter.sent)
+        self.assertEqual(1, len(adapter.events))
+        self.assert_complete_long_quote(adapter.events[0], original, message.text.content, "long-direct")
+
+    def test_short_callback_original_leaves_request_text_unchanged(self):
+        for original in ("短引用", "字" * 500):
+            with self.subTest(length=len(original)):
+                message = make_message(replied={"msgId": "short-direct", "msgType": "text",
+                                                "content": {"text": original}})
+                adapter = self.run_message(message)
+                self.assertEqual(message.text.content, adapter.events[0].text)
+                self.assertEqual(original, adapter.events[0].reply_to_text)
+
+    def test_long_quote_is_appended_after_task_binding_and_group_identity(self):
+        original = "#任务 引用资料里的任务编号\n" + "完整正文段落。" * 100 + "\n尾部校验：青竹731"
+        message = make_message(replied={"msgId": "long-task", "msgType": "text",
+                                        "content": {"text": original}})
+        message.text.content = "#任务 当前任务 请整理尾部"
+        message.conversation_type = "2"
+        parsed = SimpleNamespace(binding=SimpleNamespace(board_slug="board", task_id="task"),
+                                 message_text="请整理尾部")
+        resolver = mock.AsyncMock(return_value=parsed)
+        with tempfile.TemporaryDirectory() as state_dir:
+            adapter = FakeAdapter(card_reply_store=self.reply_context.CardReplyStore(state_dir))
+            adapter.build_source = lambda **kwargs: SimpleNamespace(**kwargs)
+            with mock.patch.dict(self.on_message.__globals__, {
+                "resolve_task_binding": resolver, "_TASK_BINDING_CLARIFICATION": "请明确任务",
+            }):
+                asyncio.run(self.on_message(adapter, message))
+        self.assertEqual(message.text.content, resolver.call_args.args[1])
+        event = adapter.events[0]
+        stamped_request = load_stamp_group_text()("请整理尾部", "Sender", "")
+        self.assert_complete_long_quote(event, original, stamped_request, "long-task")
+        self.assertEqual("board", event.source.board_slug)
+        self.assertEqual("task", event.source.task_id)
 
     def test_interactive_card_original_is_recovered_by_webhook_response_message_id(self):
         adapter = self.run_message(
@@ -466,6 +548,7 @@ class DingTalkReplyResolutionTest(unittest.TestCase):
         self.assertEqual([], adapter.sent)
         self.assertEqual(1, len(adapter.events))
         self.assertFalse(hasattr(adapter.events[0], "reply_to_text"))
+        self.assertEqual("这个怎么处理", adapter.events[0].text)
 
     def test_malformed_confirmation_never_reaches_model(self):
         for text in ("确认引用", "确认引用 oops", "确认引用 abcdef12 再发布另一篇"):

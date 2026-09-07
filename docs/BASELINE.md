@@ -26,7 +26,7 @@ base image: hermes-agent:stable-daocloud
 
 | 文件 | sha256 |
 |---|---|
-| `overlays/hermes/plugins/platforms/dingtalk/adapter.py` | `9887d1e884c2b44b53f9aef772dc6a90600e9c80fd8861512f7a22cb746218df` |
+| `overlays/hermes/plugins/platforms/dingtalk/adapter.py` | `1f11c3946ae92988cd6464a73bb5121816e5c72561462e3b8ac1932952b4a379` |
 | `overlays/hermes/plugins/platforms/dingtalk/delivery_gate.py` | `7c3d2682570274a31f398d07e6e5e1b81e9a6f602fdb7903ea6d82c9cb74dd60` |
 | `overlays/hermes/plugins/platforms/dingtalk/incoming.py` | `0153d9e33113b0fa807bb7ea8af2560364bd6b800f45faf862300a300a4e01d0` |
 | `overlays/hermes/plugins/platforms/dingtalk/markdown.py` | `72344b724b6a87fa17c7a75fb8f5001c2ea00be65c0ec879cc088d71e1b80808` |
@@ -34,7 +34,7 @@ base image: hermes-agent:stable-daocloud
 | `overlays/hermes/plugins/platforms/dingtalk/mentions.py` | `7755bf8621d4c25c1661afc884cd4572b77b446e5e405247277d4d69ecb4b852` |
 | `overlays/hermes/plugins/platforms/dingtalk/plugin_setup.py` | `d658c297f916fcab9c579dc015d30c5df13b632c809eedbe99e4f306553b0dec` |
 | `overlays/hermes/plugins/platforms/dingtalk/private_send.py` | `fd1b0eadce1320760526a997dc8b356031e26ca0af2a4608e2ff3e498c0aec04` |
-| `overlays/hermes/plugins/platforms/dingtalk/reply_context.py` | `24535800143d1d7f655a4fe12af307c0cb11be8a0607823ffa7efe9c97ac74a8` |
+| `overlays/hermes/plugins/platforms/dingtalk/reply_context.py` | `e0159bd4cee3beda48c4cc4da83bd5716590cdbec144480894c5356c1efd7d2a` |
 | `overlays/hermes/plugins/platforms/dingtalk/task_binding.py` | `1adb2aa53f4b40b6820116e2d962dae26222ce35e911dbf4c0219a4ddd87f7d9` |
 | `overlays/hermes/plugins/platforms/dingtalk/text.py` | `81377dc485271f34410087ca020a072cbe19323ffc7551367844665e77c74c90` |
 | `overlays/hermes/plugins/product_confirmation/store.py` | `00bb443b5a9aa50e04876350a2e883983274dd341ddfadd1307aeba79f931455` |

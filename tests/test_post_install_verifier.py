@@ -363,6 +363,30 @@ class BasePlatformAdapter:
         self.assertEqual("failed", failure["status"])
         self.assertIn("does not expand reply_kwargs", failure["message"])
 
+    def test_missing_long_reply_forwarding_fails_install_check(self):
+        root = self.make_target()
+        adapter = root / "plugins/platforms/dingtalk/adapter.py"
+        text = adapter.read_text(encoding="utf-8")
+        statement = "        text = append_full_reply_text(text, reply_kwargs)\n"
+        self.assertIn(statement, text)
+        adapter.write_text(text.replace(statement, "", 1), encoding="utf-8")
+        report = self.verifier.build_report(root)
+        failure = next(item for item in report["checks"] if item["name"] == "plugin.reply_context_forwarded")
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("long reply text", failure["message"])
+
+    def test_truncated_long_reply_body_fails_install_check(self):
+        root = self.make_target()
+        helper = root / "plugins/platforms/dingtalk/reply_context.py"
+        text = helper.read_text(encoding="utf-8")
+        original = '        f"{original}\\n"\n'
+        self.assertIn(original, text)
+        helper.write_text(text.replace(original, '        f"{original[:500]}\\n"\n', 1), encoding="utf-8")
+        report = self.verifier.build_report(root)
+        failure = next(item for item in report["checks"] if item["name"] == "plugin.reply_context_kwargs")
+        self.assertEqual("failed", failure["status"])
+        self.assertIn("truncated", failure["message"])
+
     def test_extra_reply_context_policy_in_adapter_fails(self):
         root = self.make_target()
         adapter = root / "plugins/platforms/dingtalk/adapter.py"

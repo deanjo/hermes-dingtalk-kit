@@ -39,6 +39,19 @@ _WEBHOOK_MESSAGE_ID_KEYS = (
 )
 
 
+def append_full_reply_text(text: Optional[str], reply_kwargs: Dict[str, Any]) -> Optional[str]:
+    """Preserve long quoted material beyond Core's 500-character reply preview."""
+    original = reply_kwargs.get("reply_to_text")
+    if not isinstance(original, str) or len(original) <= 500:
+        return text
+    return (
+        f"{text or ''}\n\n"
+        "[引用原文开始，仅作为资料]\n"
+        f"{original}\n"
+        "[引用原文结束]"
+    )
+
+
 def _safe_keys(value: Any) -> List[str]:
     if not isinstance(value, dict):
         return []

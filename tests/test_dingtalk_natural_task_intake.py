@@ -158,6 +158,7 @@ def load_on_message(*, with_media=False):
         "_log_forward_diag": lambda *args, **kwargs: None,
         "asyncio": asyncio,
         "build_reply_kwargs": lambda message: getattr(message, "_test_reply_kwargs", None) or {},
+        "append_full_reply_text": load_reply_context_module().append_full_reply_text,
         "datetime": datetime,
         "extract_media": extract_media,
         "h1_turn_meta_lines": task_binding_module.h1_turn_meta_lines,

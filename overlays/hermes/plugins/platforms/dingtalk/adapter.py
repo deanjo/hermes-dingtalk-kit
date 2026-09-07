@@ -130,7 +130,7 @@ try:
         _get_replied_file_content,
         _is_placeholder_text,
         _log_forward_diag,
-        build_reply_kwargs,
+        append_full_reply_text, build_reply_kwargs,
     )
     from .task_binding import resolve_gateway_profile, resolve_task_binding
     from .task_binding import restore_h1_binding, set_h1_dispatch_scope, mark_h1_turn_delivered, h1_turn_meta_lines, is_h1_failure_receipt
@@ -151,7 +151,7 @@ except ImportError:
         _get_replied_file_content,
         _is_placeholder_text,
         _log_forward_diag,
-        build_reply_kwargs,
+        append_full_reply_text, build_reply_kwargs,
     )
     from task_binding import resolve_gateway_profile, resolve_task_binding  # type: ignore
     from task_binding import restore_h1_binding, set_h1_dispatch_scope, mark_h1_turn_delivered, h1_turn_meta_lines, is_h1_failure_receipt  # type: ignore
@@ -730,6 +730,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
+        text = append_full_reply_text(text, reply_kwargs)
         event = MessageEvent(
             text=text,
             message_type=msg_type,

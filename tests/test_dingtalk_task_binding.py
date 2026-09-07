@@ -70,6 +70,9 @@ def load_stamp_group_text():
 
 
 def load_on_message(binding, *, exists):
+    spec = importlib.util.spec_from_file_location("reply_context_for_binding", PLUGIN_ROOT / "reply_context.py")
+    reply_context = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reply_context)
     tree = ast.parse(ADAPTER_PATH.read_text(encoding="utf-8"), filename=str(ADAPTER_PATH))
     method = None
     clarification = None
@@ -120,6 +123,7 @@ def load_on_message(binding, *, exists):
         "_log_forward_diag": lambda *args, **kwargs: None,
         "asyncio": asyncio,
         "build_reply_kwargs": lambda message: {},
+        "append_full_reply_text": reply_context.append_full_reply_text,
         "datetime": datetime,
         "extract_media": lambda message, message_type: (message_type.TEXT, [], []),
         "is_user_allowed": lambda *args, **kwargs: True,
