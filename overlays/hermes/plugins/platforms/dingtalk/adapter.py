@@ -31,6 +31,7 @@ import logging
 import mimetypes
 import os
 import re
+import time
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -124,6 +125,7 @@ try:
     from .text import extract_text
     from .plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup
     from .reply_context import (
+        CardReplyStore,
         _forwarded_chat_text_from_raw,
         _get_replied_file_content,
         _is_placeholder_text,
@@ -144,6 +146,7 @@ except ImportError:
     from text import extract_text  # type: ignore
     from plugin_setup import _apply_yaml_config, _is_connected, _standalone_send, interactive_setup  # type: ignore
     from reply_context import (  # type: ignore
+        CardReplyStore,
         _forwarded_chat_text_from_raw,
         _get_replied_file_content,
         _is_placeholder_text,
@@ -213,29 +216,13 @@ def check_dingtalk_requirements() -> bool:
                 _get_scoped_secret("DINGTALK_CLIENT_SECRET"))
 
 class DingTalkAdapter(BasePlatformAdapter):
-    """DingTalk chatbot adapter using Stream Mode.
-
-    The dingtalk-stream SDK maintains a long-lived WebSocket connection.
-    Incoming messages arrive via a ChatbotHandler callback. Replies are
-    sent via the incoming message's session_webhook URL using httpx.
-
-    Features:
-    - Text messages (plain + rich text)
-    - Images, audio, video, files (via download codes)
-    - Group chat @mention detection
-    - Session webhook caching with expiry tracking
-    - Markdown formatted replies
-    """
+    """Receive Stream callbacks; send replies through session webhooks or AI Cards."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
 
     @property
     def SUPPORTS_MESSAGE_EDITING(self) -> bool:  # noqa: N802
-        """Edits only meaningful when AI Cards are configured.
-
-        The gateway gates streaming cursor + edit behaviour on this flag,
-        so we must reflect the actual adapter capability at runtime.
-        """
+        """Enable gateway editing only when AI Cards are actually available."""
         return bool(self._card_template_id and self._card_sdk)
 
     @property
@@ -295,6 +282,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # auto-close them as siblings — otherwise tool-progress cards get
         # stuck in streaming state forever.
         self._streaming_cards: Dict[str, Dict[str, str]] = {}
+        self._card_reply_store = CardReplyStore()
         # Track fire-and-forget emoji/reaction coroutines so Python's GC
         # doesn't drop them mid-flight, and we can cancel them on disconnect.
         self._bg_tasks: Set[asyncio.Task] = set()
@@ -562,10 +550,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         sender_id = getattr(message, "sender_id", "") or ""
         sender_nick = getattr(message, "sender_nick", "") or sender_id
         sender_staff_id = getattr(message, "sender_staff_id", "") or ""
-        # R9 #9 (D10): with neither id the task-state key is shared by every
-        # anonymous sender — natural intake must fail closed (never create or
-        # consume a pending, never restore a shared binding). Intake-eligible
-        # text gets an honest error and stops (R5 I1); other messages flow on.
+        # Anonymous senders must never share a pending task or confirmation.
         has_stable_sender = bool((sender_id or "").strip() or (sender_staff_id or "").strip())
 
         chat_id = conversation_id or sender_id
@@ -587,10 +572,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             include_senders=False,
         )
 
-        # Group mention/pattern gate.  DMs pass through unconditionally.
-        # We need the message text for regex wake-word matching; extract it
-        # early but don't consume the rest of the pipeline until after the
-        # gate decides whether to process.
+        # Apply the group mention/pattern gate before processing; DMs pass.
         _early_text = self._extract_text(message) or ""
         gate_text = (
             forwarded_chat_gate_text
@@ -613,10 +595,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
             return
 
-        # Stash the incoming message keyed by chat_id so concurrent
-        # conversations don't clobber each other's context.  Also reset
-        # the per-chat "Done emoji fired" marker so a new inbound message
-        # gets its own Thinking→Done cycle.
+        # Keep incoming context and the Thinking→Done cycle scoped to this chat.
         if chat_id:
             self._message_contexts[chat_id] = message
             self._done_emoji_fired.discard(chat_id)
@@ -665,6 +644,47 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.debug("[%s] Empty message, skipping", self.name)
             return
 
+        # Resolve before task binding or model dispatch. A timestamp is only a
+        # suggestion; it cannot authorize continuation of the original request.
+        confirmed_reply = None
+        confirmation_sender = sender_staff_id or sender_id
+        confirmation_token = (
+            self._card_reply_store.confirmation_token(text) if "确认引用" in (text or "") else None
+        )
+        if confirmation_token is not None:
+            confirmed_reply = (
+                self._card_reply_store.consume_confirmation(chat_id, confirmation_sender, confirmation_token)
+                if not media_urls else None
+            )
+            if not confirmed_reply:
+                await self.send(
+                    chat_id, "引用确认无效或已过期。请重新引用，或粘贴原文和你的请求。",
+                    reply_to=msg_id,
+                    metadata={"delivery_class": "business_error", "reply_recovery_prompt": True},
+                )
+                return
+            text = confirmed_reply.pop("request_text")
+
+        reply_kwargs = build_reply_kwargs(message)
+        if confirmed_reply:
+            reply_kwargs = confirmed_reply
+        if reply_kwargs.get("reply_to_text") == "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00":
+            recovered = self._card_reply_store.resolve_message(chat_id, message)
+            if recovered:
+                reply_kwargs["reply_to_text"] = recovered
+            else:
+                candidate_prompt = (
+                    self._card_reply_store.propose_confirmation(chat_id, confirmation_sender, message, text)
+                    if not media_urls else None
+                )
+                await self.send(
+                    chat_id,
+                    candidate_prompt or "我暂时拿不到你引用消息的原文。请把关键原文贴在消息里，或重新描述要我处理的内容。",
+                    reply_to=msg_id,
+                    metadata={"delivery_class": "business_error", "reply_recovery_prompt": True},
+                )
+                return
+
         task_binding = None
         if (text or "").lstrip().startswith("#任务"):
             parsed_task_message = await resolve_task_binding(
@@ -685,12 +705,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         )
         if task_binding:  # build_source() rejects the Kanban kwargs — stamp directly.
             source.board_slug, source.task_id = task_binding.board_slug, task_binding.task_id
-        # V2 thin gate (D3): slash / #任务 already short-circuited above;
-        # the classifier bridge and intake gate are gone.  With the feature
-        # flag off the message passes through byte-compatibly (same as V1).
+        # Natural task intake is opt-in; preserve plain messages when disabled.
         if (self.config.extra or {}).get("natural_task_intake") is True:
-            # Anonymous senders skipped (log only); dispatch scope set for
-            # every gated message; restore + meta apply to natural content.
+            # Restore binding and metadata only for a stable sender.
             if not has_stable_sender:
                 logger.warning("[%s] Message skipped: no stable sender identity", self.name)
                 return
@@ -713,18 +730,6 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
-        # DingTalk may identify a quoted message without returning its text.
-        # Fail closed here so an internal sentinel never reaches the model.
-        reply_kwargs = build_reply_kwargs(message)
-        if reply_kwargs.get("reply_to_text") == "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00":
-            await self.send(
-                chat_id,
-                "我暂时拿不到你引用消息的原文。请把关键原文贴在消息里，或重新描述要我处理的内容。",
-                reply_to=msg_id,
-                metadata={"delivery_class": "business_error"},
-            )
-            return
-
         event = MessageEvent(
             text=text,
             message_type=msg_type,
@@ -807,20 +812,16 @@ class DingTalkAdapter(BasePlatformAdapter):
         # final replies; intermediate sends stay in streaming state.
         is_final_reply = reply_to is not None
 
-        # Structured @-mentions requested by the caller (e.g. the
-        # product-confirmation tool @-ing the product owner). AI Cards have no
-        # at-mention field, so a send carrying at_user_ids must take the
-        # webhook markdown path deterministically.
+        # Structured @-mentions require webhook markdown; AI Cards have no at field.
         raw_at = metadata.get("at_user_ids") or []
         if isinstance(raw_at, str):
             raw_at = [raw_at]
         at_user_ids = [str(u) for u in raw_at if str(u).strip()]
 
         # Try AI Card first (using alibabacloud_dingtalk.card_1_0 SDK).
-        if self._card_template_id and current_message and self._card_sdk and not at_user_ids:
-            # Close any previously-open streaming cards for this chat
-            # before creating a new one (handles tool-progress → final-
-            # response handoff; also cleans up lingering commentary cards).
+        if (self._card_template_id and current_message and self._card_sdk
+                and not at_user_ids and not metadata.get("reply_recovery_prompt")):
+            # Close this chat's previous streaming cards before creating another.
             await self._close_streaming_siblings(chat_id)
 
             result = await self._create_and_stream_card(
@@ -840,10 +841,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                     self._fire_done_reaction(chat_id)
                     mark_h1_turn_delivered(self, chat_id=chat_id, message_id=result.message_id)
                 else:
-                    # Intermediate (tool progress / commentary / streaming
-                    # first chunk): keep the card open and track it so the
-                    # next send() auto-closes it as a sibling, or
-                    # edit_message(finalize=True) closes it explicitly.
+                    # Keep intermediate cards open until another send or final edit.
                     self._streaming_cards.setdefault(chat_id, {})[
                         result.message_id
                     ] = content
@@ -863,14 +861,13 @@ class DingTalkAdapter(BasePlatformAdapter):
             payload["at"] = {"atUserIds": at_user_ids, "isAtAll": False}
 
         try:
+            webhook_started_ms = time.time_ns() // 1_000_000
             resp = await self._http_client.post(
                 session_webhook, json=payload, timeout=15.0
             )
+            webhook_finished_ms = time.time_ns() // 1_000_000
             if resp.status_code < 300:
-                # DingTalk webhooks report most delivery failures (robot
-                # removed from the chat, content blocked by moderation,
-                # expired webhook) as HTTP 200 with errcode != 0 in the JSON
-                # body — treat those as failures, not silent successes.
+                # HTTP 200 with errcode != 0 is still a rejected delivery.
                 try:
                     body_json = resp.json()
                 except Exception:
@@ -887,9 +884,14 @@ class DingTalkAdapter(BasePlatformAdapter):
                               f" {str(body_json.get('errmsg'))[:200]}",
                         raw_response={"delivery_outcome": "rejected"},
                     )
-                # Webhook path: fire Done only for final replies, same as
-                # the card path; flags delivery too (I1: the kit knows the
-                # send succeeded — no quote authentication in V2).
+                reply_context_saved = (
+                    self._card_reply_store.remember_webhook_delivery(
+                        chat_id, normalized, webhook_started_ms, webhook_finished_ms, body_json,
+                    ) if not metadata.get("reply_recovery_prompt") else None
+                )
+                if reply_context_saved is False:
+                    logger.warning("[webhook-reply-store] delivered but original was not saved")
+                # Mark delivery and fire Done only for final replies.
                 _webhook_out_id = uuid.uuid4().hex[:12]
                 if is_final_reply:
                     self._fire_done_reaction(chat_id)
@@ -897,7 +899,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                 return SendResult(
                     success=True,
                     message_id=_webhook_out_id,
-                    raw_response={"delivery_outcome": "delivered"},
+                    raw_response={"delivery_outcome": "delivered", "reply_context_saved": reply_context_saved},
                 )
             body = resp.text
             logger.warning(
@@ -1104,15 +1106,16 @@ class DingTalkAdapter(BasePlatformAdapter):
                 x_acs_dingtalk_access_token=token,
             )
 
-            await self._card_sdk.deliver_card_with_options_async(
+            delivery_response = await self._card_sdk.deliver_card_with_options_async(
                 deliver_request, deliver_headers, runtime
             )
 
-            # Step 3: Stream initial content.  finalize=True closes the
-            # card immediately (one-shot); finalize=False keeps it open
-            # for streaming edit_message updates by out_track_id.
+            # Stream initial content; finalize=False leaves it open for edits.
             await self._stream_card_content(
                 out_track_id, token, content, finalize=finalize,
+            )
+            reply_context_saved = self._card_reply_store.remember_delivery(
+                chat_id, out_track_id, content, delivery_response
             )
 
             logger.info(
@@ -1121,7 +1124,8 @@ class DingTalkAdapter(BasePlatformAdapter):
                 "created+finalized" if finalize else "created (streaming)",
                 out_track_id,
             )
-            return SendResult(success=True, message_id=out_track_id)
+            return SendResult(success=True, message_id=out_track_id,
+                              raw_response={"reply_context_saved": reply_context_saved})
 
         except Exception as e:
             logger.warning(
@@ -1138,13 +1142,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit an AI Card by streaming updated content.
-
-        ``message_id`` is the out_track_id returned by the initial ``send()``
-        call that created this card.  Callers (stream_consumer, tool
-        progress) track their own ids independently so two parallel flows
-        on the same chat_id don't interfere.
-        """
+        """Edit one AI Card using the out_track_id returned by its initial send."""
         if not message_id:
             return SendResult(success=False, error="message_id required")
         token = await self._get_access_token()
@@ -1152,13 +1150,14 @@ class DingTalkAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="No access token")
 
         try:
+            if not self._card_reply_store.invalidate_content(chat_id, message_id):
+                return SendResult(success=False, error="Cannot safely update saved card original")
             await self._stream_card_content(
                 message_id, token, content, finalize=finalize,
             )
+            reply_context_saved = self._card_reply_store.update_content(chat_id, message_id, content)
             if finalize:
-                # Remove from streaming-cards tracking and fire Done.  This
-                # is the canonical "response ended" signal from stream
-                # consumer's final edit.
+                # Final edit ends tracking and fires Done.
                 self._streaming_cards.get(chat_id, {}).pop(message_id, None)
                 if not self._streaming_cards.get(chat_id):
                     self._streaming_cards.pop(chat_id, None)
@@ -1169,11 +1168,10 @@ class DingTalkAdapter(BasePlatformAdapter):
                 self._fire_done_reaction(chat_id)
                 mark_h1_turn_delivered(self, chat_id=chat_id, message_id=message_id)
             else:
-                # Non-final edit reopens the card into streaming state —
-                # track it so the next send() can auto-close it as a
-                # sibling.
+                # Track non-final edits so the next send can close the card.
                 self._streaming_cards.setdefault(chat_id, {})[message_id] = content
-            return SendResult(success=True, message_id=message_id)
+            return SendResult(success=True, message_id=message_id,
+                              raw_response={"reply_context_saved": reply_context_saved})
         except Exception as e:
             logger.warning("[%s] Card edit failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))

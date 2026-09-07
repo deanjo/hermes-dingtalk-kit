@@ -2,6 +2,12 @@
 
 import json
 import logging
+import math
+import os
+import re
+import secrets
+import sqlite3
+import time
 from typing import Any, Dict, List, Optional, Set
 
 
@@ -15,6 +21,21 @@ _DINGTALK_PLACEHOLDER_TEXTS = {"[图文消息]", "群聊的聊天记录"}
 _REPLY_ORIGINAL_UNAVAILABLE = "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00"
 _REPLY_ORIGINAL_CLARIFICATION = (
     "我暂时拿不到你引用消息的原文。请把关键原文贴在消息里，或重新描述要我处理的内容。"
+)
+_CARD_REPLY_DB_NAME = "dingtalk_card_replies.db"
+_CARD_REPLY_MAX_ROWS = 5000
+_DINGTALK_STATE_DIR_ENV = "DINGTALK_KIT_STATE_DIR"
+_WEBHOOK_REPLY_MATCH_SLOP_MS = 5000
+_REPLY_CONFIRMATION_TTL_SECONDS = 600
+_WEBHOOK_MESSAGE_ID_KEYS = (
+    "msgId",
+    "msg_id",
+    "messageId",
+    "message_id",
+    "openMessageId",
+    "open_message_id",
+    "carrierId",
+    "carrier_id",
 )
 
 
@@ -246,6 +267,494 @@ def _get_text_extensions(message: "ChatbotMessage") -> Dict[str, Any]:
     text = getattr(message, "text", None)
     extensions = getattr(text, "extensions", None)
     return extensions if isinstance(extensions, dict) else {}
+
+
+def _field(value: Any, *names: str) -> Any:
+    if isinstance(value, dict):
+        for name in names:
+            if name in value:
+                return value[name]
+        return None
+    for name in names:
+        if hasattr(value, name):
+            return getattr(value, name)
+    return None
+
+
+def _delivery_carrier_ids(response: Any) -> List[str]:
+    """Extract successful carrier ids from DingTalk's delivery response."""
+    body = _field(response, "body") or response
+    result = _field(body, "result")
+    items = result if isinstance(result, (list, tuple)) else [result or body]
+    carrier_ids: List[str] = []
+    for item in items[:32]:
+        success = _field(item, "success")
+        if success is False or str(success).lower() in {"false", "0"}:
+            continue
+        raw_ids = _field(item, "carrier_id", "carrierId")
+        values = raw_ids if isinstance(raw_ids, (list, tuple)) else [raw_ids]
+        for value in values:
+            carrier_id = str(value or "").strip()
+            if carrier_id and carrier_id not in carrier_ids:
+                carrier_ids.append(carrier_id)
+    return carrier_ids
+
+
+def _webhook_response_message_ids(response_body: Any) -> List[str]:
+    """Extract exact message ids when a webhook implementation returns them."""
+    message_ids: List[str] = []
+    for item in _walk_dicts(response_body):
+        for key in _WEBHOOK_MESSAGE_ID_KEYS:
+            value = item.get(key)
+            values = value if isinstance(value, (list, tuple)) else [value]
+            for candidate in values:
+                message_id = str(candidate or "").strip()
+                if message_id and message_id not in message_ids:
+                    message_ids.append(message_id)
+    return message_ids[:32]
+
+
+def _coerce_epoch_ms(value: Any) -> Optional[int]:
+    """Normalize DingTalk's repliedMsg.createdAt to epoch milliseconds."""
+    if isinstance(value, bool):
+        return None
+    try:
+        epoch = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(epoch) or epoch <= 0:
+        return None
+    if epoch < 100_000_000_000:  # seconds
+        epoch *= 1000
+    elif epoch > 10_000_000_000_000:  # microseconds or finer
+        epoch /= 1000
+    return int(epoch)
+
+
+class CardReplyStore:
+    """Restart-safe, chat-scoped lookup from card carrier id to latest text."""
+
+    def __init__(self, state_dir: Optional[str] = None, *, max_rows: int = _CARD_REPLY_MAX_ROWS):
+        self._state_dir = os.fspath(state_dir) if state_dir else None
+        self._max_rows = max(1, int(max_rows))
+
+    def _db_path(self) -> str:
+        base = self._state_dir or os.getenv(_DINGTALK_STATE_DIR_ENV)
+        if not base:
+            hermes_home = (os.getenv("HERMES_HOME") or "").strip()
+            base = (
+                os.path.join(hermes_home, "dingtalk-kit")
+                if hermes_home
+                else os.path.join(os.path.expanduser("~"), ".hermes-dingtalk-kit")
+            )
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        return os.path.join(base, _CARD_REPLY_DB_NAME)
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path(), timeout=5)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS card_replies (
+                chat_id TEXT NOT NULL,
+                carrier_id TEXT NOT NULL,
+                out_track_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                updated_epoch REAL NOT NULL,
+                PRIMARY KEY (chat_id, carrier_id)
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS card_replies_track "
+            "ON card_replies (chat_id, out_track_id)"
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS webhook_replies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                request_started_ms INTEGER NOT NULL,
+                request_finished_ms INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                updated_epoch REAL NOT NULL
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS webhook_replies_message "
+            "ON webhook_replies (chat_id, message_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS webhook_replies_time "
+            "ON webhook_replies (chat_id, request_started_ms, request_finished_ms)"
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS reply_confirmations (
+                chat_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
+                token TEXT NOT NULL,
+                request_text TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                expires_epoch REAL NOT NULL,
+                PRIMARY KEY (chat_id, sender_id)
+            )"""
+        )
+        return conn
+
+    def remember_delivery(
+        self,
+        chat_id: str,
+        out_track_id: str,
+        content: str,
+        delivery_response: Any,
+    ) -> bool:
+        carrier_ids = _delivery_carrier_ids(delivery_response)
+        if not chat_id or not out_track_id:
+            return False
+        if not carrier_ids:
+            logger.warning("[card-reply-store] delivery has no successful carrier id")
+            return False
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._connect()
+            now = time.time()
+            with conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO card_replies "
+                    "(chat_id, carrier_id, out_track_id, content, updated_epoch) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (chat_id, carrier_id, out_track_id, str(content)[:20000], now)
+                        for carrier_id in carrier_ids
+                    ],
+                )
+                conn.execute(
+                    "DELETE FROM card_replies WHERE rowid NOT IN "
+                    "(SELECT rowid FROM card_replies "
+                    "ORDER BY updated_epoch DESC, rowid DESC LIMIT ?)",
+                    (self._max_rows,),
+                )
+            logger.info(
+                "[card-reply-store] remembered has_chat_id=%s carrier_count=%d",
+                bool(chat_id),
+                len(carrier_ids),
+            )
+            return True
+        except (OSError, sqlite3.Error, ValueError):
+            logger.warning(
+                "[card-reply-store] remember failed has_chat_id=%s carrier_count=%d",
+                bool(chat_id),
+                len(carrier_ids),
+            )
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def update_content(self, chat_id: str, out_track_id: str, content: str) -> bool:
+        if not chat_id or not out_track_id:
+            return False
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._connect()
+            with conn:
+                cursor = conn.execute(
+                    "UPDATE card_replies SET content = ?, updated_epoch = ? "
+                    "WHERE chat_id = ? AND out_track_id = ?",
+                    (str(content)[:20000], time.time(), chat_id, out_track_id),
+                )
+            return cursor.rowcount > 0
+        except (OSError, sqlite3.Error, ValueError):
+            logger.warning(
+                "[card-reply-store] update failed has_chat_id=%s",
+                bool(chat_id),
+            )
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def invalidate_content(self, chat_id: str, out_track_id: str) -> bool:
+        """Commit invalidation BEFORE a remote edit, so a failed save cannot revive stale text."""
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._connect()
+            with conn:
+                conn.execute(
+                    "UPDATE card_replies SET content = '' WHERE chat_id = ? AND out_track_id = ?",
+                    (chat_id, out_track_id),
+                )
+            return True
+        except (OSError, sqlite3.Error, ValueError):
+            logger.warning("[card-reply-store] invalidation failed has_chat_id=%s", bool(chat_id))
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def remember_webhook_delivery(
+        self,
+        chat_id: str,
+        content: str,
+        request_started_ms: int,
+        request_finished_ms: int,
+        response_body: Any = None,
+    ) -> bool:
+        """Persist the actual session-webhook output and its server-send window."""
+        if not chat_id or not content:
+            return False
+        try:
+            started_ms = int(request_started_ms)
+            finished_ms = max(started_ms, int(request_finished_ms))
+        except (TypeError, ValueError):
+            return False
+        message_ids = _webhook_response_message_ids(response_body) or [""]
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._connect()
+            now = time.time()
+            with conn:
+                conn.executemany(
+                    "INSERT INTO webhook_replies "
+                    "(chat_id, message_id, request_started_ms, request_finished_ms, "
+                    "content, updated_epoch) VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            chat_id,
+                            message_id,
+                            started_ms,
+                            finished_ms,
+                            str(content),
+                            now,
+                        )
+                        for message_id in message_ids
+                    ],
+                )
+                conn.execute(
+                    "DELETE FROM webhook_replies WHERE id NOT IN "
+                    "(SELECT id FROM webhook_replies "
+                    "ORDER BY updated_epoch DESC, id DESC LIMIT ?)",
+                    (self._max_rows,),
+                )
+            logger.info(
+                "[webhook-reply-store] remembered has_chat_id=%s exact_id_count=%d",
+                bool(chat_id),
+                0 if message_ids == [""] else len(message_ids),
+            )
+            return True
+        except (OSError, sqlite3.Error, ValueError):
+            logger.warning(
+                "[webhook-reply-store] remember failed has_chat_id=%s",
+                bool(chat_id),
+            )
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _resolve_webhook(
+        self,
+        chat_id: str,
+        message_id: str,
+        created_at: Any,
+        *,
+        allow_time_candidate: bool = False,
+    ) -> tuple[Optional[str], str, int]:
+        if not chat_id:
+            return None, "none", 0
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._connect()
+            if message_id:
+                rows = conn.execute(
+                    "SELECT DISTINCT content FROM webhook_replies "
+                    "WHERE chat_id = ? AND message_id = ? "
+                    "ORDER BY updated_epoch DESC, id DESC LIMIT 2",
+                    (chat_id, message_id),
+                ).fetchall()
+                if rows:
+                    return (str(rows[0][0]) if len(rows) == 1 else None), "message_id", len(rows)
+
+            if not allow_time_candidate:
+                return None, "message_id", 0
+
+            created_ms = _coerce_epoch_ms(created_at)
+            if created_ms is None:
+                return None, "none", 0
+            exact_rows = conn.execute(
+                "SELECT content FROM webhook_replies "
+                "WHERE chat_id = ? "
+                "AND request_started_ms <= ? "
+                "AND request_finished_ms >= ? "
+                "ORDER BY updated_epoch DESC, id DESC LIMIT 3",
+                (chat_id, created_ms, created_ms),
+            ).fetchall()
+            if len(exact_rows) == 1:
+                return str(exact_rows[0][0]), "created_at", 1
+            if len(exact_rows) > 1:
+                return None, "created_at", len(exact_rows)
+            rows = conn.execute(
+                "SELECT content FROM webhook_replies "
+                "WHERE chat_id = ? "
+                "AND request_started_ms <= ? "
+                "AND request_finished_ms >= ? "
+                "ORDER BY updated_epoch DESC, id DESC LIMIT 3",
+                (
+                    chat_id,
+                    created_ms + _WEBHOOK_REPLY_MATCH_SLOP_MS,
+                    created_ms - _WEBHOOK_REPLY_MATCH_SLOP_MS,
+                ),
+            ).fetchall()
+            # This result is only a candidate to show the user; never dispatch
+            # their original request based on a timestamp alone.
+            if len(rows) == 1:
+                return str(rows[0][0]), "created_at", 1
+            return None, "created_at", len(rows)
+        except (OSError, sqlite3.Error, ValueError):
+            logger.warning(
+                "[webhook-reply-store] lookup failed has_chat_id=%s",
+                bool(chat_id),
+            )
+            return None, "error", 0
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def resolve(self, chat_id: str, carrier_id: str) -> Optional[str]:
+        if not chat_id or not carrier_id:
+            return None
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT content FROM card_replies "
+                "WHERE chat_id = ? AND carrier_id = ?",
+                (chat_id, carrier_id),
+            ).fetchone()
+            return str(row[0]) if row and row[0] else None
+        except (OSError, sqlite3.Error, ValueError):
+            logger.warning(
+                "[card-reply-store] lookup failed has_chat_id=%s",
+                bool(chat_id),
+            )
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def resolve_message(self, chat_id: str, message: "ChatbotMessage") -> Optional[str]:
+        replied = _get_text_extensions(message).get("repliedMsg")
+        if not isinstance(replied, dict):
+            return None
+        msg_type = str(replied.get("msgType") or replied.get("msgtype") or "").lower()
+        if msg_type != "interactivecard":
+            return None
+        carrier_id = str(replied.get("msgId") or replied.get("msgid") or "").strip()
+        original = self.resolve(chat_id, carrier_id)
+        source = "carrier_id"
+        candidate_count = 1 if original else 0
+        if not original:
+            original, source, candidate_count = self._resolve_webhook(
+                chat_id,
+                carrier_id,
+                replied.get("createdAt") or replied.get("created_at"),
+            )
+        logger.info(
+            "[card-reply-store] interactiveCard lookup=%s source=%s "
+            "candidate_count=%d has_chat_id=%s",
+            "hit" if original else "miss",
+            source,
+            candidate_count,
+            bool(chat_id),
+        )
+        return original
+
+    @staticmethod
+    def confirmation_token(text: str) -> Optional[str]:
+        command = re.sub(r"^(?:@\S+\s+)+", "", str(text or "").strip())
+        if not command.startswith("确认引用"):
+            return None
+        match = re.fullmatch(r"确认引用\s+([0-9a-fA-F]{8})", command)
+        return match.group(1).lower() if match else ""
+
+    def propose_confirmation(
+        self, chat_id: str, sender_id: str, message: "ChatbotMessage", request_text: str,
+    ) -> Optional[str]:
+        """Show a complete, unverified candidate; persist only an explicit continuation."""
+        replied = _get_text_extensions(message).get("repliedMsg")
+        if not chat_id or not sender_id or not request_text or not isinstance(replied, dict):
+            return None
+        if str(replied.get("msgType") or replied.get("msgtype") or "").lower() != "interactivecard":
+            return None
+        message_id = str(replied.get("msgId") or replied.get("msgid") or "").strip()
+        content, source, count = self._resolve_webhook(
+            chat_id, "", replied.get("createdAt") or replied.get("created_at"),
+            allow_time_candidate=True,
+        )
+        logger.info("[reply-confirmation] source=%s candidate_count=%d", source, count)
+        if not content or not message_id:
+            return None
+        token = secrets.token_hex(4)
+        # Keep the action and full candidate visible, within the send() limit.
+        prompt = (
+            "无法按消息编号核实原文。我按发送时间找到下面一条候选，尚未执行你的请求。\n\n"
+            f"候选全文：\n{content}\n\n你的请求：{request_text}\n\n"
+            f"如果这就是你引用的内容，并要继续上述请求，请在 10 分钟内发送：确认引用 {token}\n"
+            "如果不是，请直接粘贴正确原文和你的请求。"
+        )
+        if len(prompt) > 20000:
+            return None
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._connect()
+            now = time.time()
+            with conn:
+                conn.execute("DELETE FROM reply_confirmations WHERE expires_epoch <= ?", (now,))
+                conn.execute(
+                    "INSERT OR REPLACE INTO reply_confirmations "
+                    "(chat_id, sender_id, token, request_text, message_id, content, expires_epoch) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (chat_id, sender_id, token, request_text, message_id, content,
+                     now + _REPLY_CONFIRMATION_TTL_SECONDS),
+                )
+                conn.execute(
+                    "DELETE FROM reply_confirmations WHERE rowid NOT IN "
+                    "(SELECT rowid FROM reply_confirmations ORDER BY expires_epoch DESC, rowid DESC LIMIT ?)",
+                    (self._max_rows,),
+                )
+            return prompt
+        except (OSError, sqlite3.Error, ValueError):
+            logger.warning("[reply-confirmation] save failed has_chat_id=%s", bool(chat_id))
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def consume_confirmation(self, chat_id: str, sender_id: str, token: str) -> Optional[Dict[str, str]]:
+        """Atomically consume one sender's unexpired confirmation, including after restart."""
+        if not chat_id or not sender_id or not token:
+            return None
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._connect()
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT request_text, message_id, content FROM reply_confirmations "
+                    "WHERE chat_id = ? AND sender_id = ? AND token = ? AND expires_epoch > ?",
+                    (chat_id, sender_id, token, time.time()),
+                ).fetchone()
+                if not row:
+                    return None
+                conn.execute(
+                    "DELETE FROM reply_confirmations WHERE chat_id = ? AND sender_id = ?",
+                    (chat_id, sender_id),
+                )
+            return {"request_text": row[0], "reply_to_message_id": row[1], "reply_to_text": row[2]}
+        except (OSError, sqlite3.Error, ValueError):
+            logger.warning("[reply-confirmation] consume failed has_chat_id=%s", bool(chat_id))
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
 
 
 def _get_replied_file_content(message: "ChatbotMessage") -> Optional[Dict[str, Any]]:

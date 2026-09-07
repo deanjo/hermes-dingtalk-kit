@@ -10,6 +10,7 @@ import copy
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -335,11 +336,75 @@ def _assert_reply_context(root: Path) -> str:
 
     if reply_context.build_reply_kwargs(FileMessage()) != {}:
         raise AssertionError("file replies must stay on the file-content path")
-    return "repliedMsg maps to reply_to_message_id/reply_to_text"
+
+    class CardText:
+        extensions = {
+            "repliedMsg": {
+                "msgId": "carrier-27",
+                "msgType": "interactiveCard",
+            }
+        }
+
+    class CardMessage:
+        text = CardText()
+
+    class WebhookCardText:
+        extensions = {
+            "repliedMsg": {
+                "msgId": "dingtalk-generated-id",
+                "msgType": "interactiveCard",
+                "createdAt": 1_800_000_000_100,
+            }
+        }
+
+    class WebhookCardMessage:
+        text = WebhookCardText()
+
+    response = types.SimpleNamespace(
+        body=types.SimpleNamespace(
+            result=[types.SimpleNamespace(carrier_id="carrier-27", success=True)]
+        )
+    )
+    with tempfile.TemporaryDirectory() as state_dir:
+        store = reply_context.CardReplyStore(state_dir)
+        if not store.remember_delivery(
+            "chat-1", "hermes-track-19", "card original", response
+        ):
+            raise AssertionError("card delivery carrier id was not persisted")
+        if store.resolve_message("chat-1", CardMessage()) != "card original":
+            raise AssertionError("interactiveCard carrier id did not resolve")
+        if store.resolve_message("chat-2", CardMessage()) is not None:
+            raise AssertionError("interactiveCard lookup is not isolated by chat")
+        if not store.remember_webhook_delivery(
+            "chat-1",
+            "webhook original",
+            1_800_000_000_000,
+            1_800_000_000_200,
+            {"errcode": 0},
+        ):
+            raise AssertionError("session webhook output was not persisted")
+        if store.resolve_message("chat-1", WebhookCardMessage()) is not None:
+            raise AssertionError("timestamp-only candidate must not resolve automatically")
+        prompt = store.propose_confirmation("chat-1", "sender-1", WebhookCardMessage(), "继续处理")
+        if not prompt or "webhook original" not in prompt or "尚未执行" not in prompt:
+            raise AssertionError("timestamp-only candidate must be shown for explicit confirmation")
+        token_match = re.search(r"确认引用 ([0-9a-f]{8})", prompt)
+        if not token_match:
+            raise AssertionError("candidate confirmation command missing")
+        token = token_match.group(1)
+        if store.consume_confirmation("chat-2", "sender-1", token) is not None:
+            raise AssertionError("candidate confirmation crossed chats")
+        reopened = reply_context.CardReplyStore(state_dir)
+        confirmed = reopened.consume_confirmation("chat-1", "sender-1", token)
+        if not confirmed or confirmed["reply_to_text"] != "webhook original":
+            raise AssertionError("confirmed candidate did not survive reopen")
+        if reopened.consume_confirmation("chat-1", "sender-1", token) is not None:
+            raise AssertionError("candidate confirmation was reusable")
+    return "exact ids recover; timestamp candidates require one explicit, scoped confirmation"
 
 
 def _assert_reply_context_forwarded(root: Path) -> str:
-    """Ensure unavailable quoted text stops before model dispatch."""
+    """Ensure only an exact card lookup can bypass unavailable-text rejection."""
     adapter = root / PLUGIN_REL / "adapter.py"
     adapter_text = adapter.read_text(encoding="utf-8")
     tree = ast.parse(adapter_text, filename=str(adapter))
@@ -421,21 +486,45 @@ def _assert_reply_context_forwarded(root: Path) -> str:
     )
     if not kwargs_index < event_index < dispatch_index:
         raise AssertionError("reply context is not forwarded in dispatch order")
-    if event_index != kwargs_index + 2:
+    confirmation_guard = method.body[kwargs_index + 1]
+    if not (
+        isinstance(confirmation_guard, ast.If)
+        and isinstance(confirmation_guard.test, ast.Name)
+        and confirmation_guard.test.id == "confirmed_reply"
+        and not confirmation_guard.orelse
+        and len(confirmation_guard.body) == 1
+        and ast.unparse(confirmation_guard.body[0]) == "reply_kwargs = confirmed_reply"
+    ):
         raise AssertionError("unexpected reply policy branch before MessageEvent")
-    guard = method.body[kwargs_index + 1]
+    guard = method.body[kwargs_index + 2]
+    if any(
+        isinstance(node, ast.Name) and node.id == "reply_kwargs"
+        for statement in method.body[kwargs_index + 3:event_index]
+        for node in ast.walk(statement)
+    ):
+        raise AssertionError("unexpected reply policy branch before MessageEvent")
     guard_text = ast.get_source_segment(adapter_text, guard) or ""
     required = (
         "__HERMES_REPLY_ORIGINAL_UNAVAILABLE__",
+        "resolve_message(chat_id, message)",
+        'reply_kwargs["reply_to_text"] = recovered',
         "await self.send",
         "我暂时拿不到你引用消息的原文",
         '"delivery_class": "business_error"',
+        "propose_confirmation(chat_id, confirmation_sender, message, text)",
+        '"reply_recovery_prompt": True',
     )
     if not isinstance(guard, ast.If) or any(item not in guard_text for item in required):
         raise AssertionError("unavailable reply does not send the required clarification")
-    if guard.orelse or not any(isinstance(node, ast.Return) for node in guard.body):
+    inner_guards = [statement for statement in guard.body if isinstance(statement, ast.If)]
+    if guard.orelse or len(inner_guards) != 1:
+        raise AssertionError("unavailable reply does not use one exact recovery branch")
+    recovery_guard = inner_guards[0]
+    if any(isinstance(node, ast.Return) for node in recovery_guard.body):
+        raise AssertionError("resolved card reply stops before model dispatch")
+    if not any(isinstance(node, ast.Return) for node in recovery_guard.orelse):
         raise AssertionError("unavailable reply does not stop before model dispatch")
-    return "unavailable reply clarifies once; other reply kwargs reach MessageEvent"
+    return "exact ids or consumed confirmations recover; other replies stop before dispatch"
 
 
 def _assert_gateway_reply_context_layering(root: Path) -> str:
