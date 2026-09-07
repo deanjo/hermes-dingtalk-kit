@@ -107,7 +107,7 @@ def load_card_methods():
         node.name: copy.deepcopy(node)
         for node in adapter_class.body
         if isinstance(node, ast.AsyncFunctionDef)
-        and node.name in {"_create_and_stream_card", "edit_message"}
+        and node.name in {"_create_and_stream_card", "edit_message", "_stream_card_content"}
     }
     module = ast.Module(
         body=[
@@ -118,6 +118,7 @@ def load_card_methods():
             ),
             methods["_create_and_stream_card"],
             methods["edit_message"],
+            methods["_stream_card_content"],
         ],
         type_ignores=[],
     )
@@ -134,7 +135,7 @@ def load_card_methods():
         ),
     }
     exec(compile(module, str(ADAPTER_PATH), "exec"), namespace)
-    return namespace["_create_and_stream_card"], namespace["edit_message"]
+    return namespace["_create_and_stream_card"], namespace["edit_message"], namespace["_stream_card_content"]
 
 
 class FakeResponse:
@@ -252,7 +253,7 @@ class FakeCardAdapter:
 class DingTalkDeliveryContractTest(unittest.TestCase):
     def setUp(self):
         self.send = load_send_function()
-        self.create_card, self.edit_card = load_card_methods()
+        self.create_card, self.edit_card, self.stream_card = load_card_methods()
 
     def run_send(self, adapter, **kwargs):
         return asyncio.run(self.send(adapter, "conv-1", "hello", **kwargs))
@@ -276,6 +277,22 @@ class DingTalkDeliveryContractTest(unittest.TestCase):
             },
             adapter._http_client.calls[0]["json"],
         )
+
+    def test_webhook_sends_and_saves_over_20000_characters_without_truncation(self):
+        adapter = FakeAdapter(FakeResponse())
+        original = "完整正文" * 6000 + "TAIL-24000"
+        result = asyncio.run(self.send(adapter, "conv-1", original, metadata={"at_user_ids": ["staff"]}))
+        self.assertTrue(result.success)
+        self.assertEqual("normalized:" + original, adapter._http_client.calls[0]["json"]["markdown"]["text"])
+        self.assertEqual("normalized:" + original, adapter._card_reply_store.webhook_remembered[0][1])
+
+    def test_card_sdk_receives_full_content_above_20000_characters(self):
+        adapter = FakeCardAdapter(SimpleNamespace())
+        adapter._card_sdk.streaming_update_with_options_async = mock.AsyncMock()
+        original = "完整卡片" * 6000 + "SDK-TAIL"
+        asyncio.run(self.stream_card(adapter, "track", "fake-token", original, finalize=True))
+        request = adapter._card_sdk.streaming_update_with_options_async.call_args.args[0]
+        self.assertEqual(original, request.content)
 
     def test_single_string_at_user_id_is_normalized_to_a_list(self):
         adapter = FakeAdapter(FakeResponse())

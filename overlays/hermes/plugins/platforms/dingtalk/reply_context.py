@@ -23,7 +23,9 @@ _REPLY_ORIGINAL_CLARIFICATION = (
     "我暂时拿不到你引用消息的原文。请把关键原文贴在消息里，或重新描述要我处理的内容。"
 )
 _CARD_REPLY_DB_NAME = "dingtalk_card_replies.db"
-_CARD_REPLY_MAX_ROWS = 5000
+_REPLY_CONFIRMATION_MAX_ROWS = 5000
+_REPLY_INPUT_MAX_BYTES = 120000
+_REPLY_PREVIEW_CHUNK_BYTES = 12000
 _DINGTALK_STATE_DIR_ENV = "DINGTALK_KIT_STATE_DIR"
 _WEBHOOK_REPLY_MATCH_SLOP_MS = 5000
 _REPLY_CONFIRMATION_TTL_SECONDS = 600
@@ -50,6 +52,59 @@ def append_full_reply_text(text: Optional[str], reply_kwargs: Dict[str, Any]) ->
         f"{original}\n"
         "[引用原文结束]"
     )
+
+
+def reply_input_limit_message(text: Optional[str], reply_kwargs: Dict[str, Any]) -> Optional[str]:
+    """Reject an oversized turn explicitly; never shorten its stored original."""
+    original = reply_kwargs.get("reply_to_text")
+    if isinstance(original, str) and len((original + (text or "")).encode("utf-8")) > _REPLY_INPUT_MAX_BYTES:
+        return (
+            "引用原文和本次请求合计超过单次处理上限（120000 UTF-8 字节），尚未执行你的请求。"
+            "已保存的原文不会因此截断或删除。请把所需内容分段粘贴，并说明这一段要处理什么。"
+        )
+    return None
+
+
+def _preview_chunks(text: str) -> List[str]:
+    data = text.encode("utf-8")
+    chunks = []
+    while data:
+        chunk = data[:_REPLY_PREVIEW_CHUNK_BYTES].decode("utf-8", errors="ignore")
+        chunks.append(chunk)
+        data = data[len(chunk.encode("utf-8")):]
+    return chunks
+
+
+async def send_reply_recovery_prompt(adapter, chat_id: str, sender_id: str,
+                                     prompt: Optional[str], message_id: str) -> bool:
+    """Show every preview byte before sending the continuation command."""
+    prompt = prompt or _REPLY_ORIGINAL_CLARIFICATION
+    token_match = re.search(r"确认引用 ([0-9a-f]{8})\n如果不是，请直接粘贴正确原文和你的请求。$", prompt)
+    token = token_match.group(1) if token_match else ""
+    parts = [prompt]
+    if len(prompt.encode("utf-8")) > _REPLY_PREVIEW_CHUNK_BYTES:
+        body, separator, instructions = prompt.rpartition("\n\n如果这就是你引用的内容")
+        chunks = _preview_chunks(body if separator else prompt)
+        parts = [f"引用核对资料（第 {i}/{len(chunks)} 段，请核对全部段落）\n{part}"
+                 for i, part in enumerate(chunks, 1)]
+        if separator:
+            parts.append("候选全文及原请求已全部发送。\n如果这就是你引用的内容" + instructions)
+    try:
+        for part in parts:
+            result = await adapter.send(
+                chat_id, part, reply_to=message_id,
+                metadata={"delivery_class": "business_error", "reply_recovery_prompt": True},
+            )
+            if not result.success:
+                raise RuntimeError("reply preview delivery failed")
+        if token and not adapter._card_reply_store.activate_confirmation(chat_id, sender_id, token):
+            raise RuntimeError("reply preview could not be activated")
+        return True
+    except Exception:
+        if token:
+            adapter._card_reply_store.cancel_confirmation(chat_id, sender_id, token)
+        logger.warning("[reply-confirmation] incomplete preview; continuation cancelled")
+        return False
 
 
 def _safe_keys(value: Any) -> List[str]:
@@ -347,8 +402,10 @@ def _coerce_epoch_ms(value: Any) -> Optional[int]:
 class CardReplyStore:
     """Restart-safe, chat-scoped lookup from card carrier id to latest text."""
 
-    def __init__(self, state_dir: Optional[str] = None, *, max_rows: int = _CARD_REPLY_MAX_ROWS):
+    def __init__(self, state_dir: Optional[str] = None, *, max_rows: int = _REPLY_CONFIRMATION_MAX_ROWS):
         self._state_dir = os.fspath(state_dir) if state_dir else None
+        # Compatibility argument: only short-lived confirmations are bounded.
+        # Delivered originals are durable records, not an evictable cache.
         self._max_rows = max(1, int(max_rows))
 
     def _db_path(self) -> str:
@@ -435,15 +492,9 @@ class CardReplyStore:
                     "(chat_id, carrier_id, out_track_id, content, updated_epoch) "
                     "VALUES (?, ?, ?, ?, ?)",
                     [
-                        (chat_id, carrier_id, out_track_id, str(content)[:20000], now)
+                        (chat_id, carrier_id, out_track_id, str(content), now)
                         for carrier_id in carrier_ids
                     ],
-                )
-                conn.execute(
-                    "DELETE FROM card_replies WHERE rowid NOT IN "
-                    "(SELECT rowid FROM card_replies "
-                    "ORDER BY updated_epoch DESC, rowid DESC LIMIT ?)",
-                    (self._max_rows,),
                 )
             logger.info(
                 "[card-reply-store] remembered has_chat_id=%s carrier_count=%d",
@@ -472,7 +523,7 @@ class CardReplyStore:
                 cursor = conn.execute(
                     "UPDATE card_replies SET content = ?, updated_epoch = ? "
                     "WHERE chat_id = ? AND out_track_id = ?",
-                    (str(content)[:20000], time.time(), chat_id, out_track_id),
+                    (str(content), time.time(), chat_id, out_track_id),
                 )
             return cursor.rowcount > 0
         except (OSError, sqlite3.Error, ValueError):
@@ -540,12 +591,6 @@ class CardReplyStore:
                         )
                         for message_id in message_ids
                     ],
-                )
-                conn.execute(
-                    "DELETE FROM webhook_replies WHERE id NOT IN "
-                    "(SELECT id FROM webhook_replies "
-                    "ORDER BY updated_epoch DESC, id DESC LIMIT ?)",
-                    (self._max_rows,),
                 )
             logger.info(
                 "[webhook-reply-store] remembered has_chat_id=%s exact_id_count=%d",
@@ -690,6 +735,7 @@ class CardReplyStore:
 
     def propose_confirmation(
         self, chat_id: str, sender_id: str, message: "ChatbotMessage", request_text: str,
+        *, defer_confirmation: bool = False,
     ) -> Optional[str]:
         """Show a complete, unverified candidate; persist only an explicit continuation."""
         replied = _get_text_extensions(message).get("repliedMsg")
@@ -705,16 +751,17 @@ class CardReplyStore:
         logger.info("[reply-confirmation] source=%s candidate_count=%d", source, count)
         if not content or not message_id:
             return None
+        limit_message = reply_input_limit_message(request_text, {"reply_to_text": content})
+        if limit_message:
+            return limit_message
         token = secrets.token_hex(4)
-        # Keep the action and full candidate visible, within the send() limit.
+        # The adapter sends this in bounded pieces, with the command last.
         prompt = (
             "无法按消息编号核实原文。我按发送时间找到下面一条候选，尚未执行你的请求。\n\n"
             f"候选全文：\n{content}\n\n你的请求：{request_text}\n\n"
             f"如果这就是你引用的内容，并要继续上述请求，请在 10 分钟内发送：确认引用 {token}\n"
             "如果不是，请直接粘贴正确原文和你的请求。"
         )
-        if len(prompt) > 20000:
-            return None
         conn: Optional[sqlite3.Connection] = None
         try:
             conn = self._connect()
@@ -725,7 +772,7 @@ class CardReplyStore:
                     "INSERT OR REPLACE INTO reply_confirmations "
                     "(chat_id, sender_id, token, request_text, message_id, content, expires_epoch) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (chat_id, sender_id, token, request_text, message_id, content,
+                    (chat_id, sender_id, "pending:" + token if defer_confirmation else token, request_text, message_id, content,
                      now + _REPLY_CONFIRMATION_TTL_SECONDS),
                 )
                 conn.execute(
@@ -737,6 +784,42 @@ class CardReplyStore:
         except (OSError, sqlite3.Error, ValueError):
             logger.warning("[reply-confirmation] save failed has_chat_id=%s", bool(chat_id))
             return None
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def cancel_confirmation(self, chat_id: str, sender_id: str, token: str) -> bool:
+        """Invalidate only this preview when any delivery step fails."""
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._connect()
+            with conn:
+                conn.execute("DELETE FROM reply_confirmations WHERE chat_id = ? AND sender_id = ? AND token IN (?, ?)",
+                             (chat_id, sender_id, token, "pending:" + token))
+            return True
+        except (OSError, sqlite3.Error, ValueError):
+            logger.warning("[reply-confirmation] cancellation failed has_chat_id=%s", bool(chat_id))
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def activate_confirmation(self, chat_id: str, sender_id: str, token: str) -> bool:
+        """Only the fully delivered preview may become a consumable command."""
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = self._connect()
+            with conn:
+                result = conn.execute(
+                    "UPDATE reply_confirmations SET token = ?, expires_epoch = ? "
+                    "WHERE chat_id = ? AND sender_id = ? AND token IN (?, ?)",
+                    (token, time.time() + _REPLY_CONFIRMATION_TTL_SECONDS,
+                     chat_id, sender_id, token, "pending:" + token),
+                )
+            return result.rowcount == 1
+        except (OSError, sqlite3.Error, ValueError):
+            logger.warning("[reply-confirmation] activation failed has_chat_id=%s", bool(chat_id))
+            return False
         finally:
             if conn is not None:
                 conn.close()

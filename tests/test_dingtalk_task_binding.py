@@ -124,6 +124,8 @@ def load_on_message(binding, *, exists):
         "asyncio": asyncio,
         "build_reply_kwargs": lambda message: {},
         "append_full_reply_text": reply_context.append_full_reply_text,
+        "reply_input_limit_message": reply_context.reply_input_limit_message,
+        "send_reply_recovery_prompt": reply_context.send_reply_recovery_prompt,
         "datetime": datetime,
         "extract_media": lambda message, message_type: (message_type.TEXT, [], []),
         "is_user_allowed": lambda *args, **kwargs: True,

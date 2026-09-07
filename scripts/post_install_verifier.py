@@ -377,7 +377,7 @@ def _assert_reply_context(root: Path) -> str:
         )
     )
     with tempfile.TemporaryDirectory() as state_dir:
-        store = reply_context.CardReplyStore(state_dir)
+        store = reply_context.CardReplyStore(state_dir, max_rows=1)
         if not store.remember_delivery(
             "chat-1", "hermes-track-19", "card original", response
         ):
@@ -411,6 +411,19 @@ def _assert_reply_context(root: Path) -> str:
             raise AssertionError("confirmed candidate did not survive reopen")
         if reopened.consume_confirmation("chat-1", "sender-1", token) is not None:
             raise AssertionError("candidate confirmation was reusable")
+        complete_original = "长文" * 11000 + "FULL-TAIL"
+        if not store.update_content("chat-1", "hermes-track-19", complete_original):
+            raise AssertionError("long card update failed")
+        store.remember_delivery("chat-2", "other-track", "other", response)
+        if reopened.resolve_message("chat-1", CardMessage()) != complete_original:
+            raise AssertionError("long original was truncated or evicted by another chat")
+        store.remember_webhook_delivery("chat-2", "other", 1_900_000_000_000, 1_900_000_000_200)
+        if "webhook original" not in (reopened.propose_confirmation("chat-1", "sender-1", WebhookCardMessage(), "继续") or ""):
+            raise AssertionError("webhook original was evicted by another chat")
+        if reply_context.reply_input_limit_message("请求", {"reply_to_text": complete_original}):
+            raise AssertionError("a complete 22000-character original should fit the product limit")
+        if not reply_context.reply_input_limit_message("请求", {"reply_to_text": "字" * 40001}):
+            raise AssertionError("oversized model input must produce an explicit refusal")
     return "exact ids recover; timestamp candidates require one explicit, scoped confirmation"
 
 
@@ -517,7 +530,7 @@ def _assert_reply_context_forwarded(root: Path) -> str:
     guard = method.body[kwargs_index + 2]
     if any(
         isinstance(node, ast.Name) and node.id == "reply_kwargs"
-        for statement in method.body[kwargs_index + 3:append_index]
+        for statement in method.body[kwargs_index + 4:append_index]
         for node in ast.walk(statement)
     ):
         raise AssertionError("unexpected reply policy branch before MessageEvent")
@@ -526,11 +539,8 @@ def _assert_reply_context_forwarded(root: Path) -> str:
         "__HERMES_REPLY_ORIGINAL_UNAVAILABLE__",
         "resolve_message(chat_id, message)",
         'reply_kwargs["reply_to_text"] = recovered',
-        "await self.send",
-        "我暂时拿不到你引用消息的原文",
-        '"delivery_class": "business_error"',
-        "propose_confirmation(chat_id, confirmation_sender, message, text)",
-        '"reply_recovery_prompt": True',
+        "await send_reply_recovery_prompt(self, chat_id, confirmation_sender, candidate_prompt, msg_id)",
+        "propose_confirmation(chat_id, confirmation_sender, message, text, defer_confirmation=True)",
     )
     if not isinstance(guard, ast.If) or any(item not in guard_text for item in required):
         raise AssertionError("unavailable reply does not send the required clarification")
@@ -542,6 +552,13 @@ def _assert_reply_context_forwarded(root: Path) -> str:
         raise AssertionError("resolved card reply stops before model dispatch")
     if not any(isinstance(node, ast.Return) for node in recovery_guard.orelse):
         raise AssertionError("unavailable reply does not stop before model dispatch")
+    limit_guard = ast.parse(
+        "if limit_message := reply_input_limit_message(text, reply_kwargs):\n"
+        "    await send_reply_recovery_prompt(self, chat_id, confirmation_sender, limit_message, msg_id)\n"
+        "    return\n"
+    ).body[0]
+    if ast.dump(method.body[kwargs_index + 3]) != ast.dump(limit_guard):
+        raise AssertionError("oversized quoted input must stop before task binding and model dispatch")
     return "exact ids or consumed confirmations recover; complete long originals reach event text"
 
 

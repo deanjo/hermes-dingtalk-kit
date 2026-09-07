@@ -445,10 +445,10 @@ class BasePlatformAdapter:
         root = self.make_target()
         adapter = root / "plugins/platforms/dingtalk/adapter.py"
         text = adapter.read_text(encoding="utf-8")
-        marker = "                return\n\n        task_binding = None\n"
+        marker = "                return\n        if limit_message := reply_input_limit_message(text, reply_kwargs):\n"
         self.assertIn(marker, text)
         adapter.write_text(
-            text.replace(marker, "\n        task_binding = None\n", 1),
+            text.replace(marker, "        if limit_message := reply_input_limit_message(text, reply_kwargs):\n", 1),
             encoding="utf-8",
         )
 

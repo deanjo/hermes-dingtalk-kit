@@ -130,7 +130,7 @@ try:
         _get_replied_file_content,
         _is_placeholder_text,
         _log_forward_diag,
-        append_full_reply_text, build_reply_kwargs,
+        append_full_reply_text, build_reply_kwargs, reply_input_limit_message, send_reply_recovery_prompt,
     )
     from .task_binding import resolve_gateway_profile, resolve_task_binding
     from .task_binding import restore_h1_binding, set_h1_dispatch_scope, mark_h1_turn_delivered, h1_turn_meta_lines, is_h1_failure_receipt
@@ -151,7 +151,7 @@ except ImportError:
         _get_replied_file_content,
         _is_placeholder_text,
         _log_forward_diag,
-        append_full_reply_text, build_reply_kwargs,
+        append_full_reply_text, build_reply_kwargs, reply_input_limit_message, send_reply_recovery_prompt,
     )
     from task_binding import resolve_gateway_profile, resolve_task_binding  # type: ignore
     from task_binding import restore_h1_binding, set_h1_dispatch_scope, mark_h1_turn_delivered, h1_turn_meta_lines, is_h1_failure_receipt  # type: ignore
@@ -674,17 +674,14 @@ class DingTalkAdapter(BasePlatformAdapter):
                 reply_kwargs["reply_to_text"] = recovered
             else:
                 candidate_prompt = (
-                    self._card_reply_store.propose_confirmation(chat_id, confirmation_sender, message, text)
+                    self._card_reply_store.propose_confirmation(chat_id, confirmation_sender, message, text, defer_confirmation=True)
                     if not media_urls else None
                 )
-                await self.send(
-                    chat_id,
-                    candidate_prompt or "我暂时拿不到你引用消息的原文。请把关键原文贴在消息里，或重新描述要我处理的内容。",
-                    reply_to=msg_id,
-                    metadata={"delivery_class": "business_error", "reply_recovery_prompt": True},
-                )
+                await send_reply_recovery_prompt(self, chat_id, confirmation_sender, candidate_prompt, msg_id)
                 return
-
+        if limit_message := reply_input_limit_message(text, reply_kwargs):
+            await send_reply_recovery_prompt(self, chat_id, confirmation_sender, limit_message, msg_id)
+            return
         task_binding = None
         if (text or "").lstrip().startswith("#任务"):
             parsed_task_message = await resolve_task_binding(
@@ -852,7 +849,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         logger.debug("[%s] Sending via webhook", self.name)
         # Normalize markdown for DingTalk
-        normalized = self._normalize_markdown(content[: self.MAX_MESSAGE_LENGTH])
+        normalized = self._normalize_markdown(content)
 
         payload = {
             "msgtype": "markdown",
@@ -1189,7 +1186,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             out_track_id=out_track_id,
             guid=str(uuid.uuid4()),
             key="content",
-            content=content[: self.MAX_MESSAGE_LENGTH],
+            content=content,
             is_full=True,
             is_finalize=finalize,
             is_error=False,

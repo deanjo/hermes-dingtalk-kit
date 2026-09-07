@@ -159,6 +159,8 @@ def load_on_message(*, with_media=False):
         "asyncio": asyncio,
         "build_reply_kwargs": lambda message: getattr(message, "_test_reply_kwargs", None) or {},
         "append_full_reply_text": load_reply_context_module().append_full_reply_text,
+        "reply_input_limit_message": load_reply_context_module().reply_input_limit_message,
+        "send_reply_recovery_prompt": load_reply_context_module().send_reply_recovery_prompt,
         "datetime": datetime,
         "extract_media": extract_media,
         "h1_turn_meta_lines": task_binding_module.h1_turn_meta_lines,

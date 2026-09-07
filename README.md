@@ -14,6 +14,14 @@ Hermes DingTalk Kit 是独立维护的 Hermes DingTalk adapter（适配器）与
 - 发送结果校验：HTTP 200 但响应体 `errcode != 0` 时按失败处理，不再把“机器人已移出群”等拒绝误报成成功。
 - Product Confirmation（产品确认）插件：5 个窄工具维护 `PRODUCT_DRAFT -> WAITING_PRODUCT_CONFIRMATION -> PRODUCT_APPROVED/PRODUCT_NEEDS_REVISION -> TECH_DESIGN`；状态和发送 claim（占用权）存 SQLite，同一 `task_id + proposal_version` 并发时只有 claim 获得者可以发送。明确未送达会标为 `FAILED` 后允许重试，结果不确定则保留 `CLAIMED` 并阻止自动重发；身份来自公开 `pre_gateway_dispatch` hook 的 `event.source.user_id_alt`。
 
+## 引用原文保留与超长处理
+
+成功送达的卡片和 webhook 原文保存在 `DINGTALK_KIT_STATE_DIR`，未指定时使用 `$HERMES_HOME/dingtalk-kit/dingtalk_card_replies.db`。沿用既有 SQLite 表结构，旧库可直接打开；正文不再按条数淘汰，也不在 20000 字处截断。数据目录必须使用持久挂载并纳入业务数据备份，磁盘空间仍是实际容量边界；写入失败通过日志及 `reply_context_saved=false` 返回，不能当作已保存。`CardReplyStore(max_rows=...)` 为兼容旧调用保留，但仅限制短期确认，不再限制原文条数。
+
+准确消息编号只在同一聊天内恢复原文；仅有发送时间时只能展示唯一候选，由原请求者确认后继续。完整候选及原请求按每段最多 12000 UTF-8 字节顺序发送（另加段号说明，小于既有 20000 字发送长度），确认命令最后发送；任一段失败即撤销该令牌。令牌保持 10 分钟、同聊天同用户、单次消费；过期和数量清理不会删除正文。
+
+单次引用的原文与请求合计超过 **120000 UTF-8 字节**时，插件明确提示分段，并在任务绑定及模型调用前停止；完整原文仍保留。这是本产品为限制一次核对消息量及模型输入体积设定的保守上限，并非钉钉或模型官方限制。上限内超过 500 字的原文另作为引用资料完整传入，避免 Hermes 核心的引用预览裁剪影响正文。出站 webhook 与卡片 SDK 请求同样移除静默截断；若平台拒绝过大的发送，按真实失败返回，不保存伪造的送达记录。修复前已经丢弃或未保存的原文无法由新版本凭空补回。
+
 ## 不包含内容
 
 - 不包含任何 `.env`、API key、token、cookie、Authorization header。
