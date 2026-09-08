@@ -110,8 +110,7 @@ def load_on_message(reply_context):
         "_log_forward_diag": lambda *args, **kwargs: None,
         "build_reply_kwargs": reply_context.build_reply_kwargs,
         "append_full_reply_text": reply_context.append_full_reply_text,
-        "reply_input_limit_message": reply_context.reply_input_limit_message,
-        "send_reply_recovery_prompt": reply_context.send_reply_recovery_prompt,
+        "append_conversation_context": reply_context.append_conversation_context,
         "datetime": datetime,
         "extract_media": extract_media,
         "is_user_allowed": lambda *args, **kwargs: True,
@@ -236,410 +235,90 @@ class DingTalkReplyResolutionTest(unittest.TestCase):
         asyncio.run(self.on_message(adapter, message))
         return adapter
 
-    def test_missing_original_clarifies_without_model_dispatch(self):
-        adapter = self.run_message(
-            make_message(replied={"msgId": "quoted-1", "msgType": "text"})
-        )
+    def test_missing_original_and_natural_words_reach_model(self):
+        for words in ["继续，是原文", "别用这段，换成我刚说的", "确认引用 xyz", "为什么这样理解？", "不是", "嗯，可以，但把尾句删掉"]:
+            message = make_message(replied={"msgId": "missing", "msgType": "text"})
+            message.text.content = words
+            adapter = self.run_message(message)
+            self.assertEqual([], adapter.sent)
+            self.assertEqual(1, len(adapter.events))
+            event = adapter.events[0]
+            self.assertTrue(event.text.startswith(words + "\n\n"))
+            self.assertIn("引用原文未取得", event.text)
+            self.assertIsNone(event.reply_to_text)
+            self.assertFalse(event.allow_gateway_control)
 
-        self.assertEqual([], adapter.events)
-        self.assertEqual(1, len(adapter.sent))
-        self.assertEqual(
-            self.reply_context._REPLY_ORIGINAL_CLARIFICATION,
-            adapter.sent[0]["content"],
-        )
-        self.assertEqual("incoming-1", adapter.sent[0]["reply_to"])
-        self.assertEqual(
-            {"delivery_class": "business_error", "reply_recovery_prompt": True},
-            adapter.sent[0]["metadata"],
-        )
-
-    def test_missing_original_stays_closed_when_clarification_send_fails(self):
-        adapter = self.run_message(
-            make_message(replied={"msgId": "quoted-1", "msgType": "text"}),
-            send_success=False,
-        )
-
-        self.assertEqual([], adapter.events)
-        self.assertEqual(1, len(adapter.sent))
-
-    def test_callback_original_reaches_model_without_clarification(self):
-        adapter = self.run_message(
-            make_message(
-                replied={
-                    "msgId": "quoted-2",
-                    "msgType": "text",
-                    "content": {"text": "供应商联系人没有显示"},
-                }
-            )
-        )
-
+    def test_complete_saved_original_overrides_callback_preview(self):
+        original = "长原文。" * 6000 + "TAIL-731"
+        message = make_message(replied={"msgId": "saved", "msgType": "text", "content": "预览"})
+        adapter = self.run_message(message, remembered=("saved", "track", original))
+        self.assertEqual(original, adapter.events[0].reply_to_text)
+        self.assertIn(original, adapter.events[0].text)
         self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assertEqual("供应商联系人没有显示", adapter.events[0].reply_to_text)
 
-    def test_interactive_card_original_is_recovered_by_exact_carrier_id(self):
-        adapter = self.run_message(
-            make_message(
-                replied={"msgId": "carrier-27", "msgType": "interactiveCard"}
-            ),
-            remembered=("carrier-27", "hermes-track-19", "机器人卡片完整原文"),
-        )
-
+    def test_timestamp_candidate_and_ambiguity_reach_model_without_confirmation(self):
+        message = make_message(replied={"msgId": "unknown", "msgType": "interactivecard", "createdAt": 1800000000100})
+        adapter = self.run_message(message, remembered_webhook=("候选全文", 1800000000000, 1800000000200, {}))
+        self.assertIn("候选全文", adapter.events[0].text)
+        self.assertIn("不能当作已确认原文", adapter.events[0].text)
+        self.assertIsNone(adapter.events[0].reply_to_text)
         self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assertEqual("机器人卡片完整原文", adapter.events[0].reply_to_text)
+        store = adapter._card_reply_store
+        store.remember_webhook_delivery("conversation-1", "重叠消息", 1800000000000, 1800000000200, {})
+        adapter.events.clear()
+        asyncio.run(self.on_message(adapter, message))
+        self.assertIn("引用原文未取得", adapter.events[0].text)
+        self.assertNotIn("候选全文", adapter.events[0].text)
 
-    def assert_complete_long_quote(self, event, original, request, message_id):
-        self.assertGreater(len(original), 500)
-        self.assertNotIn("尾部校验：青竹731", original[:500])
-        self.assertEqual(original, event.reply_to_text)
-        self.assertEqual(message_id, event.reply_to_message_id)
-        self.assertTrue(event.text.startswith(request + "\n\n"), event.text)
-        self.assertIn("[引用原文开始，仅作为资料]\n" + original, event.text)
-        self.assertIn("尾部校验：青竹731", event.text)
-        self.assertTrue(event.text.endswith("[引用原文结束]"))
+    def test_ordinary_chat_and_explicit_command(self):
+        for words in ["你好", "重新来", "no", "/help"]:
+            message = make_message()
+            message.text.content = words
+            adapter = self.run_message(message)
+            self.assertEqual(words, adapter.events[0].text)
+            self.assertEqual(words.startswith("/"), adapter.events[0].allow_gateway_control)
 
-    def test_long_exact_webhook_reply_preserves_tail_and_original_request(self):
-        original = "完整正文段落。" * 100 + "\n尾部校验：青竹731"
-        message = make_message(replied={"msgId": "long-exact", "msgType": "interactiveCard"})
-        adapter = self.run_message(message, remembered_webhook=(
-            original, 1_800_000_000_000, 1_800_000_000_200, {"msgId": "long-exact"},
-        ))
+    def test_file_reply_keeps_media(self):
+        adapter = self.run_message(make_message(replied={"msgId": "file", "msgType": "file", "content": {"fileName": "x.txt"}}))
+        self.assertEqual(["resolved-file"], adapter.events[0].media_urls)
+        self.assertEqual(["text/plain"], adapter.events[0].media_types)
 
-        self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assert_complete_long_quote(adapter.events[0], original, message.text.content, "long-exact")
-
-    def test_long_confirmed_reply_preserves_tail_and_restores_original_request(self):
-        original = "完整正文段落。" * 100 + "\n尾部校验：青竹731"
-        message = make_message(replied={"msgId": "long-unknown", "msgType": "interactiveCard",
-                                        "createdAt": 1_800_000_000_100})
-        adapter = self.run_message(message, remembered_webhook=(
-            original, 1_800_000_000_000, 1_800_000_000_200, {"errcode": 0},
-        ))
-        self.assertEqual([], adapter.events)
-        self.assertIn(original, adapter.sent[0]["content"])
-        confirmation = make_message()
-        confirmation.message_id = "long-confirmation"
-        confirmation.text.content = re.search(r"确认引用 [0-9a-f]{8}", adapter.sent[0]["content"]).group(0)
-        asyncio.run(self.on_message(adapter, confirmation))
-
-        self.assertEqual(1, len(adapter.events))
-        self.assert_complete_long_quote(adapter.events[0], original, message.text.content, "long-unknown")
-        self.assertNotIn(confirmation.text.content, adapter.events[0].text)
-
-    def test_long_callback_original_preserves_tail_and_original_request(self):
-        original = "完整正文段落。" * 100 + "\n尾部校验：青竹731"
-        message = make_message(replied={"msgId": "long-direct", "msgType": "text",
-                                        "content": {"text": original}})
-        adapter = self.run_message(message)
-
-        self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assert_complete_long_quote(adapter.events[0], original, message.text.content, "long-direct")
-
-    def test_over_20000_character_candidate_is_fully_shown_then_confirmed(self):
-        original = "完整正文段落。" * 3000 + "\n尾部校验：青竹731"
-        message = make_message(replied={"msgId": "very-long", "msgType": "interactiveCard",
-                                        "createdAt": 1_800_000_000_100})
-        adapter = self.run_message(message, remembered_webhook=(
-            original, 1_800_000_000_000, 1_800_000_000_200, {"errcode": 0},
-        ))
-        self.assertEqual([], adapter.events)
-        self.assertGreater(len(adapter.sent), 2)
-        preview = "".join(part["content"].split("\n", 1)[1] for part in adapter.sent[:-1])
-        self.assertIn(original, preview)
-        self.assertIn(message.text.content, preview)
-        for part in adapter.sent[:-1]:
-            self.assertLess(len(part["content"].encode("utf-8")), 13000)
-            self.assertNotRegex(part["content"], r"确认引用 [0-9a-f]{8}")
-        confirmation = make_message()
-        confirmation.text.content = re.search(r"确认引用 [0-9a-f]{8}", adapter.sent[-1]["content"]).group(0)
-        asyncio.run(self.on_message(adapter, confirmation))
-        self.assertEqual(1, len(adapter.events))
-        self.assert_complete_long_quote(adapter.events[0], original, message.text.content, "very-long")
-
-    def test_partial_preview_failure_revokes_confirmation_and_stops(self):
-        original = "全文" * 11000 + "TAIL"
-        message = make_message(replied={"msgId": "failed-preview", "msgType": "interactiveCard",
-                                        "createdAt": 1_800_000_000_100})
-        with mock.patch.object(self.reply_context.secrets, "token_hex", return_value="1234abcd"):
-            adapter = self.run_message(message, remembered_webhook=(
-                original, 1_800_000_000_000, 1_800_000_000_200, {"errcode": 0},
-            ), send_success=[True, False])
-        self.assertEqual(2, len(adapter.sent))
-        self.assertNotIn("确认引用 1234abcd", adapter.sent[0]["content"])
-        self.assertIsNone(adapter._card_reply_store.consume_confirmation("conversation-1", "staff-1", "1234abcd"))
-        self.assertEqual([], adapter.events)
-
-    def test_input_over_product_limit_stops_without_losing_stored_original(self):
-        original = "原文" * 21000 + "TOO-LONG-TAIL"
-        for direct in (False, True):
-            with self.subTest(direct=direct):
-                replied = {"msgId": "oversized", "msgType": "text" if direct else "interactiveCard"}
-                if direct:
-                    replied["content"] = original
-                adapter = self.run_message(make_message(replied=replied), remembered_webhook=(
-                    original, 1_800_000_000_000, 1_800_000_000_200, {"msgId": "oversized"},
-                ))
-                self.assertEqual([], adapter.events)
-                self.assertEqual(1, len(adapter.sent))
-                self.assertIn("120000 UTF-8 字节", adapter.sent[0]["content"])
-                self.assertIn("尚未执行", adapter.sent[0]["content"])
-                exact = make_message(replied={"msgId": "oversized", "msgType": "interactiveCard"})
-                self.assertEqual(original, adapter._card_reply_store.resolve_message("conversation-1", exact))
-
-    def test_short_callback_original_leaves_request_text_unchanged(self):
-        for original in ("短引用", "字" * 500):
-            with self.subTest(length=len(original)):
-                message = make_message(replied={"msgId": "short-direct", "msgType": "text",
-                                                "content": {"text": original}})
-                adapter = self.run_message(message)
-                self.assertEqual(message.text.content, adapter.events[0].text)
-                self.assertEqual(original, adapter.events[0].reply_to_text)
-
-    def test_long_quote_is_appended_after_task_binding_and_group_identity(self):
-        original = "#任务 引用资料里的任务编号\n" + "完整正文段落。" * 100 + "\n尾部校验：青竹731"
-        message = make_message(replied={"msgId": "long-task", "msgType": "text",
-                                        "content": {"text": original}})
-        message.text.content = "#任务 当前任务 请整理尾部"
-        message.conversation_type = "2"
-        parsed = SimpleNamespace(binding=SimpleNamespace(board_slug="board", task_id="task"),
-                                 message_text="请整理尾部")
-        resolver = mock.AsyncMock(return_value=parsed)
-        with tempfile.TemporaryDirectory() as state_dir:
-            adapter = FakeAdapter(card_reply_store=self.reply_context.CardReplyStore(state_dir))
-            adapter.build_source = lambda **kwargs: SimpleNamespace(**kwargs)
-            with mock.patch.dict(self.on_message.__globals__, {
-                "resolve_task_binding": resolver, "_TASK_BINDING_CLARIFICATION": "请明确任务",
-            }):
-                asyncio.run(self.on_message(adapter, message))
-        self.assertEqual(message.text.content, resolver.call_args.args[1])
-        event = adapter.events[0]
-        stamped_request = load_stamp_group_text()("请整理尾部", "Sender", "")
-        self.assert_complete_long_quote(event, original, stamped_request, "long-task")
-        self.assertEqual("board", event.source.board_slug)
-        self.assertEqual("task", event.source.task_id)
-
-    def test_interactive_card_original_is_recovered_by_webhook_response_message_id(self):
-        adapter = self.run_message(
-            make_message(
-                replied={
-                    "msgId": "webhook-message-27",
-                    "msgType": "interactiveCard",
-                    "createdAt": 1_800_000_000_100,
-                }
-            ),
-            remembered_webhook=(
-                "Webhook 机器人完整原文",
-                1_800_000_000_000,
-                1_800_000_000_200,
-                {"messageId": "webhook-message-27"},
-            ),
-        )
-
-        self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assertEqual("Webhook 机器人完整原文", adapter.events[0].reply_to_text)
-
-    def test_timestamp_candidate_requires_explicit_confirmation_before_dispatch(self):
-        adapter = self.run_message(
-            make_message(
-                replied={
-                    "msgId": "dingtalk-only-message-id",
-                    "msgType": "interactiveCard",
-                    "createdAt": 1_800_000_000_100,
-                }
-            ),
-            remembered_webhook=(
-                "按钉钉创建时间找回的原文",
-                1_800_000_000_000,
-                1_800_000_000_200,
-                {"errcode": 0, "errmsg": "ok"},
-            ),
-        )
-
-        self.assertEqual([], adapter.events)
-        prompt = adapter.sent[0]["content"]
-        self.assertIn("按钉钉创建时间找回的原文", prompt)
-        self.assertIn("这个怎么处理", prompt)
-        self.assertIn("尚未执行", prompt)
-        command = re.search(r"确认引用 [0-9a-f]{8}", prompt).group(0)
+    def test_inbound_original_survives_reopen_and_chat_boundary(self):
         message = make_message()
-        message.message_id = "confirmation-2"
-        message.text.content = command
-        asyncio.run(self.on_message(adapter, message))
-        self.assertEqual(1, len(adapter.events))
-        self.assertEqual("按钉钉创建时间找回的原文", adapter.events[0].reply_to_text)
-        self.assertEqual("这个怎么处理", adapter.events[0].text)
-        self.assertEqual("dingtalk-only-message-id", adapter.events[0].reply_to_message_id)
-        message.message_id = "confirmation-3"
-        asyncio.run(self.on_message(adapter, message))
-        self.assertEqual(1, len(adapter.events), "a replay must not repeat the original request")
-        self.assertIn("无效或已过期", adapter.sent[-1]["content"])
+        message.text.content = "用户保存的全文" * 800
+        adapter = self.run_message(message)
+        store = self.reply_context.CardReplyStore(adapter._card_reply_store._state_dir)
+        quoted = make_message(replied={"msgId": "incoming-1", "msgType": "text"})
+        self.assertEqual(message.text.content, store.resolve_message("conversation-1", quoted))
+        self.assertIsNone(store.resolve_message("another-chat", quoted))
 
-    def test_ambiguous_webhook_created_at_windows_fail_closed(self):
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        store = self.reply_context.CardReplyStore(temp.name)
-        for content in ("第一条", "第二条"):
-            self.assertTrue(
-                store.remember_webhook_delivery(
-                    "conversation-1",
-                    content,
-                    1_800_000_000_000,
-                    1_800_000_000_200,
-                    {"errcode": 0},
-                )
-            )
-        adapter = FakeAdapter(card_reply_store=store)
-        asyncio.run(
-            self.on_message(
-                adapter,
-                make_message(
-                    replied={
-                        "msgId": "unknown-message-id",
-                        "msgType": "interactiveCard",
-                        "createdAt": 1_800_000_000_100,
-                    }
-                ),
-            )
-        )
-
-        self.assertEqual([], adapter.events)
-        self.assertEqual(1, len(adapter.sent))
-
-    def test_exact_time_window_can_only_propose_a_candidate(self):
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        store = self.reply_context.CardReplyStore(temp.name)
-        self.assertTrue(
-            store.remember_webhook_delivery(
-                "conversation-1",
-                "精确时间窗原文",
-                1_800_000_000_000,
-                1_800_000_000_200,
-                {"errcode": 0},
-            )
-        )
-        self.assertTrue(
-            store.remember_webhook_delivery(
-                "conversation-1",
-                "仅在误差范围内的另一条",
-                1_800_000_003_000,
-                1_800_000_003_200,
-                {"errcode": 0},
-            )
-        )
-        adapter = FakeAdapter(card_reply_store=store)
-        asyncio.run(
-            self.on_message(
-                adapter,
-                make_message(
-                    replied={
-                        "msgId": "unknown-message-id",
-                        "msgType": "interactiveCard",
-                        "createdAt": 1_800_000_000_100,
-                    }
-                ),
-            )
-        )
-
-        self.assertEqual([], adapter.events)
-        self.assertEqual(1, len(adapter.sent))
-        self.assertIn("精确时间窗原文", adapter.sent[0]["content"])
-        self.assertIn("尚未执行", adapter.sent[0]["content"])
-        self.assertNotIn("仅在误差范围内的另一条", adapter.sent[0]["content"])
-
-    def test_webhook_created_at_lookup_is_isolated_by_chat(self):
-        adapter = self.run_message(
-            make_message(
-                replied={
-                    "msgId": "unknown-message-id",
-                    "msgType": "interactiveCard",
-                    "createdAt": 1_800_000_000_100,
-                }
-            ),
-            remembered_webhook=(
-                "别的群的 Webhook 原文",
-                1_800_000_000_000,
-                1_800_000_000_200,
-                {"errcode": 0},
-            ),
-            remembered_chat="conversation-2",
-        )
-
-        self.assertEqual([], adapter.events)
-        self.assertEqual(1, len(adapter.sent))
-
-    def test_unknown_interactive_card_still_clarifies_without_dispatch(self):
-        adapter = self.run_message(
-            make_message(
-                replied={"msgId": "unknown-carrier", "msgType": "interactiveCard"}
-            )
-        )
-
-        self.assertEqual([], adapter.events)
-        self.assertEqual(1, len(adapter.sent))
-        self.assertEqual(
-            self.reply_context._REPLY_ORIGINAL_CLARIFICATION,
-            adapter.sent[0]["content"],
-        )
-
-    def test_interactive_card_lookup_is_isolated_by_chat(self):
-        adapter = self.run_message(
-            make_message(
-                replied={"msgId": "carrier-27", "msgType": "interactiveCard"}
-            ),
-            remembered=("carrier-27", "hermes-track-19", "别的群的卡片原文"),
-            remembered_chat="conversation-2",
-        )
-
-        self.assertEqual([], adapter.events)
-        self.assertEqual(1, len(adapter.sent))
-
-    def test_non_reply_message_is_unchanged(self):
-        adapter = self.run_message(make_message())
-
+    def test_oversized_material_is_readable_in_full_and_never_canned_reply(self):
+        original = "超长原文" * 12000 + "FILE-TAIL-853"
+        adapter = self.run_message(make_message(replied={"msgId": "big", "msgType": "text"}), remembered=("big", "track", original))
+        event = adapter.events[0]
+        files = list(Path(adapter._card_reply_store._state_dir).glob("quote-*.txt"))
+        self.assertEqual(1, len(files))
+        self.assertIn(original, files[0].read_text())
+        self.assertIn(str(files[0]), event.text)
+        self.assertTrue(event.text.startswith("这个怎么处理"))
         self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assertFalse(hasattr(adapter.events[0], "reply_to_text"))
-        self.assertEqual("这个怎么处理", adapter.events[0].text)
 
-    def test_malformed_confirmation_never_reaches_model(self):
-        for text in ("确认引用", "确认引用 oops", "确认引用 abcdef12 再发布另一篇"):
-            with self.subTest(text=text):
-                message = make_message()
-                message.text.content = text
-                adapter = self.run_message(message)
-                self.assertEqual([], adapter.events)
-                self.assertIn("无效或已过期", adapter.sent[0]["content"])
-
-    def test_candidate_send_failure_never_dispatches_original_request(self):
-        adapter = self.run_message(
-            make_message(replied={"msgId": "unknown", "msgType": "interactivecard",
-                                  "createdAt": 1_800_000_000_100}),
-            remembered_webhook=("候选内容", 1_800_000_000_000, 1_800_000_000_200, {"errcode": 0}),
-            send_success=False,
-        )
-        self.assertEqual([], adapter.events)
-        self.assertIn("尚未执行", adapter.sent[0]["content"])
-
-    def test_file_reply_stays_on_media_path(self):
-        adapter = self.run_message(
-            make_message(
-                replied={
-                    "msgId": "quoted-file",
-                    "msgType": "file",
-                    "content": {"fileName": "evidence.txt", "downloadCode": "code-1"},
-                }
-            )
-        )
-
-        self.assertEqual([], adapter.sent)
-        self.assertEqual(1, len(adapter.events))
-        self.assertEqual(MessageType.DOCUMENT, adapter.events[0].message_type)
-        self.assertFalse(hasattr(adapter.events[0], "reply_to_text"))
+    def test_historical_context_survives_new_session_without_other_chats(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict("os.environ", {"HERMES_HOME": home}):
+            with closing(sqlite3.connect(str(Path(home) / "state.db"))) as db, db:
+                db.executescript("CREATE TABLE sessions(id TEXT, source TEXT, chat_id TEXT); CREATE TABLE messages(id INTEGER, session_id TEXT, role TEXT, content TEXT, timestamp REAL, platform_message_id TEXT);")
+                db.executemany("INSERT INTO sessions VALUES (?, 'dingtalk', ?)", [("old", "conversation-1"), ("new", "conversation-1"), ("other", "another-chat")])
+                db.executemany("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)", [
+                    (1, "old", "user", "当时要求用绿色", 1800000000, "old-user"),
+                    (2, "old", "assistant", "已改成绿色纸鹤", 1800000001, None),
+                    (3, "new", "user", "后来的无关请求", 1800000010, None),
+                    (4, "other", "user", "其他聊天隐私", 1800000000, None)])
+            adapter = self.run_message(make_message(replied={"msgId": "old-bot", "msgType": "text", "createdAt": 1800000001100}), remembered_webhook=("已改成绿色纸鹤", 1800000001050, 1800000001150, {"msgId": "old-bot"}))
+            text = adapter.events[0].text
+            self.assertIn("当时要求用绿色", text)
+            self.assertIn("已改成绿色纸鹤", text)
+            self.assertNotIn("后来的无关请求", text)
+            self.assertNotIn("其他聊天隐私", text)
 
 
 class CardReplyStoreTest(unittest.TestCase):
@@ -740,7 +419,7 @@ class CardReplyStoreTest(unittest.TestCase):
             self.assertEqual("原文-0", reopened.resolve_message("old-chat", first))
             candidate = make_message(replied={"msgId": "unknown", "msgType": "interactiveCard",
                                               "createdAt": 1800000000100})
-            self.assertIn("原文-0", reopened.propose_confirmation("old-chat", "sender", candidate, "处理"))
+            self.assertIn("原文-0", reopened.prepare_reply("old-chat", candidate, self.reply_context.build_reply_kwargs(candidate)))
             with closing(reopened._connect()) as conn:
                 self.assertEqual(5001, conn.execute("SELECT COUNT(*) FROM card_replies").fetchone()[0])
                 self.assertEqual(5001, conn.execute("SELECT COUNT(*) FROM webhook_replies").fetchone()[0])
@@ -755,126 +434,6 @@ class CardReplyStoreTest(unittest.TestCase):
             updated = "卡片新版" * 6000 + "EDIT-TAIL"
             self.assertTrue(store.update_content("chat", "track", updated))
             self.assertEqual(updated, self.reply_context.CardReplyStore(state_dir).resolve("chat", "card"))
-
-    def test_confirmation_expiry_and_count_cleanup_never_delete_originals(self):
-        with tempfile.TemporaryDirectory() as state_dir:
-            store = self.reply_context.CardReplyStore(state_dir, max_rows=1)
-            for index in range(3):
-                self.assertTrue(store.remember_delivery("chat", f"track-{index}", f"原文-{index}",
-                    self.delivery_response(SimpleNamespace(carrier_id=f"card-{index}", success=True))))
-                self.assertTrue(store.remember_webhook_delivery("chat", f"原文-{index}",
-                    1800000000000 + index * 10000, 1800000000200 + index * 10000, {}))
-            candidate = make_message(replied={"msgId": "unknown", "msgType": "interactiveCard",
-                                              "createdAt": 1800000000100})
-            with mock.patch.object(self.reply_context.time, "time", return_value=1000):
-                store.propose_confirmation("chat", "expired", candidate, "旧请求")
-            with mock.patch.object(self.reply_context.time, "time", return_value=2000):
-                store.propose_confirmation("chat", "replaced", candidate, "新请求")
-                store.propose_confirmation("chat", "current", candidate, "更新请求")
-            with closing(store._connect()) as conn:
-                self.assertEqual([("current",)], conn.execute("SELECT sender_id FROM reply_confirmations").fetchall())
-                self.assertEqual(3, conn.execute("SELECT COUNT(*) FROM card_replies").fetchone()[0])
-                self.assertEqual(3, conn.execute("SELECT COUNT(*) FROM webhook_replies").fetchone()[0])
-            self.assertEqual("原文-0", store.resolve("chat", "card-0"))
-
-    def test_webhook_time_window_mapping_survives_reopen_without_logging_content(self):
-        with tempfile.TemporaryDirectory() as state_dir:
-            store = self.reply_context.CardReplyStore(state_dir)
-            with self.assertLogs(self.reply_context.logger, level="INFO") as logs:
-                self.assertTrue(
-                    store.remember_webhook_delivery(
-                        "conversation-1",
-                        "Webhook 持久化原文",
-                        1_800_000_000_000,
-                        1_800_000_000_200,
-                        {"errcode": 0, "errmsg": "ok"},
-                    )
-                )
-                reopened = self.reply_context.CardReplyStore(state_dir)
-                message = make_message(
-                    replied={
-                        "msgId": "dingtalk-generated-id",
-                        "msgType": "interactiveCard",
-                        "createdAt": 1_800_000_000_100,
-                    }
-                )
-                self.assertIsNone(reopened.resolve_message("conversation-1", message))
-                prompt = reopened.propose_confirmation("conversation-1", "staff-1", message, "请继续")
-                self.assertIn("Webhook 持久化原文", prompt)
-            safe_log = "\n".join(logs.output)
-            self.assertIn("exact_id_count=0", safe_log)
-            self.assertIn("source=created_at", safe_log)
-            self.assertNotIn("Webhook 持久化原文", safe_log)
-
-    def test_confirmation_is_scoped_expiring_single_use_and_restart_safe(self):
-        with tempfile.TemporaryDirectory() as state_dir:
-            store = self.reply_context.CardReplyStore(state_dir)
-            store.remember_webhook_delivery("chat-1", "完整候选", 1_800_000_000_000,
-                                            1_800_000_000_200, {"errcode": 0})
-            message = make_message(replied={"msgId": "unknown", "msgType": "interactivecard",
-                                            "createdAt": 1_800_000_000_100})
-            prompt = store.propose_confirmation("chat-1", "sender-1", message, "可以发布了")
-            token = re.search(r"确认引用 ([0-9a-f]{8})", prompt).group(1)
-            reopened = self.reply_context.CardReplyStore(state_dir)
-            self.assertIsNone(reopened.consume_confirmation("chat-2", "sender-1", token))
-            self.assertIsNone(reopened.consume_confirmation("chat-1", "sender-2", token))
-            self.assertIsNone(reopened.consume_confirmation("chat-1", "sender-1", "wrong"))
-            with mock.patch.object(self.reply_context.time, "time", return_value=10**12):
-                self.assertIsNone(reopened.consume_confirmation("chat-1", "sender-1", token))
-            self.assertEqual(
-                {"request_text": "可以发布了", "reply_to_message_id": "unknown", "reply_to_text": "完整候选"},
-                reopened.consume_confirmation("chat-1", "sender-1", token),
-            )
-            self.assertIsNone(reopened.consume_confirmation("chat-1", "sender-1", token))
-
-    def test_preview_is_not_consumable_until_every_part_has_been_delivered(self):
-        with tempfile.TemporaryDirectory() as state_dir:
-            store = self.reply_context.CardReplyStore(state_dir)
-            store.remember_webhook_delivery("chat", "全文" * 11000 + "TAIL", 1800000000000,
-                                            1800000000200, {})
-            message = make_message(replied={"msgId": "unknown", "msgType": "interactivecard",
-                                            "createdAt": 1800000000100})
-            prompt = store.propose_confirmation("chat", "sender", message, "原请求", defer_confirmation=True)
-            token = re.search(r"确认引用 ([0-9a-f]{8})", prompt).group(1)
-            adapter = FakeAdapter(card_reply_store=store)
-            normal_send = adapter.send
-
-            async def send_and_try_early_confirmation(*args, **kwargs):
-                self.assertIsNone(store.consume_confirmation("chat", "sender", token))
-                return await normal_send(*args, **kwargs)
-
-            adapter.send = send_and_try_early_confirmation
-            self.assertTrue(asyncio.run(self.reply_context.send_reply_recovery_prompt(adapter, "chat", "sender", prompt, "request")))
-            self.assertEqual("原请求", store.consume_confirmation("chat", "sender", token)["request_text"])
-
-    def test_failed_preview_stays_unusable_even_if_cleanup_cannot_write(self):
-        with tempfile.TemporaryDirectory() as state_dir:
-            store = self.reply_context.CardReplyStore(state_dir)
-            store.remember_webhook_delivery("chat", "正文", 1800000000000, 1800000000200, {})
-            message = make_message(replied={"msgId": "unknown", "msgType": "interactivecard",
-                                            "createdAt": 1800000000100})
-            prompt = store.propose_confirmation("chat", "sender", message, "原请求", defer_confirmation=True)
-            token = re.search(r"确认引用 ([0-9a-f]{8})", prompt).group(1)
-            adapter = FakeAdapter(card_reply_store=store, send_success=False)
-            with mock.patch.object(store, "cancel_confirmation", return_value=False):
-                self.assertFalse(asyncio.run(self.reply_context.send_reply_recovery_prompt(adapter, "chat", "sender", prompt, "request")))
-            self.assertIsNone(store.consume_confirmation("chat", "sender", token))
-
-    def test_new_candidate_replaces_old_confirmation_and_requires_full_preview(self):
-        with tempfile.TemporaryDirectory() as state_dir:
-            store = self.reply_context.CardReplyStore(state_dir)
-            store.remember_webhook_delivery("chat", "候选", 1_800_000_000_000,
-                                            1_800_000_000_200, {"errcode": 0})
-            message = make_message(replied={"msgId": "unknown", "msgType": "interactivecard",
-                                            "createdAt": 1_800_000_000_100})
-            first = store.propose_confirmation("chat", "sender", message, "旧请求")
-            second = store.propose_confirmation("chat", "sender", message, "新请求")
-            first_token = re.search(r"确认引用 ([0-9a-f]{8})", first).group(1)
-            second_token = re.search(r"确认引用 ([0-9a-f]{8})", second).group(1)
-            self.assertIsNone(store.consume_confirmation("chat", "sender", first_token))
-            self.assertEqual("新请求", store.consume_confirmation("chat", "sender", second_token)["request_text"])
-            self.assertIn("x" * 20000, store.propose_confirmation("chat", "sender", message, "x" * 20000))
-            self.assertIsNone(store.propose_confirmation("chat", "", message, "请求"))
 
     def test_exact_webhook_id_collision_does_not_pick_arbitrary_content(self):
         with tempfile.TemporaryDirectory() as state_dir:
@@ -895,7 +454,6 @@ class CardReplyStoreTest(unittest.TestCase):
             self.assertFalse(store.remember_webhook_delivery("chat", "正文", 1, 2, {"errcode": 0}))
             self.assertFalse(store.invalidate_content("chat", "track"))
             self.assertIsNone(store.resolve("chat", "carrier"))
-            self.assertIsNone(store.consume_confirmation("chat", "sender", "abcdef12"))
 
     def test_invalidation_survives_restart_when_final_save_fails(self):
         with tempfile.TemporaryDirectory() as state_dir:
@@ -925,6 +483,3 @@ class CardReplyStoreTest(unittest.TestCase):
                     str(Path(hermes_home) / "dingtalk-kit" / "dingtalk_card_replies.db"),
                     store._db_path(),
                 )
-
-if __name__ == "__main__":
-    unittest.main()

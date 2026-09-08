@@ -130,7 +130,7 @@ try:
         _get_replied_file_content,
         _is_placeholder_text,
         _log_forward_diag,
-        append_full_reply_text, build_reply_kwargs, reply_input_limit_message, send_reply_recovery_prompt,
+        append_full_reply_text, build_reply_kwargs, append_conversation_context,
     )
     from .task_binding import resolve_gateway_profile, resolve_task_binding
     from .task_binding import restore_h1_binding, set_h1_dispatch_scope, mark_h1_turn_delivered, h1_turn_meta_lines, is_h1_failure_receipt
@@ -151,7 +151,7 @@ except ImportError:
         _get_replied_file_content,
         _is_placeholder_text,
         _log_forward_diag,
-        append_full_reply_text, build_reply_kwargs, reply_input_limit_message, send_reply_recovery_prompt,
+        append_full_reply_text, build_reply_kwargs, append_conversation_context,
     )
     from task_binding import resolve_gateway_profile, resolve_task_binding  # type: ignore
     from task_binding import restore_h1_binding, set_h1_dispatch_scope, mark_h1_turn_delivered, h1_turn_meta_lines, is_h1_failure_receipt  # type: ignore
@@ -644,44 +644,13 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.debug("[%s] Empty message, skipping", self.name)
             return
 
-        # Resolve before task binding or model dispatch. A timestamp is only a
-        # suggestion; it cannot authorize continuation of the original request.
-        confirmed_reply = None
-        confirmation_sender = sender_staff_id or sender_id
-        confirmation_token = (
-            self._card_reply_store.confirmation_token(text) if "确认引用" in (text or "") else None
-        )
-        if confirmation_token is not None:
-            confirmed_reply = (
-                self._card_reply_store.consume_confirmation(chat_id, confirmation_sender, confirmation_token)
-                if not media_urls else None
-            )
-            if not confirmed_reply:
-                await self.send(
-                    chat_id, "引用确认无效或已过期。请重新引用，或粘贴原文和你的请求。",
-                    reply_to=msg_id,
-                    metadata={"delivery_class": "business_error", "reply_recovery_prompt": True},
-                )
-                return
-            text = confirmed_reply.pop("request_text")
-
+        # Only explicit slash commands may bypass model interpretation.
+        allow_gateway_control = (text or "").lstrip().startswith("/")
+        current_text = text
         reply_kwargs = build_reply_kwargs(message)
-        if confirmed_reply:
-            reply_kwargs = confirmed_reply
-        if reply_kwargs.get("reply_to_text") == "\x00__HERMES_REPLY_ORIGINAL_UNAVAILABLE__\x00":
-            recovered = self._card_reply_store.resolve_message(chat_id, message)
-            if recovered:
-                reply_kwargs["reply_to_text"] = recovered
-            else:
-                candidate_prompt = (
-                    self._card_reply_store.propose_confirmation(chat_id, confirmation_sender, message, text, defer_confirmation=True)
-                    if not media_urls else None
-                )
-                await send_reply_recovery_prompt(self, chat_id, confirmation_sender, candidate_prompt, msg_id)
-                return
-        if limit_message := reply_input_limit_message(text, reply_kwargs):
-            await send_reply_recovery_prompt(self, chat_id, confirmation_sender, limit_message, msg_id)
-            return
+        context = self._card_reply_store.prepare_reply(chat_id, message, reply_kwargs)
+        self._card_reply_store.remember_incoming(chat_id, msg_id, text, message, media_urls, media_types)
+        text = append_conversation_context(text, context)
         task_binding = None
         if (text or "").lstrip().startswith("#任务"):
             parsed_task_message = await resolve_task_binding(
@@ -728,6 +697,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         except (ValueError, OSError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
         text = append_full_reply_text(text, reply_kwargs)
+        text = self._card_reply_store.fit_model_context(text, reply_kwargs, current_text)
         event = MessageEvent(
             text=text,
             message_type=msg_type,
@@ -737,6 +707,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             timestamp=timestamp,
+            allow_gateway_control=allow_gateway_control,
             **reply_kwargs,
         )
 
@@ -885,7 +856,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                 reply_context_saved = (
                     self._card_reply_store.remember_webhook_delivery(
                         chat_id, normalized, webhook_started_ms, webhook_finished_ms, body_json,
-                    ) if not metadata.get("reply_recovery_prompt") else None
+                    )
                 )
                 if reply_context_saved is False:
                     logger.warning("[webhook-reply-store] delivered but original was not saved")

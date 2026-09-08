@@ -337,98 +337,33 @@ def _assert_reply_context(root: Path) -> str:
     if reply_context.build_reply_kwargs(FileMessage()) != {}:
         raise AssertionError("file replies must stay on the file-content path")
 
-    original = "完整引用正文。" * 100 + "\n尾部标记：install-tail-731"
-    long_kwargs = {"reply_to_message_id": "long-1", "reply_to_text": original}
-    complete = reply_context.append_full_reply_text("请整理末段", long_kwargs)
-    if not complete.startswith("请整理末段\n\n") or original not in complete:
-        raise AssertionError("long reply original or user request was truncated")
-    if long_kwargs != {"reply_to_message_id": "long-1", "reply_to_text": original}:
-        raise AssertionError("long reply forwarding mutated reply kwargs")
-    for short_kwargs in ({}, {"reply_to_text": "字" * 500}):
-        if reply_context.append_full_reply_text("用户原请求", short_kwargs) != "用户原请求":
-            raise AssertionError("short or absent reply changed user request text")
-
-    class CardText:
-        extensions = {
-            "repliedMsg": {
-                "msgId": "carrier-27",
-                "msgType": "interactiveCard",
-            }
-        }
-
-    class CardMessage:
-        text = CardText()
-
-    class WebhookCardText:
-        extensions = {
-            "repliedMsg": {
-                "msgId": "dingtalk-generated-id",
-                "msgType": "interactiveCard",
-                "createdAt": 1_800_000_000_100,
-            }
-        }
-
-    class WebhookCardMessage:
-        text = WebhookCardText()
-
-    response = types.SimpleNamespace(
-        body=types.SimpleNamespace(
-            result=[types.SimpleNamespace(carrier_id="carrier-27", success=True)]
-        )
-    )
-    with tempfile.TemporaryDirectory() as state_dir:
-        store = reply_context.CardReplyStore(state_dir, max_rows=1)
-        if not store.remember_delivery(
-            "chat-1", "hermes-track-19", "card original", response
-        ):
-            raise AssertionError("card delivery carrier id was not persisted")
-        if store.resolve_message("chat-1", CardMessage()) != "card original":
-            raise AssertionError("interactiveCard carrier id did not resolve")
-        if store.resolve_message("chat-2", CardMessage()) is not None:
-            raise AssertionError("interactiveCard lookup is not isolated by chat")
-        if not store.remember_webhook_delivery(
-            "chat-1",
-            "webhook original",
-            1_800_000_000_000,
-            1_800_000_000_200,
-            {"errcode": 0},
-        ):
-            raise AssertionError("session webhook output was not persisted")
-        if store.resolve_message("chat-1", WebhookCardMessage()) is not None:
-            raise AssertionError("timestamp-only candidate must not resolve automatically")
-        prompt = store.propose_confirmation("chat-1", "sender-1", WebhookCardMessage(), "继续处理")
-        if not prompt or "webhook original" not in prompt or "尚未执行" not in prompt:
-            raise AssertionError("timestamp-only candidate must be shown for explicit confirmation")
-        token_match = re.search(r"确认引用 ([0-9a-f]{8})", prompt)
-        if not token_match:
-            raise AssertionError("candidate confirmation command missing")
-        token = token_match.group(1)
-        if store.consume_confirmation("chat-2", "sender-1", token) is not None:
-            raise AssertionError("candidate confirmation crossed chats")
-        reopened = reply_context.CardReplyStore(state_dir)
-        confirmed = reopened.consume_confirmation("chat-1", "sender-1", token)
-        if not confirmed or confirmed["reply_to_text"] != "webhook original":
-            raise AssertionError("confirmed candidate did not survive reopen")
-        if reopened.consume_confirmation("chat-1", "sender-1", token) is not None:
-            raise AssertionError("candidate confirmation was reusable")
-        complete_original = "长文" * 11000 + "FULL-TAIL"
-        if not store.update_content("chat-1", "hermes-track-19", complete_original):
-            raise AssertionError("long card update failed")
-        store.remember_delivery("chat-2", "other-track", "other", response)
-        if reopened.resolve_message("chat-1", CardMessage()) != complete_original:
-            raise AssertionError("long original was truncated or evicted by another chat")
-        store.remember_webhook_delivery("chat-2", "other", 1_900_000_000_000, 1_900_000_000_200)
-        if "webhook original" not in (reopened.propose_confirmation("chat-1", "sender-1", WebhookCardMessage(), "继续") or ""):
-            raise AssertionError("webhook original was evicted by another chat")
-        if reply_context.reply_input_limit_message("请求", {"reply_to_text": complete_original}):
-            raise AssertionError("a complete 22000-character original should fit the product limit")
-        if not reply_context.reply_input_limit_message("请求", {"reply_to_text": "字" * 40001}):
-            raise AssertionError("oversized model input must produce an explicit refusal")
-    return "exact ids recover; timestamp candidates require one explicit, scoped confirmation"
+    with tempfile.TemporaryDirectory() as directory:
+        store = reply_context.CardReplyStore(directory)
+        context = store.prepare_reply("chat-1", Message(), kwargs)
+        if kwargs["reply_to_text"] is not None or "未取得" not in context:
+            raise AssertionError("missing original must reach the model as a gap")
+        original = "完整引用正文。" * 100 + "尾部标记：install-tail-731"
+        store.remember_webhook_delivery("chat-1", original, 1800000000000, 1800000000200, {"msgId": "reply-42"})
+        kwargs = reply_context.build_reply_kwargs(Message())
+        store.prepare_reply("chat-1", Message(), kwargs)
+        complete = reply_context.append_full_reply_text("当前原话", kwargs)
+        if original not in complete or not complete.startswith("当前原话"):
+            raise AssertionError("long original or current words were truncated")
+        other = reply_context.build_reply_kwargs(Message())
+        store.prepare_reply("other-chat", Message(), other)
+        if other["reply_to_text"] is not None:
+            raise AssertionError("reply crossed chat boundary")
+        candidate = types.SimpleNamespace(text=types.SimpleNamespace(extensions={"repliedMsg": {
+            "msgId": "unknown", "msgType": "interactivecard", "createdAt": 1800000000100}}))
+        candidate_kwargs = reply_context.build_reply_kwargs(candidate)
+        material = store.prepare_reply("chat-1", candidate, candidate_kwargs)
+        if original not in material or "候选" not in material or candidate_kwargs["reply_to_text"] is not None:
+            raise AssertionError("timestamp material must stay an unconfirmed candidate")
+    return "exact/candidate/missing context retains current words and chat isolation"
 
 
 def _assert_reply_context_forwarded(root: Path) -> str:
-    """Ensure only an exact card lookup can bypass unavailable-text rejection."""
+    """Verify the existing intake path passes context to the model without semantic interception."""
     adapter = root / PLUGIN_REL / "adapter.py"
     adapter_text = adapter.read_text(encoding="utf-8")
     tree = ast.parse(adapter_text, filename=str(adapter))
@@ -514,52 +449,27 @@ def _assert_reply_context_forwarded(root: Path) -> str:
     if not kwargs_index < event_index < dispatch_index:
         raise AssertionError("reply context is not forwarded in dispatch order")
     append_index = event_index - 1
-    expected_append = ast.parse("text = append_full_reply_text(text, reply_kwargs)").body[0]
-    if ast.dump(method.body[append_index]) != ast.dump(expected_append):
-        raise AssertionError("long reply text must be appended immediately before MessageEvent")
-    confirmation_guard = method.body[kwargs_index + 1]
-    if not (
-        isinstance(confirmation_guard, ast.If)
-        and isinstance(confirmation_guard.test, ast.Name)
-        and confirmation_guard.test.id == "confirmed_reply"
-        and not confirmation_guard.orelse
-        and len(confirmation_guard.body) == 1
-        and ast.unparse(confirmation_guard.body[0]) == "reply_kwargs = confirmed_reply"
-    ):
-        raise AssertionError("unexpected reply policy branch before MessageEvent")
-    guard = method.body[kwargs_index + 2]
-    if any(
-        isinstance(node, ast.Name) and node.id == "reply_kwargs"
-        for statement in method.body[kwargs_index + 4:append_index]
-        for node in ast.walk(statement)
-    ):
-        raise AssertionError("unexpected reply policy branch before MessageEvent")
-    guard_text = ast.get_source_segment(adapter_text, guard) or ""
-    required = (
-        "__HERMES_REPLY_ORIGINAL_UNAVAILABLE__",
-        "resolve_message(chat_id, message)",
-        'reply_kwargs["reply_to_text"] = recovered',
-        "await send_reply_recovery_prompt(self, chat_id, confirmation_sender, candidate_prompt, msg_id)",
-        "propose_confirmation(chat_id, confirmation_sender, message, text, defer_confirmation=True)",
+    expected = (
+        "context = self._card_reply_store.prepare_reply(chat_id, message, reply_kwargs)",
+        "text = append_conversation_context(text, context)",
+        "text = append_full_reply_text(text, reply_kwargs)",
+        "text = self._card_reply_store.fit_model_context(text, reply_kwargs, current_text)",
     )
-    if not isinstance(guard, ast.If) or any(item not in guard_text for item in required):
-        raise AssertionError("unavailable reply does not send the required clarification")
-    inner_guards = [statement for statement in guard.body if isinstance(statement, ast.If)]
-    if guard.orelse or len(inner_guards) != 1:
-        raise AssertionError("unavailable reply does not use one exact recovery branch")
-    recovery_guard = inner_guards[0]
-    if any(isinstance(node, ast.Return) for node in recovery_guard.body):
-        raise AssertionError("resolved card reply stops before model dispatch")
-    if not any(isinstance(node, ast.Return) for node in recovery_guard.orelse):
-        raise AssertionError("unavailable reply does not stop before model dispatch")
-    limit_guard = ast.parse(
-        "if limit_message := reply_input_limit_message(text, reply_kwargs):\n"
-        "    await send_reply_recovery_prompt(self, chat_id, confirmation_sender, limit_message, msg_id)\n"
-        "    return\n"
-    ).body[0]
-    if ast.dump(method.body[kwargs_index + 3]) != ast.dump(limit_guard):
-        raise AssertionError("oversized quoted input must stop before task binding and model dispatch")
-    return "exact ids or consumed confirmations recover; complete long originals reach event text"
+    statements = [ast.unparse(node) for node in method.body]
+    for statement in expected:
+        if ast.unparse(ast.parse(statement).body[0]) not in statements:
+            raise AssertionError("missing complete model-context forwarding: " + statement)
+    # Between reply resolution and explicit task commands, no semantic branch
+    # may send a canned answer or stop dispatch. Task commands remain supported.
+    task_index = next(i for i, node in enumerate(method.body) if ast.unparse(node) == "task_binding = None")
+    if any(isinstance(node, (ast.Return, ast.If)) for statement in method.body[kwargs_index:task_index] for node in ast.walk(statement)):
+        raise AssertionError("unexpected reply policy branch before MessageEvent")
+    event_call = method.body[event_index].value
+    if not any(k.arg == "allow_gateway_control" and ast.unparse(k.value) == "allow_gateway_control" for k in event_call.keywords):
+        raise AssertionError("ordinary messages must disable gateway semantic shortcuts")
+    if "allow_gateway_control = (text or '').lstrip().startswith('/')" not in statements:
+        raise AssertionError("only explicit slash commands may use gateway control")
+    return "all ordinary words, exact/candidate/missing quotes and full context reach model dispatch"
 
 
 def _assert_gateway_reply_context_layering(root: Path) -> str:

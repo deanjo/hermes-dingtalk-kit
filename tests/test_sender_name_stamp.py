@@ -152,8 +152,7 @@ def load_on_message(*, natural_intake=False, with_media=False, mention_meta="", 
         "asyncio": asyncio,
         "build_reply_kwargs": lambda message: {},
         "append_full_reply_text": reply_context.append_full_reply_text,
-        "reply_input_limit_message": reply_context.reply_input_limit_message,
-        "send_reply_recovery_prompt": reply_context.send_reply_recovery_prompt,
+        "append_conversation_context": reply_context.append_conversation_context,
         "datetime": datetime,
         "extract_media": extract_media,
         "h1_turn_meta_lines": lambda adapter, **kwargs: ["[消息编号: incoming-1]"],
@@ -175,6 +174,12 @@ def load_on_message(*, natural_intake=False, with_media=False, mention_meta="", 
 
 
 class FakeAdapter:
+    _card_reply_store = SimpleNamespace(
+        prepare_reply=lambda *args: "",
+        remember_incoming=lambda *args: True,
+        fit_model_context=lambda text, *args: text,
+    )
+
     def __init__(self, *, natural_intake=False):
         self.name = "dingtalk"
         self.config = SimpleNamespace(

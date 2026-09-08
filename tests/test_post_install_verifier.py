@@ -373,7 +373,7 @@ class BasePlatformAdapter:
         report = self.verifier.build_report(root)
         failure = next(item for item in report["checks"] if item["name"] == "plugin.reply_context_forwarded")
         self.assertEqual("failed", failure["status"])
-        self.assertIn("long reply text", failure["message"])
+        self.assertIn("complete model-context forwarding", failure["message"])
 
     def test_truncated_long_reply_body_fails_install_check(self):
         root = self.make_target()
@@ -441,26 +441,16 @@ class BasePlatformAdapter:
         self.assertEqual("failed", failure["status"])
         self.assertIn("unexpected reply policy branch", failure["message"])
 
-    def test_card_reply_recovery_without_unknown_return_fails(self):
+    def test_missing_gap_context_forwarding_fails(self):
         root = self.make_target()
         adapter = root / "plugins/platforms/dingtalk/adapter.py"
-        text = adapter.read_text(encoding="utf-8")
-        marker = "                return\n        if limit_message := reply_input_limit_message(text, reply_kwargs):\n"
-        self.assertIn(marker, text)
-        adapter.write_text(
-            text.replace(marker, "        if limit_message := reply_input_limit_message(text, reply_kwargs):\n", 1),
-            encoding="utf-8",
-        )
-
+        text = adapter.read_text()
+        marker = "        context = self._card_reply_store.prepare_reply(chat_id, message, reply_kwargs)"
+        adapter.write_text(text.replace(marker, '        context = ""'))
         report = self.verifier.build_report(root)
-
-        failure = next(
-            item
-            for item in report["checks"]
-            if item["name"] == "plugin.reply_context_forwarded"
-        )
+        failure = next(item for item in report["checks"] if item["name"] == "plugin.reply_context_forwarded")
         self.assertEqual("failed", failure["status"])
-        self.assertIn("does not stop before model dispatch", failure["message"])
+        self.assertIn("complete model-context forwarding", failure["message"])
 
     def test_gateway_reply_context_without_return_none_fails(self):
         root = self.make_target()

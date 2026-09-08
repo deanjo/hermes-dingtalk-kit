@@ -159,8 +159,7 @@ def load_on_message(*, with_media=False):
         "asyncio": asyncio,
         "build_reply_kwargs": lambda message: getattr(message, "_test_reply_kwargs", None) or {},
         "append_full_reply_text": load_reply_context_module().append_full_reply_text,
-        "reply_input_limit_message": load_reply_context_module().reply_input_limit_message,
-        "send_reply_recovery_prompt": load_reply_context_module().send_reply_recovery_prompt,
+        "append_conversation_context": load_reply_context_module().append_conversation_context,
         "datetime": datetime,
         "extract_media": extract_media,
         "h1_turn_meta_lines": task_binding_module.h1_turn_meta_lines,
@@ -180,6 +179,12 @@ def load_on_message(*, with_media=False):
 
 
 class FakeAdapter:
+    _card_reply_store = SimpleNamespace(
+        prepare_reply=lambda *args: "",
+        remember_incoming=lambda *args: True,
+        fit_model_context=lambda text, *args: text,
+    )
+
     def __init__(self, *, enabled=True, send_success=True, gateway_profile=None):
         self.name = "dingtalk"
         self.config = SimpleNamespace(extra={"natural_task_intake": enabled})

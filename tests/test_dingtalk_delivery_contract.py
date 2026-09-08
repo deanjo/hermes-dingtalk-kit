@@ -358,13 +358,13 @@ class DingTalkDeliveryContractTest(unittest.TestCase):
         self.assertIs(result.raw_response["reply_context_saved"], False)
         self.assertEqual(1, len(adapter._http_client.calls))
 
-    def test_recovery_prompt_uses_webhook_without_becoming_another_candidate(self):
+    def test_legacy_recovery_prompt_is_saved_like_every_delivered_reply(self):
         adapter = FakeAdapter(FakeResponse())
         result = self.run_send(adapter, metadata={"reply_recovery_prompt": True, "delivery_class": "business_error"})
         self.assertTrue(result.success)
         self.assertEqual(0, adapter.card_calls)
-        self.assertEqual([], adapter._card_reply_store.webhook_remembered)
-        self.assertIsNone(result.raw_response["reply_context_saved"])
+        self.assertEqual(1, len(adapter._card_reply_store.webhook_remembered))
+        self.assertTrue(result.raw_response["reply_context_saved"])
 
     def test_card_delivery_response_is_saved_for_future_quote_resolution(self):
         response = SimpleNamespace(
